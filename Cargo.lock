@@ -14,6 +14,8 @@ dependencies = [
  "akraz-ipc",
  "akraz-platform",
  "akraz-protocol",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

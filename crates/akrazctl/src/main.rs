@@ -3,8 +3,11 @@ use std::fmt::{Display, Formatter};
 use std::process::ExitCode;
 
 use akraz_core::RuntimeInputState;
-use akraz_daemon::{build_daemon_status, build_permissions_probe};
-use akraz_ipc::{IpcEndpoint, JsonRpcSuccess, to_json_line};
+use akraz_daemon::handle_ipc_request_line;
+use akraz_ipc::{
+    DaemonStatusParams, IpcEndpoint, JsonRpcRequest, METHOD_DAEMON_STATUS,
+    METHOD_PERMISSIONS_PROBE, PermissionsProbeParams, to_json_line,
+};
 use akraz_platform::FakePlatformAdapter;
 
 const LOCAL_REQUEST_ID: &str = "local";
@@ -52,44 +55,46 @@ fn print_version() {
 
 fn print_status(options: StatusOptions) -> ExitCode {
     let _endpoint = options.endpoint;
-    let state = RuntimeInputState::new();
-    let platform = FakePlatformAdapter::default();
-    let status = match build_daemon_status(&state, &platform) {
-        Ok(status) => status,
-        Err(error) => {
-            eprintln!("failed to build daemon status: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let request = JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_DAEMON_STATUS,
+        DaemonStatusParams::default(),
+    );
 
-    print_json_success(status)
+    print_local_daemon_response(&request)
 }
 
 fn print_permissions_probe() -> ExitCode {
-    let platform = FakePlatformAdapter::default();
-    let probe = match build_permissions_probe(&platform) {
-        Ok(probe) => probe,
+    let request = JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_PERMISSIONS_PROBE,
+        PermissionsProbeParams::default(),
+    );
+
+    print_local_daemon_response(&request)
+}
+
+fn print_local_daemon_response<P>(request: &JsonRpcRequest<P>) -> ExitCode
+where
+    P: serde::Serialize,
+{
+    let request_line = match to_json_line(request) {
+        Ok(line) => line,
         Err(error) => {
-            eprintln!("failed to probe permissions: {error}");
+            eprintln!("failed to encode JSON request: {error}");
             return ExitCode::FAILURE;
         }
     };
+    let state = RuntimeInputState::new();
+    let platform = FakePlatformAdapter::default();
 
-    print_json_success(probe)
-}
-
-fn print_json_success<T>(result: T) -> ExitCode
-where
-    T: serde::Serialize,
-{
-    let response = JsonRpcSuccess::new(LOCAL_REQUEST_ID, result);
-    match to_json_line(&response) {
+    match handle_ipc_request_line(&state, &platform, &request_line) {
         Ok(line) => {
             print!("{line}");
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("failed to encode JSON response: {error}");
+            eprintln!("failed to handle local IPC request: {error}");
             ExitCode::FAILURE
         }
     }
@@ -148,9 +153,9 @@ impl Display for CliUsageError {
 
 #[cfg(test)]
 mod tests {
-    use akraz_ipc::{IpcEndpoint, IpcEndpointKind};
+    use akraz_ipc::{IpcEndpoint, IpcEndpointKind, METHOD_DAEMON_STATUS};
 
-    use super::{CliUsageError, StatusOptions, parse_status_options};
+    use super::{CliUsageError, LOCAL_REQUEST_ID, StatusOptions, parse_status_options};
 
     #[test]
     fn parses_status_endpoint_option() {
@@ -184,5 +189,17 @@ mod tests {
             parse_status_options(["--bad"].map(String::from)),
             Err(CliUsageError::UnknownStatusOption("--bad".to_string()))
         );
+    }
+
+    #[test]
+    fn status_request_uses_daemon_status_ipc_method() {
+        let request = akraz_ipc::JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_DAEMON_STATUS,
+            akraz_ipc::DaemonStatusParams::default(),
+        );
+
+        assert_eq!(request.id, LOCAL_REQUEST_ID);
+        assert_eq!(request.method, METHOD_DAEMON_STATUS);
     }
 }

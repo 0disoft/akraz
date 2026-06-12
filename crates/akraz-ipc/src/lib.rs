@@ -8,6 +8,7 @@ use akraz_core::ControlMode;
 use akraz_platform::PlatformCapabilities;
 use akraz_protocol::ProtocolVersion;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// JSON-RPC protocol marker used by akraz local IPC.
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -17,6 +18,18 @@ pub const METHOD_DAEMON_STATUS: &str = "daemon.status";
 
 /// JSON-RPC method for platform permission probing.
 pub const METHOD_PERMISSIONS_PROBE: &str = "permissions.probe";
+
+/// JSON-RPC parse error code.
+pub const JSONRPC_ERROR_PARSE: i32 = -32700;
+
+/// JSON-RPC invalid request error code.
+pub const JSONRPC_ERROR_INVALID_REQUEST: i32 = -32600;
+
+/// JSON-RPC method not found error code.
+pub const JSONRPC_ERROR_METHOD_NOT_FOUND: i32 = -32601;
+
+/// JSON-RPC invalid params error code.
+pub const JSONRPC_ERROR_INVALID_PARAMS: i32 = -32602;
 
 /// Supported local IPC endpoint kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +241,31 @@ impl<P> JsonRpcRequest<P> {
     }
 }
 
+/// Decoded local IPC request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcRequest {
+    DaemonStatus(JsonRpcRequest<DaemonStatusParams>),
+    PermissionsProbe(JsonRpcRequest<PermissionsProbeParams>),
+}
+
+impl IpcRequest {
+    /// Return the request id.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::DaemonStatus(request) => &request.id,
+            Self::PermissionsProbe(request) => &request.id,
+        }
+    }
+
+    /// Return the request method.
+    pub fn method(&self) -> &str {
+        match self {
+            Self::DaemonStatus(request) => &request.method,
+            Self::PermissionsProbe(request) => &request.method,
+        }
+    }
+}
+
 /// JSON-RPC success response envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -284,6 +322,20 @@ impl JsonRpcError {
             message: message.into(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawJsonRpcRequest {
+    jsonrpc: String,
+    id: String,
+    method: String,
+    #[serde(default = "empty_params_value")]
+    params: Value,
+}
+
+fn empty_params_value() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 /// Empty params for `daemon.status`.
@@ -427,13 +479,88 @@ where
         .map_err(IpcCodecError::from_source)
 }
 
+/// Parse and classify a single JSON-RPC request line.
+pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
+    let value: Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(JsonRpcFailure::new(
+                None,
+                JsonRpcError::new(JSONRPC_ERROR_PARSE, "parse error"),
+            ));
+        }
+    };
+    let id = request_id_from_value(&value);
+    let raw: RawJsonRpcRequest = match serde_json::from_value(value) {
+        Ok(request) => request,
+        Err(_) => {
+            return Err(JsonRpcFailure::new(
+                id,
+                JsonRpcError::new(JSONRPC_ERROR_INVALID_REQUEST, "invalid request"),
+            ));
+        }
+    };
+
+    if raw.jsonrpc != JSONRPC_VERSION {
+        return Err(JsonRpcFailure::new(
+            Some(raw.id),
+            JsonRpcError::new(JSONRPC_ERROR_INVALID_REQUEST, "invalid JSON-RPC version"),
+        ));
+    }
+
+    match raw.method.as_str() {
+        METHOD_DAEMON_STATUS => parse_typed_request(raw).map(IpcRequest::DaemonStatus),
+        METHOD_PERMISSIONS_PROBE => parse_typed_request(raw).map(IpcRequest::PermissionsProbe),
+        _ => Err(JsonRpcFailure::new(
+            Some(raw.id),
+            JsonRpcError::new(
+                JSONRPC_ERROR_METHOD_NOT_FOUND,
+                format!("method not found: {}", raw.method),
+            ),
+        )),
+    }
+}
+
+fn request_id_from_value(value: &Value) -> Option<String> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn parse_typed_request<P>(raw: RawJsonRpcRequest) -> Result<JsonRpcRequest<P>, JsonRpcFailure>
+where
+    P: for<'de> Deserialize<'de>,
+{
+    let params = if raw.params.is_object() {
+        serde_json::from_value(raw.params)
+    } else {
+        Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "params must be an object",
+        )))
+    }
+    .map_err(|error| {
+        JsonRpcFailure::new(
+            Some(raw.id.clone()),
+            JsonRpcError::new(
+                JSONRPC_ERROR_INVALID_PARAMS,
+                format!("invalid params for {}: {error}", raw.method),
+            ),
+        )
+    })?;
+
+    Ok(JsonRpcRequest::new(raw.id, raw.method, params))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ControlModeSnapshot, DaemonStatus, IpcEndpoint, IpcEndpointEnvironment, IpcEndpointError,
-        IpcEndpointKind, IpcOperatingSystem, IpcPlatformCapabilities, JsonRpcRequest,
-        JsonRpcSuccess, METHOD_DAEMON_STATUS, ProtocolVersionSnapshot, resolve_default_endpoint,
-        to_json_line,
+        IpcEndpointKind, IpcOperatingSystem, IpcPlatformCapabilities, IpcRequest,
+        JSONRPC_ERROR_INVALID_PARAMS, JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE,
+        JsonRpcRequest, JsonRpcSuccess, METHOD_DAEMON_STATUS, ProtocolVersionSnapshot,
+        parse_request_line, resolve_default_endpoint, to_json_line,
     };
     use serde_json::json;
 
@@ -509,6 +636,69 @@ mod tests {
                     }
                 }
             })
+        );
+    }
+
+    #[test]
+    fn parses_daemon_status_request_line() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_DAEMON_STATUS,
+            super::DaemonStatusParams::default(),
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(IpcRequest::DaemonStatus(request))
+        );
+    }
+
+    #[test]
+    fn malformed_request_line_returns_parse_error() {
+        assert_eq!(
+            parse_request_line("{not json"),
+            Err(super::JsonRpcFailure::new(
+                None,
+                super::JsonRpcError::new(JSONRPC_ERROR_PARSE, "parse error")
+            ))
+        );
+    }
+
+    #[test]
+    fn unknown_request_method_returns_method_not_found() {
+        let line = r#"{"jsonrpc":"2.0","id":"req_1","method":"daemon.nope","params":{}}"#;
+
+        assert_eq!(
+            parse_request_line(line),
+            Err(super::JsonRpcFailure::new(
+                Some("req_1".to_string()),
+                super::JsonRpcError::new(
+                    JSONRPC_ERROR_METHOD_NOT_FOUND,
+                    "method not found: daemon.nope"
+                )
+            ))
+        );
+    }
+
+    #[test]
+    fn invalid_request_params_return_invalid_params() {
+        let line = r#"{"jsonrpc":"2.0","id":"req_1","method":"daemon.status","params":[]}"#;
+        let failure = match parse_request_line(line) {
+            Ok(request) => panic!("expected invalid params failure, got {request:?}"),
+            Err(failure) => failure,
+        };
+
+        assert_eq!(failure.id, Some("req_1".to_string()));
+        assert_eq!(failure.error.code, JSONRPC_ERROR_INVALID_PARAMS);
+        assert!(
+            failure
+                .error
+                .message
+                .starts_with("invalid params for daemon.status:")
         );
     }
 
