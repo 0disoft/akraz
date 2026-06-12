@@ -7,7 +7,8 @@ use akraz_core::RuntimeInputState;
 use akraz_ipc::{
     DaemonStatus, IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError,
     JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PermissionIssue,
-    PermissionsProbe, ProtocolVersionSnapshot, parse_request_line, to_json_line,
+    PermissionsProbe, ProtocolVersionSnapshot, parse_request_line, serve_os_local_ipc_once,
+    to_json_line,
 };
 use akraz_platform::{PlatformAdapter, PlatformError};
 use akraz_protocol::ProtocolVersion;
@@ -16,6 +17,36 @@ use akraz_protocol::ProtocolVersion;
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const JSONRPC_DAEMON_ERROR: i32 = -32000;
+
+/// Daemon OS IPC serving configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonIpcRunConfig {
+    endpoint: akraz_ipc::IpcEndpoint,
+    max_requests: Option<usize>,
+}
+
+impl DaemonIpcRunConfig {
+    /// Serve indefinitely at the selected endpoint.
+    pub fn serve_forever(endpoint: akraz_ipc::IpcEndpoint) -> Self {
+        Self {
+            endpoint,
+            max_requests: None,
+        }
+    }
+
+    /// Serve a bounded number of requests at the selected endpoint.
+    pub fn serve_requests(endpoint: akraz_ipc::IpcEndpoint, max_requests: usize) -> Self {
+        Self {
+            endpoint,
+            max_requests: Some(max_requests),
+        }
+    }
+
+    /// The OS IPC endpoint this daemon run will bind.
+    pub fn endpoint(&self) -> &akraz_ipc::IpcEndpoint {
+        &self.endpoint
+    }
+}
 
 /// In-process local IPC server backed by daemon runtime state.
 #[derive(Debug)]
@@ -38,6 +69,29 @@ where
     fn handle_request_line(&self, request_line: &str) -> Result<String, IpcTransportError> {
         handle_ipc_request_line(&self.state, &self.platform, request_line)
             .map_err(|error| IpcTransportError::request_failed(error.to_string()))
+    }
+}
+
+/// Serve daemon IPC requests on an OS-backed endpoint.
+pub fn serve_daemon_ipc<P>(
+    config: &DaemonIpcRunConfig,
+    server: &DaemonIpcServer<P>,
+) -> Result<(), IpcTransportError>
+where
+    P: PlatformAdapter,
+{
+    let mut handled_requests = 0usize;
+
+    loop {
+        if config
+            .max_requests
+            .is_some_and(|max_requests| handled_requests >= max_requests)
+        {
+            return Ok(());
+        }
+
+        serve_os_local_ipc_once(config.endpoint(), server)?;
+        handled_requests += 1;
     }
 }
 
@@ -189,16 +243,16 @@ fn push_missing_capability_issue(
 mod tests {
     use akraz_core::{ControlMode, RuntimeInputState};
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonStatus, DaemonStatusParams, IpcPlatformCapabilities,
-        JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_STATUS,
-        to_json_line,
+        ControlModeSnapshot, DaemonStatus, DaemonStatusParams, IpcEndpoint,
+        IpcPlatformCapabilities, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer,
+        METHOD_DAEMON_STATUS, OsLocalIpcClient, call_json_rpc, to_json_line,
     };
     use akraz_platform::{FakePlatformAdapter, PlatformCapabilities};
     use serde_json::json;
 
     use super::{
-        DAEMON_VERSION, DaemonIpcServer, build_daemon_status, build_permissions_probe,
-        handle_ipc_request_line,
+        DAEMON_VERSION, DaemonIpcRunConfig, DaemonIpcServer, build_daemon_status,
+        build_permissions_probe, handle_ipc_request_line, serve_daemon_ipc,
     };
 
     fn status_or_panic(
@@ -216,6 +270,59 @@ mod tests {
             Ok(probe) => probe,
             Err(error) => panic!("expected permission probe: {error}"),
         }
+    }
+
+    #[cfg(unix)]
+    fn unique_os_endpoint() -> IpcEndpoint {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "akraz-daemon-test-{}-{nanos}.sock",
+            std::process::id()
+        ));
+
+        match IpcEndpoint::unix_socket(path.to_string_lossy().into_owned()) {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("expected Unix socket endpoint: {error}"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn unique_os_endpoint() -> IpcEndpoint {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+
+        match IpcEndpoint::manual(format!(
+            r"\\.\pipe\akraz-daemon-test-{}-{nanos}",
+            std::process::id()
+        )) {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("expected Windows named pipe endpoint: {error}"),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn call_with_short_retry(
+        client: &OsLocalIpcClient,
+        request: &JsonRpcRequest<DaemonStatusParams>,
+    ) -> Result<String, String> {
+        let mut last_error = None;
+        for _ in 0..20 {
+            match call_json_rpc(client, request) {
+                Ok(response) => return Ok(response),
+                Err(error @ akraz_ipc::IpcCallError::Transport { .. }) => {
+                    last_error = Some(error.to_string());
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| "retry exhausted".to_string()))
     }
 
     #[test]
@@ -302,6 +409,40 @@ mod tests {
             Err(error) => panic!("expected daemon status response JSON: {error}"),
         };
 
+        assert_eq!(response.id, "req_1");
+        assert_eq!(response.result.daemon_version, DAEMON_VERSION);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn daemon_ipc_loop_serves_bounded_os_requests() {
+        let endpoint = unique_os_endpoint();
+        let server_endpoint = endpoint.clone();
+        let server_thread = std::thread::spawn(move || {
+            let server =
+                DaemonIpcServer::new(RuntimeInputState::new(), FakePlatformAdapter::default());
+            let config = DaemonIpcRunConfig::serve_requests(server_endpoint, 1);
+
+            serve_daemon_ipc(&config, &server)
+        });
+        let client = OsLocalIpcClient::new(endpoint);
+        let request =
+            JsonRpcRequest::new("req_1", METHOD_DAEMON_STATUS, DaemonStatusParams::default());
+
+        let response_line = match call_with_short_retry(&client, &request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected daemon IPC response: {error}"),
+        };
+        let server_result = match server_thread.join() {
+            Ok(result) => result,
+            Err(_) => panic!("expected daemon IPC server thread to finish"),
+        };
+        let response: JsonRpcSuccess<DaemonStatus> = match serde_json::from_str(&response_line) {
+            Ok(response) => response,
+            Err(error) => panic!("expected daemon status response JSON: {error}"),
+        };
+
+        assert_eq!(server_result, Ok(()));
         assert_eq!(response.id, "req_1");
         assert_eq!(response.result.daemon_version, DAEMON_VERSION);
     }
