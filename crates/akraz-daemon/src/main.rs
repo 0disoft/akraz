@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use akraz_core::RuntimeInputState;
 use akraz_daemon::{DaemonIpcRunConfig, DaemonIpcServer, build_daemon_status, serve_daemon_ipc};
-use akraz_ipc::{IpcEndpoint, resolve_current_default_endpoint};
+use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
 use akraz_platform::FakePlatformAdapter;
 
 fn main() -> ExitCode {
@@ -51,8 +51,19 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
     match serve_daemon_ipc(&config, &server) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("daemon IPC failed: {error}");
+            eprintln!("{}", format_daemon_ipc_error(&error));
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn format_daemon_ipc_error(error: &IpcTransportError) -> String {
+    match error {
+        IpcTransportError::EndpointUnavailable { endpoint, message } => format!(
+            "failed to open daemon IPC endpoint at {endpoint}. Another akraz-daemon may already be running, or the endpoint path may be unavailable. Details: {message}"
+        ),
+        IpcTransportError::RequestFailed { message } => {
+            format!("daemon IPC request failed. Details: {message}")
         }
     }
 }
@@ -172,9 +183,12 @@ impl Display for DaemonUsageError {
 
 #[cfg(test)]
 mod tests {
-    use akraz_ipc::{IpcEndpoint, IpcEndpointKind};
+    use akraz_ipc::{IpcEndpoint, IpcEndpointKind, IpcTransportError};
 
-    use super::{DaemonCommand, DaemonUsageError, ServeOptions, parse_daemon_command};
+    use super::{
+        DaemonCommand, DaemonUsageError, ServeOptions, format_daemon_ipc_error,
+        parse_daemon_command,
+    };
 
     #[test]
     fn default_command_serves_forever_on_default_endpoint() {
@@ -238,6 +252,30 @@ mod tests {
         assert_eq!(
             parse_daemon_command(["--bad"].map(String::from)),
             Err(DaemonUsageError::UnknownArgument("--bad".to_string()))
+        );
+    }
+
+    #[test]
+    fn daemon_ipc_error_reports_unavailable_endpoint_with_lifecycle_hint() {
+        let endpoint = match IpcEndpoint::manual("local-test") {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("expected endpoint: {error}"),
+        };
+        let error = IpcTransportError::endpoint_unavailable(endpoint, "Access is denied.");
+
+        assert_eq!(
+            format_daemon_ipc_error(&error),
+            "failed to open daemon IPC endpoint at local-test. Another akraz-daemon may already be running, or the endpoint path may be unavailable. Details: Access is denied."
+        );
+    }
+
+    #[test]
+    fn daemon_ipc_error_reports_request_failure_detail() {
+        let error = IpcTransportError::request_failed("pipe closed before a request line");
+
+        assert_eq!(
+            format_daemon_ipc_error(&error),
+            "daemon IPC request failed. Details: pipe closed before a request line"
         );
     }
 }

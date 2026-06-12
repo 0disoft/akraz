@@ -3,9 +3,9 @@ use std::fmt::{Display, Formatter};
 use std::process::ExitCode;
 
 use akraz_ipc::{
-    DaemonStatusParams, IpcEndpoint, IpcEndpointError, JsonRpcRequest, METHOD_DAEMON_STATUS,
-    METHOD_PERMISSIONS_PROBE, OsLocalIpcClient, PermissionsProbeParams, call_json_rpc,
-    resolve_current_default_endpoint,
+    DaemonStatusParams, IpcCallError, IpcEndpoint, IpcEndpointError, IpcTransportError,
+    JsonRpcRequest, METHOD_DAEMON_STATUS, METHOD_PERMISSIONS_PROBE, OsLocalIpcClient,
+    PermissionsProbeParams, call_json_rpc, resolve_current_default_endpoint,
 };
 
 const LOCAL_REQUEST_ID: &str = "local";
@@ -98,8 +98,24 @@ where
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("failed to call daemon IPC: {error}");
+            eprintln!("{}", format_daemon_call_error(&error));
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn format_daemon_call_error(error: &IpcCallError) -> String {
+    match error {
+        IpcCallError::Transport {
+            source: IpcTransportError::EndpointUnavailable { endpoint, message },
+        } => format!(
+            "akraz daemon is not reachable at {endpoint}. Start akraz-daemon, or pass --endpoint to use a different IPC endpoint. Details: {message}"
+        ),
+        IpcCallError::Transport {
+            source: IpcTransportError::RequestFailed { message },
+        } => format!("akraz daemon IPC request failed. Details: {message}"),
+        IpcCallError::Encode { source } => {
+            format!("failed to encode daemon IPC request: {source}")
         }
     }
 }
@@ -196,12 +212,13 @@ impl Display for CliRuntimeError {
 #[cfg(test)]
 mod tests {
     use akraz_ipc::{
-        IpcEndpoint, IpcEndpointError, IpcEndpointKind, JsonRpcRequest, LocalIpcClient,
+        IpcCallError, IpcEndpoint, IpcEndpointError, IpcEndpointKind, IpcTransportError,
+        JsonRpcRequest, LocalIpcClient,
     };
 
     use super::{
         CliRuntimeError, CliUsageError, EndpointOptions, LOCAL_REQUEST_ID, METHOD_DAEMON_STATUS,
-        build_daemon_client_with_resolver, parse_endpoint_options,
+        build_daemon_client_with_resolver, format_daemon_call_error, parse_endpoint_options,
     };
 
     #[test]
@@ -293,5 +310,36 @@ mod tests {
         };
 
         assert_eq!(client.endpoint(), &endpoint);
+    }
+
+    #[test]
+    fn daemon_call_error_reports_unreachable_endpoint_with_next_action() {
+        let endpoint = match IpcEndpoint::manual("local-test") {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("expected endpoint: {error}"),
+        };
+        let error = IpcCallError::Transport {
+            source: IpcTransportError::endpoint_unavailable(
+                endpoint,
+                "No process is on the other end of the pipe.",
+            ),
+        };
+
+        assert_eq!(
+            format_daemon_call_error(&error),
+            "akraz daemon is not reachable at local-test. Start akraz-daemon, or pass --endpoint to use a different IPC endpoint. Details: No process is on the other end of the pipe."
+        );
+    }
+
+    #[test]
+    fn daemon_call_error_reports_request_failures_as_ipc_failures() {
+        let error = IpcCallError::Transport {
+            source: IpcTransportError::request_failed("pipe closed before a response line"),
+        };
+
+        assert_eq!(
+            format_daemon_call_error(&error),
+            "akraz daemon IPC request failed. Details: pipe closed before a response line"
+        );
     }
 }
