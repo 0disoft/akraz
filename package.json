@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -14,6 +14,7 @@
     "format:check": "oxfmt --check .",
     "lint": "oxlint . --no-error-on-unmatched-pattern",
     "lint:fix": "oxlint --fix . --no-error-on-unmatched-pattern",
+    "smoke:daemon-lifecycle": "bun run --cwd apps/akraz smoke:daemon-lifecycle",
     "test": "bun test"
   },
   "devDependencies": {

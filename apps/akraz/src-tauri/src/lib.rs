@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
@@ -20,21 +20,109 @@ use tauri_plugin_shell::{
 const LOCAL_REQUEST_ID: &str = "tauri";
 const DAEMON_PATH_ENV: &str = "AKRAZ_DAEMON_PATH";
 const DAEMON_SIDECAR_NAME: &str = "akraz-daemon";
+const DAEMON_LIFECYCLE_SMOKE_FLAG: &str = "--akraz-smoke-daemon-lifecycle";
 const DAEMON_START_RETRIES: usize = 50;
 const DAEMON_START_RETRY_DELAY: Duration = Duration::from_millis(40);
+const DAEMON_STOP_RETRIES: usize = 50;
+const DAEMON_STOP_RETRY_DELAY: Duration = Duration::from_millis(40);
 
 type ManagedDaemon = Arc<Mutex<DaemonProcessState>>;
 
-pub fn run() -> tauri::Result<()> {
+pub fn run() -> Result<(), String> {
+    if should_run_daemon_lifecycle_smoke(std::env::args_os().skip(1)) {
+        return run_daemon_lifecycle_smoke();
+    }
+
+    run_gui().map_err(|error| error.to_string())
+}
+
+fn run_gui() -> tauri::Result<()> {
+    app_builder(Arc::new(Mutex::new(DaemonProcessState::default()))).run(tauri::generate_context!())
+}
+
+fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .manage(Arc::new(Mutex::new(DaemonProcessState::default())))
+        .manage(managed)
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             daemon_start,
             daemon_stop
         ])
-        .run(tauri::generate_context!())
+}
+
+fn should_run_daemon_lifecycle_smoke<I>(args: I) -> bool
+where
+    I: IntoIterator,
+    I::Item: AsRef<OsStr>,
+{
+    args.into_iter()
+        .any(|argument| argument.as_ref() == OsStr::new(DAEMON_LIFECYCLE_SMOKE_FLAG))
+}
+
+fn run_daemon_lifecycle_smoke() -> Result<(), String> {
+    let managed = Arc::new(Mutex::new(DaemonProcessState::default()));
+    let app = app_builder(Arc::clone(&managed))
+        .build(tauri::generate_context!())
+        .map_err(|error| format!("failed to initialize Akraz smoke app: {error}"))?;
+    let handle = app.handle().clone();
+    let initial = refresh_daemon_snapshot(&managed)?;
+    let mut report = DaemonLifecycleSmokeReport::new(initial.clone());
+
+    if initial.phase != DaemonLifecyclePhase::NotRunning {
+        print_smoke_report(&report)?;
+        return Err(format!(
+            "daemon lifecycle smoke requires no existing daemon, but initial phase was {:?}",
+            initial.phase
+        ));
+    }
+
+    let started = start_daemon(&handle, &managed)?;
+    report.started = Some(started.clone());
+    if started.phase != DaemonLifecyclePhase::Running {
+        report.stopped = Some(stop_daemon(&managed)?);
+        print_smoke_report(&report)?;
+        return Err(format!(
+            "daemon lifecycle smoke expected running after start, got {:?}",
+            started.phase
+        ));
+    }
+
+    let stopped = stop_daemon(&managed)?;
+    report.stopped = Some(stopped.clone());
+    print_smoke_report(&report)?;
+    if stopped.phase == DaemonLifecyclePhase::Running {
+        return Err(
+            "daemon lifecycle smoke expected daemon to stop, but it is still running.".to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn print_smoke_report(report: &DaemonLifecycleSmokeReport) -> Result<(), String> {
+    let line = serde_json::to_string(report)
+        .map_err(|error| format!("failed to encode daemon lifecycle smoke report: {error}"))?;
+    println!("{line}");
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DaemonLifecycleSmokeReport {
+    initial: DaemonLifecycleSnapshot,
+    started: Option<DaemonLifecycleSnapshot>,
+    stopped: Option<DaemonLifecycleSnapshot>,
+}
+
+impl DaemonLifecycleSmokeReport {
+    fn new(initial: DaemonLifecycleSnapshot) -> Self {
+        Self {
+            initial,
+            started: None,
+            stopped: None,
+        }
+    }
 }
 
 #[tauri::command]
@@ -255,7 +343,7 @@ fn stop_daemon(managed: &ManagedDaemon) -> Result<DaemonLifecycleSnapshot, Strin
         return Ok(DaemonLifecycleSnapshot::failed(error));
     }
 
-    Ok(read_daemon_snapshot().with_detail("Akraz stopped."))
+    Ok(wait_for_stopped_daemon_snapshot())
 }
 
 fn read_daemon_snapshot() -> DaemonLifecycleSnapshot {
@@ -263,6 +351,22 @@ fn read_daemon_snapshot() -> DaemonLifecycleSnapshot {
         Ok(status) => DaemonLifecycleSnapshot::running(status, None),
         Err(snapshot) => snapshot,
     }
+}
+
+fn wait_for_stopped_daemon_snapshot() -> DaemonLifecycleSnapshot {
+    let mut last_snapshot = read_daemon_snapshot();
+    for _ in 0..DAEMON_STOP_RETRIES {
+        if last_snapshot.phase == DaemonLifecyclePhase::NotRunning {
+            return last_snapshot.with_detail("Akraz stopped.");
+        }
+
+        thread::sleep(DAEMON_STOP_RETRY_DELAY);
+        last_snapshot = read_daemon_snapshot();
+    }
+
+    last_snapshot.with_detail(
+        "Akraz stop was requested, but the daemon endpoint did not settle before the timeout.",
+    )
 }
 
 fn call_daemon_status() -> Result<DaemonStatus, DaemonLifecycleSnapshot> {
@@ -512,8 +616,9 @@ mod tests {
     };
 
     use super::{
-        DAEMON_SIDECAR_NAME, DaemonLifecyclePhase, classify_daemon_call_error,
-        daemon_executable_name, parse_daemon_status_response, resolve_env_daemon_executable_from,
+        DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_SIDECAR_NAME, DaemonLifecyclePhase,
+        classify_daemon_call_error, daemon_executable_name, parse_daemon_status_response,
+        resolve_env_daemon_executable_from, should_run_daemon_lifecycle_smoke,
     };
 
     fn status_fixture() -> DaemonStatus {
@@ -609,6 +714,23 @@ mod tests {
     #[test]
     fn sidecar_name_matches_tauri_external_bin_basename() {
         assert_eq!(DAEMON_SIDECAR_NAME, "akraz-daemon");
+    }
+
+    #[test]
+    fn daemon_lifecycle_smoke_flag_is_explicit_and_hidden() {
+        assert!(should_run_daemon_lifecycle_smoke([OsString::from(
+            DAEMON_LIFECYCLE_SMOKE_FLAG
+        )]));
+        assert!(should_run_daemon_lifecycle_smoke([
+            OsString::from("--ordinary-open-argument"),
+            OsString::from(DAEMON_LIFECYCLE_SMOKE_FLAG)
+        ]));
+        assert!(!should_run_daemon_lifecycle_smoke([OsString::from(
+            "--smoke-daemon-lifecycle"
+        )]));
+        assert!(!should_run_daemon_lifecycle_smoke([OsString::from(
+            "document.akraz"
+        )]));
     }
 
     #[test]
