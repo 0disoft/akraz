@@ -1,0 +1,29 @@
+[package]
+name = "akraz-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[lib]
+name = "akraz_app_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "akraz"
+path = "src/main.rs"
+
+[dependencies]
+akraz-ipc = { path = "../../../crates/akraz-ipc" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = "2.11.2"
+
+[build-dependencies]
+tauri-build = "2.6.2"

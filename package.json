@@ -8,7 +8,8 @@
   ],
   "type": "module",
   "scripts": {
-    "check": "bun run format:check && bun run lint",
+    "build": "bun run --cwd apps/akraz build",
+    "check": "bun run format:check && bun run lint && bun run --cwd apps/akraz check && bun run build",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint . --no-error-on-unmatched-pattern",
