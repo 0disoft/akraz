@@ -1,9 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 
-import type { DaemonStatus } from "./types";
+import type { DaemonLifecycleSnapshot } from "./types";
 
 export const daemonClient = {
-  status(): Promise<DaemonStatus> {
-    return invoke<DaemonStatus>("daemon_status");
+  status(): Promise<DaemonLifecycleSnapshot> {
+    return invoke<DaemonLifecycleSnapshot>("daemon_status");
+  },
+
+  start(): Promise<DaemonLifecycleSnapshot> {
+    return invoke<DaemonLifecycleSnapshot>("daemon_start");
+  },
+
+  stop(): Promise<DaemonLifecycleSnapshot> {
+    return invoke<DaemonLifecycleSnapshot>("daemon_stop");
   },
 };

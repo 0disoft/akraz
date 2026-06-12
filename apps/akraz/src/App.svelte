@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
 
   import { daemonState } from './lib/state/daemonState.svelte';
-  import type { ControlMode, PlatformCapabilities } from './lib/api/types';
+  import type { ControlMode, DaemonLifecyclePhase, PlatformCapabilities } from './lib/api/types';
 
   const modeLabels: Record<ControlMode, string> = {
     Local: '로컬',
@@ -10,6 +10,14 @@
     Remote: '원격 제어 중',
     LeavingRemote: '돌아오는 중',
     Suspended: '일시정지',
+  };
+
+  const phaseLabels: Record<DaemonLifecyclePhase, string> = {
+    not_running: '꺼져 있음',
+    starting: '시작 중',
+    running: '연결됨',
+    unreachable: '응답 없음',
+    failed: '확인 실패',
   };
 
   const capabilityRows: Array<{ key: keyof PlatformCapabilities; label: string }> = [
@@ -22,6 +30,23 @@
   onMount(() => {
     void daemonState.refresh();
   });
+
+  function canStartDaemon() {
+    const phase = daemonState.snapshot?.phase;
+    return phase === undefined || phase === 'not_running';
+  }
+
+  function canStopDaemon() {
+    return daemonState.snapshot?.phase === 'running' && daemonState.snapshot.managedPid !== null;
+  }
+
+  function statusMessage() {
+    if (daemonState.lastError) {
+      return daemonState.lastError;
+    }
+
+    return daemonState.snapshot?.detail ?? '백그라운드 연결을 시작할 수 있어.';
+  }
 </script>
 
 <main class="shell">
@@ -31,9 +56,32 @@
         <p class="eyebrow">Akraz</p>
         <h1 id="home-title">입력 공유 상태</h1>
       </div>
-      <button type="button" class="refresh-button" disabled={daemonState.isLoading} onclick={() => daemonState.refresh()}>
-        {daemonState.isLoading ? '확인 중' : '새로고침'}
-      </button>
+      <div class="action-row" aria-label="데몬 제어">
+        <button
+          type="button"
+          class="control-button secondary"
+          disabled={daemonState.isBusy}
+          onclick={() => daemonState.refresh()}
+        >
+          {daemonState.operation === 'refresh' ? '확인 중' : '새로고침'}
+        </button>
+        <button
+          type="button"
+          class="control-button"
+          disabled={daemonState.isBusy || !canStartDaemon()}
+          onclick={() => daemonState.start()}
+        >
+          {daemonState.operation === 'start' ? '시작 중' : '시작'}
+        </button>
+        <button
+          type="button"
+          class="control-button danger"
+          disabled={daemonState.isBusy || !canStopDaemon()}
+          onclick={() => daemonState.stop()}
+        >
+          {daemonState.operation === 'stop' ? '끄는 중' : '중지'}
+        </button>
+      </div>
     </div>
 
     {#if daemonState.status}
@@ -83,8 +131,10 @@
       <div class="status-summary error" aria-live="polite">
         <span class="status-dot error" aria-hidden="true"></span>
         <div>
-          <p class="summary-label">데몬 연결 안 됨</p>
-          <p class="summary-value">{daemonState.lastError ?? 'akraz-daemon을 먼저 실행해야 해.'}</p>
+          <p class="summary-label">
+            {daemonState.snapshot ? phaseLabels[daemonState.snapshot.phase] : '확인 전'}
+          </p>
+          <p class="summary-value">{statusMessage()}</p>
         </div>
       </div>
     {/if}

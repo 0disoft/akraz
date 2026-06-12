@@ -25,3 +25,17 @@ export interface DaemonStatus {
   peers: PeerStatus[];
   capabilities: PlatformCapabilities;
 }
+
+export type DaemonLifecyclePhase =
+  | "not_running"
+  | "starting"
+  | "running"
+  | "unreachable"
+  | "failed";
+
+export interface DaemonLifecycleSnapshot {
+  phase: DaemonLifecyclePhase;
+  status: DaemonStatus | null;
+  detail: string | null;
+  managedPid: number | null;
+}

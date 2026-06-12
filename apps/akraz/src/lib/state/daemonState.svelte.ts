@@ -1,22 +1,42 @@
 import { daemonClient } from "../api/daemonClient";
-import type { DaemonStatus } from "../api/types";
+import type { DaemonLifecycleSnapshot, DaemonStatus } from "../api/types";
+
+type DaemonOperation = "refresh" | "start" | "stop";
 
 export class DaemonState {
-  status = $state<DaemonStatus | null>(null);
-  isLoading = $state(false);
+  snapshot = $state<DaemonLifecycleSnapshot | null>(null);
+  operation = $state<DaemonOperation | null>(null);
   lastError = $state<string | null>(null);
 
-  async refresh() {
-    this.isLoading = true;
-    this.lastError = null;
+  get status(): DaemonStatus | null {
+    return this.snapshot?.status ?? null;
+  }
 
+  get isBusy(): boolean {
+    return this.operation !== null;
+  }
+
+  async refresh() {
+    await this.run("refresh", () => daemonClient.status());
+  }
+
+  async start() {
+    await this.run("start", () => daemonClient.start());
+  }
+
+  async stop() {
+    await this.run("stop", () => daemonClient.stop());
+  }
+
+  private async run(operation: DaemonOperation, action: () => Promise<DaemonLifecycleSnapshot>) {
+    this.operation = operation;
+    this.lastError = null;
     try {
-      this.status = await daemonClient.status();
+      this.snapshot = await action();
     } catch (error) {
-      this.status = null;
       this.lastError = error instanceof Error ? error.message : String(error);
     } finally {
-      this.isLoading = false;
+      this.operation = null;
     }
   }
 }
