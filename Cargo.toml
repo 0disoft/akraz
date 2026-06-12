@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/akraz-core",
+  "crates/akraz-protocol",
+  "crates/akraz-platform",
+  "crates/akraz-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+authors = ["Akraz contributors"]
+repository = "https://github.com/akraz/akraz"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"

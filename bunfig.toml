@@ -1,0 +1,11 @@
+telemetry = false
+
+[install]
+auto = "disable"
+exact = true
+
+[install.lockfile]
+save = true
+
+[test]
+coverage = false
