@@ -5,8 +5,9 @@ use std::process::ExitCode;
 use akraz_core::RuntimeInputState;
 use akraz_daemon::DaemonIpcServer;
 use akraz_ipc::{
-    DaemonStatusParams, InProcessIpcClient, IpcEndpoint, JsonRpcRequest, METHOD_DAEMON_STATUS,
-    METHOD_PERMISSIONS_PROBE, PermissionsProbeParams, call_json_rpc,
+    DaemonStatusParams, InProcessIpcClient, IpcEndpoint, JsonRpcRequest, LocalIpcClient,
+    METHOD_DAEMON_STATUS, METHOD_PERMISSIONS_PROBE, OsLocalIpcClient, PermissionsProbeParams,
+    call_json_rpc,
 };
 use akraz_platform::FakePlatformAdapter;
 
@@ -103,14 +104,42 @@ where
 
 fn build_local_diagnostic_client(
     endpoint: Option<IpcEndpoint>,
-) -> Result<InProcessIpcClient<DaemonIpcServer<FakePlatformAdapter>>, CliRuntimeError> {
-    let endpoint = match endpoint {
-        Some(endpoint) => endpoint,
-        None => IpcEndpoint::manual(LOCAL_DIAGNOSTIC_ENDPOINT).map_err(CliRuntimeError::from)?,
-    };
+) -> Result<DiagnosticIpcClient, CliRuntimeError> {
+    if let Some(endpoint) = endpoint {
+        return Ok(DiagnosticIpcClient::Os(OsLocalIpcClient::new(endpoint)));
+    }
+
+    let endpoint = IpcEndpoint::manual(LOCAL_DIAGNOSTIC_ENDPOINT).map_err(CliRuntimeError::from)?;
     let server = DaemonIpcServer::new(RuntimeInputState::new(), FakePlatformAdapter::default());
 
-    Ok(InProcessIpcClient::new(endpoint, server))
+    Ok(DiagnosticIpcClient::InProcess(InProcessIpcClient::new(
+        endpoint, server,
+    )))
+}
+
+#[derive(Debug)]
+enum DiagnosticIpcClient {
+    InProcess(InProcessIpcClient<DaemonIpcServer<FakePlatformAdapter>>),
+    Os(OsLocalIpcClient),
+}
+
+impl LocalIpcClient for DiagnosticIpcClient {
+    fn endpoint(&self) -> &IpcEndpoint {
+        match self {
+            Self::InProcess(client) => client.endpoint(),
+            Self::Os(client) => client.endpoint(),
+        }
+    }
+
+    fn send_request_line(
+        &self,
+        request_line: &str,
+    ) -> Result<String, akraz_ipc::IpcTransportError> {
+        match self {
+            Self::InProcess(client) => client.send_request_line(request_line),
+            Self::Os(client) => client.send_request_line(request_line),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,11 +272,7 @@ mod tests {
 
     #[test]
     fn local_diagnostic_client_calls_daemon_through_ipc_transport() {
-        let endpoint = match IpcEndpoint::manual("in-process://test") {
-            Ok(endpoint) => endpoint,
-            Err(error) => panic!("expected endpoint: {error}"),
-        };
-        let client = match build_local_diagnostic_client(Some(endpoint.clone())) {
+        let client = match build_local_diagnostic_client(None) {
             Ok(client) => client,
             Err(error) => panic!("expected diagnostic client: {error}"),
         };
@@ -266,8 +291,22 @@ mod tests {
             Err(error) => panic!("expected daemon status response JSON: {error}"),
         };
 
-        assert_eq!(client.endpoint(), &endpoint);
+        assert_eq!(client.endpoint().address, super::LOCAL_DIAGNOSTIC_ENDPOINT);
         assert_eq!(response.id, LOCAL_REQUEST_ID);
         assert_eq!(response.result.daemon_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn explicit_status_endpoint_selects_os_ipc_client() {
+        let endpoint = match IpcEndpoint::manual("explicit-endpoint") {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("expected endpoint: {error}"),
+        };
+        let client = match build_local_diagnostic_client(Some(endpoint.clone())) {
+            Ok(client) => client,
+            Err(error) => panic!("expected diagnostic client: {error}"),
+        };
+
+        assert_eq!(client.endpoint(), &endpoint);
     }
 }

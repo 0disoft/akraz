@@ -2,13 +2,43 @@
 
 use std::env;
 use std::error::Error;
+#[cfg(windows)]
+use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(windows)]
+use std::ptr::{null, null_mut};
 
 use akraz_core::ControlMode;
 use akraz_platform::PlatformCapabilities;
 use akraz_protocol::ProtocolVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
+    PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+};
 
 /// JSON-RPC protocol marker used by akraz local IPC.
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -176,6 +206,385 @@ where
 
     fn send_request_line(&self, request_line: &str) -> Result<String, IpcTransportError> {
         self.server.handle_request_line(request_line)
+    }
+}
+
+/// OS-backed local IPC client.
+#[derive(Debug, Clone)]
+pub struct OsLocalIpcClient {
+    endpoint: IpcEndpoint,
+}
+
+impl OsLocalIpcClient {
+    /// Create an OS-backed local IPC client.
+    pub fn new(endpoint: IpcEndpoint) -> Self {
+        Self { endpoint }
+    }
+}
+
+impl LocalIpcClient for OsLocalIpcClient {
+    fn endpoint(&self) -> &IpcEndpoint {
+        &self.endpoint
+    }
+
+    fn send_request_line(&self, request_line: &str) -> Result<String, IpcTransportError> {
+        send_os_request_line(&self.endpoint, request_line)
+    }
+}
+
+/// Serve one OS-backed local IPC request and write its response.
+pub fn serve_os_local_ipc_once<S>(
+    endpoint: &IpcEndpoint,
+    server: &S,
+) -> Result<(), IpcTransportError>
+where
+    S: LocalIpcServer,
+{
+    serve_os_request_once(endpoint, server)
+}
+
+#[cfg(unix)]
+fn send_os_request_line(
+    endpoint: &IpcEndpoint,
+    request_line: &str,
+) -> Result<String, IpcTransportError> {
+    match endpoint.kind {
+        IpcEndpointKind::UnixSocket | IpcEndpointKind::Manual => {
+            let mut stream = UnixStream::connect(&endpoint.address).map_err(|error| {
+                IpcTransportError::endpoint_unavailable(endpoint.clone(), error.to_string())
+            })?;
+            stream
+                .write_all(request_line.as_bytes())
+                .map_err(|error| IpcTransportError::request_failed(error.to_string()))?;
+            stream
+                .flush()
+                .map_err(|error| IpcTransportError::request_failed(error.to_string()))?;
+
+            read_response_line(BufReader::new(stream))
+        }
+        IpcEndpointKind::WindowsNamedPipe => Err(IpcTransportError::endpoint_unavailable(
+            endpoint.clone(),
+            "Windows named pipes are not available on this platform",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn serve_os_request_once<S>(endpoint: &IpcEndpoint, server: &S) -> Result<(), IpcTransportError>
+where
+    S: LocalIpcServer,
+{
+    match endpoint.kind {
+        IpcEndpointKind::UnixSocket | IpcEndpointKind::Manual => {
+            prepare_unix_socket_path(endpoint)?;
+            let listener = UnixListener::bind(&endpoint.address).map_err(|error| {
+                IpcTransportError::endpoint_unavailable(endpoint.clone(), error.to_string())
+            })?;
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| IpcTransportError::request_failed(error.to_string()))?;
+            let request_line = read_request_line(BufReader::new(
+                stream
+                    .try_clone()
+                    .map_err(|error| IpcTransportError::request_failed(error.to_string()))?,
+            ))?;
+            let response_line = server.handle_request_line(&request_line)?;
+            stream
+                .write_all(response_line.as_bytes())
+                .map_err(|error| IpcTransportError::request_failed(error.to_string()))?;
+            stream
+                .flush()
+                .map_err(|error| IpcTransportError::request_failed(error.to_string()))?;
+            cleanup_unix_socket_path(endpoint);
+
+            Ok(())
+        }
+        IpcEndpointKind::WindowsNamedPipe => Err(IpcTransportError::endpoint_unavailable(
+            endpoint.clone(),
+            "Windows named pipes are not available on this platform",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn prepare_unix_socket_path(endpoint: &IpcEndpoint) -> Result<(), IpcTransportError> {
+    let path = Path::new(&endpoint.address);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            IpcTransportError::endpoint_unavailable(endpoint.clone(), error.to_string())
+        })?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            fs::remove_file(path).map_err(|error| {
+                IpcTransportError::endpoint_unavailable(endpoint.clone(), error.to_string())
+            })
+        }
+        Ok(_) => Err(IpcTransportError::endpoint_unavailable(
+            endpoint.clone(),
+            "socket path exists and is not a Unix socket",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(IpcTransportError::endpoint_unavailable(
+            endpoint.clone(),
+            error.to_string(),
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_unix_socket_path(endpoint: &IpcEndpoint) {
+    let path = Path::new(&endpoint.address);
+    let _ = fs::remove_file(path);
+}
+
+#[cfg(windows)]
+fn send_os_request_line(
+    endpoint: &IpcEndpoint,
+    request_line: &str,
+) -> Result<String, IpcTransportError> {
+    match endpoint.kind {
+        IpcEndpointKind::WindowsNamedPipe | IpcEndpointKind::Manual => {
+            let pipe_name = wide_null(&endpoint.address);
+            // SAFETY: `pipe_name` is a null-terminated UTF-16 buffer that remains alive for the
+            // duration of the call, and all pointer parameters either point to valid values or null.
+            let handle = unsafe {
+                CreateFileW(
+                    pipe_name.as_ptr(),
+                    FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                    0,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(IpcTransportError::endpoint_unavailable(
+                    endpoint.clone(),
+                    std::io::Error::last_os_error().to_string(),
+                ));
+            }
+
+            let handle = OwnedWindowsHandle::new(handle);
+            write_windows_pipe(handle.raw(), request_line.as_bytes())?;
+            read_windows_pipe_line(handle.raw())
+        }
+        IpcEndpointKind::UnixSocket => Err(IpcTransportError::endpoint_unavailable(
+            endpoint.clone(),
+            "Unix sockets are not available on this platform",
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn serve_os_request_once<S>(endpoint: &IpcEndpoint, server: &S) -> Result<(), IpcTransportError>
+where
+    S: LocalIpcServer,
+{
+    match endpoint.kind {
+        IpcEndpointKind::WindowsNamedPipe | IpcEndpointKind::Manual => {
+            let pipe_name = wide_null(&endpoint.address);
+            // SAFETY: `pipe_name` is a null-terminated UTF-16 buffer that remains alive for the
+            // duration of the call, and the security attributes pointer is intentionally null.
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    pipe_name.as_ptr(),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    PIPE_UNLIMITED_INSTANCES,
+                    4096,
+                    4096,
+                    0,
+                    null(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(IpcTransportError::endpoint_unavailable(
+                    endpoint.clone(),
+                    std::io::Error::last_os_error().to_string(),
+                ));
+            }
+
+            let handle = OwnedWindowsHandle::new(handle);
+            // SAFETY: `handle` is a valid named-pipe handle from `CreateNamedPipeW`; no overlapped
+            // structure is used because this synchronous one-shot server blocks for one client.
+            let connected = unsafe { ConnectNamedPipe(handle.raw(), null_mut()) != 0 };
+            if !connected {
+                // SAFETY: `GetLastError` reads the current thread's last Win32 error.
+                let error = unsafe { GetLastError() };
+                if error != ERROR_PIPE_CONNECTED {
+                    return Err(IpcTransportError::request_failed(
+                        std::io::Error::last_os_error().to_string(),
+                    ));
+                }
+            }
+
+            let request_line = read_windows_pipe_line(handle.raw())?;
+            let response_line = server.handle_request_line(&request_line)?;
+            write_windows_pipe(handle.raw(), response_line.as_bytes())
+        }
+        IpcEndpointKind::UnixSocket => Err(IpcTransportError::endpoint_unavailable(
+            endpoint.clone(),
+            "Unix sockets are not available on this platform",
+        )),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct OwnedWindowsHandle(HANDLE);
+
+#[cfg(windows)]
+impl OwnedWindowsHandle {
+    fn new(handle: HANDLE) -> Self {
+        Self(handle)
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedWindowsHandle {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is owned by this wrapper and is closed exactly once on drop.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    OsStr::new(value).encode_wide().chain([0]).collect()
+}
+
+#[cfg(windows)]
+fn write_windows_pipe(handle: HANDLE, bytes: &[u8]) -> Result<(), IpcTransportError> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let chunk = &bytes[offset..];
+        let mut written = 0u32;
+        // SAFETY: `handle` is a valid pipe handle, `chunk.as_ptr()` is valid for `chunk.len()`
+        // bytes, and `written` is a valid out pointer for the synchronous call.
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                chunk.as_ptr().cast(),
+                chunk.len().try_into().unwrap_or(u32::MAX),
+                &mut written,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(IpcTransportError::request_failed(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        if written == 0 {
+            return Err(IpcTransportError::request_failed(
+                "pipe write made no progress",
+            ));
+        }
+        offset += written as usize;
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_windows_pipe_line(handle: HANDLE) -> Result<String, IpcTransportError> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        let mut read = 0u32;
+        // SAFETY: `handle` is a valid pipe handle, `buffer` is writable for its length, and `read`
+        // is a valid out pointer for the synchronous call.
+        let ok = unsafe {
+            ReadFile(
+                handle,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                &mut read,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(IpcTransportError::request_failed(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        if read == 0 {
+            return Err(IpcTransportError::request_failed(
+                "pipe closed before a response line was received",
+            ));
+        }
+
+        let chunk = &buffer[..read as usize];
+        bytes.extend_from_slice(chunk);
+        if chunk.contains(&b'\n') {
+            break;
+        }
+    }
+
+    String::from_utf8(bytes).map_err(|error| IpcTransportError::request_failed(error.to_string()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn send_os_request_line(
+    endpoint: &IpcEndpoint,
+    _request_line: &str,
+) -> Result<String, IpcTransportError> {
+    Err(IpcTransportError::endpoint_unavailable(
+        endpoint.clone(),
+        "OS local IPC is not available on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn serve_os_request_once<S>(endpoint: &IpcEndpoint, _server: &S) -> Result<(), IpcTransportError>
+where
+    S: LocalIpcServer,
+{
+    Err(IpcTransportError::endpoint_unavailable(
+        endpoint.clone(),
+        "OS local IPC is not available on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn read_request_line<R>(reader: R) -> Result<String, IpcTransportError>
+where
+    R: BufRead,
+{
+    read_ipc_line(reader, "request")
+}
+
+#[cfg(unix)]
+fn read_response_line<R>(reader: R) -> Result<String, IpcTransportError>
+where
+    R: BufRead,
+{
+    read_ipc_line(reader, "response")
+}
+
+#[cfg(unix)]
+fn read_ipc_line<R>(mut reader: R, label: &'static str) -> Result<String, IpcTransportError>
+where
+    R: BufRead,
+{
+    let mut line = String::new();
+    let read = reader
+        .read_line(&mut line)
+        .map_err(|error| IpcTransportError::request_failed(error.to_string()))?;
+    if read == 0 {
+        Err(IpcTransportError::request_failed(format!(
+            "IPC {label} stream closed before a line was received"
+        )))
+    } else {
+        Ok(line)
     }
 }
 
@@ -691,8 +1100,9 @@ mod tests {
         IpcEndpointEnvironment, IpcEndpointError, IpcEndpointKind, IpcOperatingSystem,
         IpcPlatformCapabilities, IpcRequest, IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS,
         JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess,
-        LocalIpcClient, LocalIpcServer, METHOD_DAEMON_STATUS, ProtocolVersionSnapshot,
-        call_json_rpc, parse_request_line, resolve_default_endpoint, to_json_line,
+        LocalIpcClient, LocalIpcServer, METHOD_DAEMON_STATUS, OsLocalIpcClient,
+        ProtocolVersionSnapshot, call_json_rpc, parse_request_line, resolve_default_endpoint,
+        serve_os_local_ipc_once, to_json_line,
     };
     use serde_json::json;
 
@@ -719,6 +1129,59 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("expected valid JSON: {error}"),
         }
+    }
+
+    #[cfg(unix)]
+    fn unique_os_endpoint() -> IpcEndpoint {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "akraz-ipc-test-{}-{nanos}.sock",
+            std::process::id()
+        ));
+
+        match IpcEndpoint::unix_socket(path.to_string_lossy().into_owned()) {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("expected Unix socket endpoint: {error}"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn unique_os_endpoint() -> IpcEndpoint {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+
+        match IpcEndpoint::manual(format!(
+            r"\\.\pipe\akraz-ipc-test-{}-{nanos}",
+            std::process::id()
+        )) {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("expected Windows named pipe endpoint: {error}"),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn send_with_short_retry(
+        client: &OsLocalIpcClient,
+        request_line: &str,
+    ) -> Result<String, IpcTransportError> {
+        let mut last_error = None;
+        for _ in 0..20 {
+            match client.send_request_line(request_line) {
+                Ok(response) => return Ok(response),
+                Err(error @ IpcTransportError::EndpointUnavailable { .. }) => {
+                    last_error = Some(error);
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| IpcTransportError::request_failed("retry exhausted")))
     }
 
     #[test]
@@ -845,6 +1308,27 @@ mod tests {
         };
 
         assert_eq!(error.to_string(), "IPC request failed: server unavailable");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn os_local_ipc_client_and_server_exchange_one_request_line() {
+        let endpoint = unique_os_endpoint();
+        let server_endpoint = endpoint.clone();
+        let server_thread = std::thread::spawn(move || {
+            let server = EchoServer;
+            serve_os_local_ipc_once(&server_endpoint, &server)
+        });
+        let client = OsLocalIpcClient::new(endpoint);
+
+        let response = send_with_short_retry(&client, "ping\n");
+        let server_result = match server_thread.join() {
+            Ok(result) => result,
+            Err(_) => panic!("expected OS IPC server thread to finish"),
+        };
+
+        assert_eq!(server_result, Ok(()));
+        assert_eq!(response, Ok("handled:ping\n".to_string()));
     }
 
     #[test]
