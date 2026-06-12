@@ -20,3 +20,6 @@ akraz-daemon = { path = "../akraz-daemon" }
 akraz-ipc = { path = "../akraz-ipc" }
 akraz-platform = { path = "../akraz-platform" }
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

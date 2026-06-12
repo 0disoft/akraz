@@ -95,6 +95,90 @@ impl Display for IpcEndpoint {
     }
 }
 
+/// Local IPC transport failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcTransportError {
+    EndpointUnavailable {
+        endpoint: IpcEndpoint,
+        message: String,
+    },
+    RequestFailed {
+        message: String,
+    },
+}
+
+impl IpcTransportError {
+    /// Build an endpoint-unavailable transport error.
+    pub fn endpoint_unavailable(endpoint: IpcEndpoint, message: impl Into<String>) -> Self {
+        Self::EndpointUnavailable {
+            endpoint,
+            message: message.into(),
+        }
+    }
+
+    /// Build a request-failed transport error.
+    pub fn request_failed(message: impl Into<String>) -> Self {
+        Self::RequestFailed {
+            message: message.into(),
+        }
+    }
+}
+
+impl Display for IpcTransportError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EndpointUnavailable { endpoint, message } => {
+                write!(
+                    formatter,
+                    "IPC endpoint unavailable at {endpoint}: {message}"
+                )
+            }
+            Self::RequestFailed { message } => write!(formatter, "IPC request failed: {message}"),
+        }
+    }
+}
+
+impl Error for IpcTransportError {}
+
+/// Local IPC server contract used by OS transports and in-process diagnostics.
+pub trait LocalIpcServer {
+    fn handle_request_line(&self, request_line: &str) -> Result<String, IpcTransportError>;
+}
+
+/// Local IPC client contract used by CLI and UI callers.
+pub trait LocalIpcClient {
+    fn endpoint(&self) -> &IpcEndpoint;
+
+    fn send_request_line(&self, request_line: &str) -> Result<String, IpcTransportError>;
+}
+
+/// In-process local IPC client used until OS pipe/socket transports are attached.
+#[derive(Debug, Clone)]
+pub struct InProcessIpcClient<S> {
+    endpoint: IpcEndpoint,
+    server: S,
+}
+
+impl<S> InProcessIpcClient<S> {
+    /// Create an in-process client backed by a local server implementation.
+    pub fn new(endpoint: IpcEndpoint, server: S) -> Self {
+        Self { endpoint, server }
+    }
+}
+
+impl<S> LocalIpcClient for InProcessIpcClient<S>
+where
+    S: LocalIpcServer,
+{
+    fn endpoint(&self) -> &IpcEndpoint {
+        &self.endpoint
+    }
+
+    fn send_request_line(&self, request_line: &str) -> Result<String, IpcTransportError> {
+        self.server.handle_request_line(request_line)
+    }
+}
+
 /// Environment facts used to resolve the default local IPC endpoint.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IpcEndpointEnvironment {
@@ -479,6 +563,53 @@ where
         .map_err(IpcCodecError::from_source)
 }
 
+/// Encode and send one JSON-RPC request over a local IPC client.
+pub fn call_json_rpc<C, P>(client: &C, request: &JsonRpcRequest<P>) -> Result<String, IpcCallError>
+where
+    C: LocalIpcClient,
+    P: Serialize,
+{
+    let request_line = to_json_line(request).map_err(IpcCallError::from_codec)?;
+    client
+        .send_request_line(&request_line)
+        .map_err(IpcCallError::from_transport)
+}
+
+/// Local IPC call failure at either encoding or transport boundary.
+#[derive(Debug)]
+pub enum IpcCallError {
+    Encode { source: IpcCodecError },
+    Transport { source: IpcTransportError },
+}
+
+impl IpcCallError {
+    fn from_codec(source: IpcCodecError) -> Self {
+        Self::Encode { source }
+    }
+
+    fn from_transport(source: IpcTransportError) -> Self {
+        Self::Transport { source }
+    }
+}
+
+impl Display for IpcCallError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encode { source } => write!(formatter, "failed to encode IPC request: {source}"),
+            Self::Transport { source } => write!(formatter, "{source}"),
+        }
+    }
+}
+
+impl Error for IpcCallError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Encode { source } => Some(source),
+            Self::Transport { source } => Some(source),
+        }
+    }
+}
+
 /// Parse and classify a single JSON-RPC request line.
 pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
     let value: Value = match serde_json::from_str(line) {
@@ -556,13 +687,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlModeSnapshot, DaemonStatus, IpcEndpoint, IpcEndpointEnvironment, IpcEndpointError,
-        IpcEndpointKind, IpcOperatingSystem, IpcPlatformCapabilities, IpcRequest,
-        JSONRPC_ERROR_INVALID_PARAMS, JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE,
-        JsonRpcRequest, JsonRpcSuccess, METHOD_DAEMON_STATUS, ProtocolVersionSnapshot,
-        parse_request_line, resolve_default_endpoint, to_json_line,
+        ControlModeSnapshot, DaemonStatus, DaemonStatusParams, InProcessIpcClient, IpcEndpoint,
+        IpcEndpointEnvironment, IpcEndpointError, IpcEndpointKind, IpcOperatingSystem,
+        IpcPlatformCapabilities, IpcRequest, IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS,
+        JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess,
+        LocalIpcClient, LocalIpcServer, METHOD_DAEMON_STATUS, ProtocolVersionSnapshot,
+        call_json_rpc, parse_request_line, resolve_default_endpoint, to_json_line,
     };
     use serde_json::json;
+
+    #[derive(Debug, Clone)]
+    struct EchoServer;
+
+    impl LocalIpcServer for EchoServer {
+        fn handle_request_line(&self, request_line: &str) -> Result<String, IpcTransportError> {
+            Ok(format!("handled:{request_line}"))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FailingServer;
+
+    impl LocalIpcServer for FailingServer {
+        fn handle_request_line(&self, _request_line: &str) -> Result<String, IpcTransportError> {
+            Err(IpcTransportError::request_failed("server unavailable"))
+        }
+    }
 
     fn json_value_or_panic(line: &str) -> serde_json::Value {
         match serde_json::from_str(line) {
@@ -637,6 +787,64 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn in_process_client_sends_request_lines_to_server() {
+        let endpoint = match IpcEndpoint::manual("in-process://test") {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("expected endpoint: {error}"),
+        };
+        let client = InProcessIpcClient::new(endpoint.clone(), EchoServer);
+
+        assert_eq!(client.endpoint(), &endpoint);
+        assert_eq!(
+            client.send_request_line("request\n"),
+            Ok("handled:request\n".to_string())
+        );
+    }
+
+    #[test]
+    fn local_json_rpc_call_encodes_request_before_transport_send() {
+        let endpoint = match IpcEndpoint::manual("in-process://test") {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("expected endpoint: {error}"),
+        };
+        let client = InProcessIpcClient::new(endpoint, EchoServer);
+        let request =
+            JsonRpcRequest::new("req_1", METHOD_DAEMON_STATUS, DaemonStatusParams::default());
+        let response_line = match call_json_rpc(&client, &request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected local JSON-RPC response: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&response_line[8..]),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "method": "daemon.status",
+                "params": {}
+            })
+        );
+    }
+
+    #[test]
+    fn local_json_rpc_call_returns_transport_failures() {
+        let endpoint = match IpcEndpoint::manual("in-process://test") {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("expected endpoint: {error}"),
+        };
+        let client = InProcessIpcClient::new(endpoint, FailingServer);
+        let request =
+            JsonRpcRequest::new("req_1", METHOD_DAEMON_STATUS, DaemonStatusParams::default());
+
+        let error = match call_json_rpc(&client, &request) {
+            Ok(response) => panic!("expected transport error, got {response}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "IPC request failed: server unavailable");
     }
 
     #[test]

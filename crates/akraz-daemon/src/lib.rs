@@ -5,9 +5,9 @@ use std::fmt::{Display, Formatter};
 
 use akraz_core::RuntimeInputState;
 use akraz_ipc::{
-    DaemonStatus, IpcCodecError, IpcPlatformCapabilities, IpcRequest, JsonRpcError, JsonRpcFailure,
-    JsonRpcSuccess, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, parse_request_line,
-    to_json_line,
+    DaemonStatus, IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError,
+    JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PermissionIssue,
+    PermissionsProbe, ProtocolVersionSnapshot, parse_request_line, to_json_line,
 };
 use akraz_platform::{PlatformAdapter, PlatformError};
 use akraz_protocol::ProtocolVersion;
@@ -16,6 +16,30 @@ use akraz_protocol::ProtocolVersion;
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const JSONRPC_DAEMON_ERROR: i32 = -32000;
+
+/// In-process local IPC server backed by daemon runtime state.
+#[derive(Debug)]
+pub struct DaemonIpcServer<P> {
+    state: RuntimeInputState,
+    platform: P,
+}
+
+impl<P> DaemonIpcServer<P> {
+    /// Create an in-process daemon IPC server.
+    pub fn new(state: RuntimeInputState, platform: P) -> Self {
+        Self { state, platform }
+    }
+}
+
+impl<P> LocalIpcServer for DaemonIpcServer<P>
+where
+    P: PlatformAdapter,
+{
+    fn handle_request_line(&self, request_line: &str) -> Result<String, IpcTransportError> {
+        handle_ipc_request_line(&self.state, &self.platform, request_line)
+            .map_err(|error| IpcTransportError::request_failed(error.to_string()))
+    }
+}
 
 /// Error returned while encoding a daemon IPC response.
 #[derive(Debug)]
@@ -166,13 +190,15 @@ mod tests {
     use akraz_core::{ControlMode, RuntimeInputState};
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, DaemonStatusParams, IpcPlatformCapabilities,
-        JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, METHOD_DAEMON_STATUS, to_json_line,
+        JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_STATUS,
+        to_json_line,
     };
     use akraz_platform::{FakePlatformAdapter, PlatformCapabilities};
     use serde_json::json;
 
     use super::{
-        DAEMON_VERSION, build_daemon_status, build_permissions_probe, handle_ipc_request_line,
+        DAEMON_VERSION, DaemonIpcServer, build_daemon_status, build_permissions_probe,
+        handle_ipc_request_line,
     };
 
     fn status_or_panic(
@@ -255,6 +281,29 @@ mod tests {
         assert_eq!(response.id, "req_1");
         assert_eq!(response.result.daemon_version, DAEMON_VERSION);
         assert_eq!(response.result.mode, ControlModeSnapshot::Local);
+    }
+
+    #[test]
+    fn daemon_ipc_server_implements_local_server_contract() {
+        let server = DaemonIpcServer::new(RuntimeInputState::new(), FakePlatformAdapter::default());
+        let request =
+            JsonRpcRequest::new("req_1", METHOD_DAEMON_STATUS, DaemonStatusParams::default());
+        let request_line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        let response_line = match server.handle_request_line(&request_line) {
+            Ok(line) => line,
+            Err(error) => panic!("expected daemon server response: {error}"),
+        };
+        let response: JsonRpcSuccess<DaemonStatus> = match serde_json::from_str(&response_line) {
+            Ok(response) => response,
+            Err(error) => panic!("expected daemon status response JSON: {error}"),
+        };
+
+        assert_eq!(response.id, "req_1");
+        assert_eq!(response.result.daemon_version, DAEMON_VERSION);
     }
 
     #[test]
