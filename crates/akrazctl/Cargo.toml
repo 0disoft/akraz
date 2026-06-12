@@ -15,10 +15,7 @@ name = "akrazctl"
 path = "src/main.rs"
 
 [dependencies]
-akraz-core = { path = "../akraz-core" }
-akraz-daemon = { path = "../akraz-daemon" }
 akraz-ipc = { path = "../akraz-ipc" }
-akraz-platform = { path = "../akraz-platform" }
 serde = { workspace = true }
 
 [dev-dependencies]

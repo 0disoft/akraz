@@ -2,17 +2,13 @@ use std::env;
 use std::fmt::{Display, Formatter};
 use std::process::ExitCode;
 
-use akraz_core::RuntimeInputState;
-use akraz_daemon::DaemonIpcServer;
 use akraz_ipc::{
-    DaemonStatusParams, InProcessIpcClient, IpcEndpoint, JsonRpcRequest, LocalIpcClient,
-    METHOD_DAEMON_STATUS, METHOD_PERMISSIONS_PROBE, OsLocalIpcClient, PermissionsProbeParams,
-    call_json_rpc,
+    DaemonStatusParams, IpcEndpoint, IpcEndpointError, JsonRpcRequest, METHOD_DAEMON_STATUS,
+    METHOD_PERMISSIONS_PROBE, OsLocalIpcClient, PermissionsProbeParams, call_json_rpc,
+    resolve_current_default_endpoint,
 };
-use akraz_platform::FakePlatformAdapter;
 
 const LOCAL_REQUEST_ID: &str = "local";
-const LOCAL_DIAGNOSTIC_ENDPOINT: &str = "in-process://akrazd";
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -22,7 +18,7 @@ fn main() -> ExitCode {
             print_version();
             ExitCode::SUCCESS
         }
-        Some("status") => match parse_status_options(args) {
+        Some("status") => match parse_endpoint_options(args) {
             Ok(options) => print_status(options),
             Err(error) => {
                 eprintln!("{error}");
@@ -30,7 +26,13 @@ fn main() -> ExitCode {
             }
         },
         Some("permissions") => match args.next().as_deref() {
-            Some("probe") => print_permissions_probe(),
+            Some("probe") => match parse_endpoint_options(args) {
+                Ok(options) => print_permissions_probe(options),
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            },
             Some(argument) => {
                 eprintln!("unknown permissions command: {argument}");
                 ExitCode::from(2)
@@ -55,7 +57,7 @@ fn print_version() {
     println!("akrazctl {}", env!("CARGO_PKG_VERSION"));
 }
 
-fn print_status(options: StatusOptions) -> ExitCode {
+fn print_status(options: EndpointOptions) -> ExitCode {
     let request = JsonRpcRequest::new(
         LOCAL_REQUEST_ID,
         METHOD_DAEMON_STATUS,
@@ -65,14 +67,14 @@ fn print_status(options: StatusOptions) -> ExitCode {
     print_local_daemon_response(options.endpoint, &request)
 }
 
-fn print_permissions_probe() -> ExitCode {
+fn print_permissions_probe(options: EndpointOptions) -> ExitCode {
     let request = JsonRpcRequest::new(
         LOCAL_REQUEST_ID,
         METHOD_PERMISSIONS_PROBE,
         PermissionsProbeParams::default(),
     );
 
-    print_local_daemon_response(None, &request)
+    print_local_daemon_response(options.endpoint, &request)
 }
 
 fn print_local_daemon_response<P>(
@@ -82,7 +84,7 @@ fn print_local_daemon_response<P>(
 where
     P: serde::Serialize,
 {
-    let client = match build_local_diagnostic_client(endpoint) {
+    let client = match build_daemon_client(endpoint) {
         Ok(client) => client,
         Err(error) => {
             eprintln!("{error}");
@@ -102,52 +104,31 @@ where
     }
 }
 
-fn build_local_diagnostic_client(
+fn build_daemon_client(endpoint: Option<IpcEndpoint>) -> Result<OsLocalIpcClient, CliRuntimeError> {
+    build_daemon_client_with_resolver(endpoint, resolve_current_default_endpoint)
+}
+
+fn build_daemon_client_with_resolver<F>(
     endpoint: Option<IpcEndpoint>,
-) -> Result<DiagnosticIpcClient, CliRuntimeError> {
-    if let Some(endpoint) = endpoint {
-        return Ok(DiagnosticIpcClient::Os(OsLocalIpcClient::new(endpoint)));
-    }
+    resolve_default_endpoint: F,
+) -> Result<OsLocalIpcClient, CliRuntimeError>
+where
+    F: FnOnce() -> Result<IpcEndpoint, IpcEndpointError>,
+{
+    let endpoint = match endpoint {
+        Some(endpoint) => endpoint,
+        None => resolve_default_endpoint().map_err(CliRuntimeError::from)?,
+    };
 
-    let endpoint = IpcEndpoint::manual(LOCAL_DIAGNOSTIC_ENDPOINT).map_err(CliRuntimeError::from)?;
-    let server = DaemonIpcServer::new(RuntimeInputState::new(), FakePlatformAdapter::default());
-
-    Ok(DiagnosticIpcClient::InProcess(InProcessIpcClient::new(
-        endpoint, server,
-    )))
-}
-
-#[derive(Debug)]
-enum DiagnosticIpcClient {
-    InProcess(InProcessIpcClient<DaemonIpcServer<FakePlatformAdapter>>),
-    Os(OsLocalIpcClient),
-}
-
-impl LocalIpcClient for DiagnosticIpcClient {
-    fn endpoint(&self) -> &IpcEndpoint {
-        match self {
-            Self::InProcess(client) => client.endpoint(),
-            Self::Os(client) => client.endpoint(),
-        }
-    }
-
-    fn send_request_line(
-        &self,
-        request_line: &str,
-    ) -> Result<String, akraz_ipc::IpcTransportError> {
-        match self {
-            Self::InProcess(client) => client.send_request_line(request_line),
-            Self::Os(client) => client.send_request_line(request_line),
-        }
-    }
+    Ok(OsLocalIpcClient::new(endpoint))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct StatusOptions {
+struct EndpointOptions {
     endpoint: Option<IpcEndpoint>,
 }
 
-fn parse_status_options<I>(args: I) -> Result<StatusOptions, CliUsageError>
+fn parse_endpoint_options<I>(args: I) -> Result<EndpointOptions, CliUsageError>
 where
     I: IntoIterator<Item = String>,
 {
@@ -165,7 +146,7 @@ where
         }
     }
 
-    Ok(StatusOptions { endpoint })
+    Ok(EndpointOptions { endpoint })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,20 +196,19 @@ impl Display for CliRuntimeError {
 #[cfg(test)]
 mod tests {
     use akraz_ipc::{
-        DaemonStatus, IpcEndpoint, IpcEndpointKind, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient,
-        METHOD_DAEMON_STATUS, call_json_rpc,
+        IpcEndpoint, IpcEndpointError, IpcEndpointKind, JsonRpcRequest, LocalIpcClient,
     };
 
     use super::{
-        CliUsageError, LOCAL_REQUEST_ID, StatusOptions, build_local_diagnostic_client,
-        parse_status_options,
+        CliRuntimeError, CliUsageError, EndpointOptions, LOCAL_REQUEST_ID, METHOD_DAEMON_STATUS,
+        build_daemon_client_with_resolver, parse_endpoint_options,
     };
 
     #[test]
-    fn parses_status_endpoint_option() {
+    fn parses_endpoint_option() {
         assert_eq!(
-            parse_status_options(["--endpoint", "local-test"].map(String::from)),
-            Ok(StatusOptions {
+            parse_endpoint_options(["--endpoint", "local-test"].map(String::from)),
+            Ok(EndpointOptions {
                 endpoint: Some(IpcEndpoint {
                     kind: IpcEndpointKind::Manual,
                     address: "local-test".to_string(),
@@ -236,8 +216,8 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_status_options(["--endpoint=local-test"].map(String::from)),
-            Ok(StatusOptions {
+            parse_endpoint_options(["--endpoint=local-test"].map(String::from)),
+            Ok(EndpointOptions {
                 endpoint: Some(IpcEndpoint {
                     kind: IpcEndpointKind::Manual,
                     address: "local-test".to_string(),
@@ -247,13 +227,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_status_options() {
+    fn rejects_invalid_endpoint_options() {
         assert_eq!(
-            parse_status_options(["--endpoint"].map(String::from)),
+            parse_endpoint_options(["--endpoint"].map(String::from)),
             Err(CliUsageError::MissingEndpointValue)
         );
         assert_eq!(
-            parse_status_options(["--bad"].map(String::from)),
+            parse_endpoint_options(["--bad"].map(String::from)),
             Err(CliUsageError::UnknownStatusOption("--bad".to_string()))
         );
     }
@@ -271,40 +251,45 @@ mod tests {
     }
 
     #[test]
-    fn local_diagnostic_client_calls_daemon_through_ipc_transport() {
-        let client = match build_local_diagnostic_client(None) {
+    fn default_daemon_client_resolves_os_endpoint() {
+        let endpoint = match IpcEndpoint::manual("resolved-endpoint") {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("expected endpoint: {error}"),
+        };
+        let expected_endpoint = endpoint.clone();
+        let client = match build_daemon_client_with_resolver(None, || Ok(endpoint)) {
             Ok(client) => client,
-            Err(error) => panic!("expected diagnostic client: {error}"),
-        };
-        let request = JsonRpcRequest::new(
-            LOCAL_REQUEST_ID,
-            METHOD_DAEMON_STATUS,
-            akraz_ipc::DaemonStatusParams::default(),
-        );
-
-        let response_line = match call_json_rpc(&client, &request) {
-            Ok(line) => line,
-            Err(error) => panic!("expected daemon IPC response: {error}"),
-        };
-        let response: JsonRpcSuccess<DaemonStatus> = match serde_json::from_str(&response_line) {
-            Ok(response) => response,
-            Err(error) => panic!("expected daemon status response JSON: {error}"),
+            Err(error) => panic!("expected daemon IPC client: {error}"),
         };
 
-        assert_eq!(client.endpoint().address, super::LOCAL_DIAGNOSTIC_ENDPOINT);
-        assert_eq!(response.id, LOCAL_REQUEST_ID);
-        assert_eq!(response.result.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(client.endpoint(), &expected_endpoint);
     }
 
     #[test]
-    fn explicit_status_endpoint_selects_os_ipc_client() {
+    fn default_daemon_client_reports_endpoint_resolution_errors() {
+        let error = build_daemon_client_with_resolver(None, || {
+            Err(IpcEndpointError::UnsupportedOperatingSystem)
+        });
+
+        match error {
+            Err(CliRuntimeError::InvalidEndpoint(message)) => {
+                assert_eq!(message, "unsupported operating system for local IPC")
+            }
+            Ok(client) => panic!("expected endpoint resolution failure, got {client:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_endpoint_selects_os_ipc_client_without_resolving_default() {
         let endpoint = match IpcEndpoint::manual("explicit-endpoint") {
             Ok(endpoint) => endpoint,
             Err(error) => panic!("expected endpoint: {error}"),
         };
-        let client = match build_local_diagnostic_client(Some(endpoint.clone())) {
+        let client = match build_daemon_client_with_resolver(Some(endpoint.clone()), || {
+            Err(IpcEndpointError::UnsupportedOperatingSystem)
+        }) {
             Ok(client) => client,
-            Err(error) => panic!("expected diagnostic client: {error}"),
+            Err(error) => panic!("expected daemon IPC client: {error}"),
         };
 
         assert_eq!(client.endpoint(), &endpoint);

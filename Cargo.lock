@@ -42,10 +42,7 @@ version = "0.1.0"
 name = "akrazctl"
 version = "0.1.0"
 dependencies = [
- "akraz-core",
- "akraz-daemon",
  "akraz-ipc",
- "akraz-platform",
  "serde",
  "serde_json",
 ]
