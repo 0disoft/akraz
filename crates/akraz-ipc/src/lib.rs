@@ -1,5 +1,6 @@
 //! Local IPC JSON-RPC contract shared by akraz daemon, CLI, and UI callers.
 
+use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -16,6 +17,194 @@ pub const METHOD_DAEMON_STATUS: &str = "daemon.status";
 
 /// JSON-RPC method for platform permission probing.
 pub const METHOD_PERMISSIONS_PROBE: &str = "permissions.probe";
+
+/// Supported local IPC endpoint kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IpcEndpointKind {
+    WindowsNamedPipe,
+    UnixSocket,
+    Manual,
+}
+
+/// Supported operating systems for default endpoint resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcOperatingSystem {
+    Windows,
+    Linux,
+    Macos,
+}
+
+/// Local IPC endpoint address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpcEndpoint {
+    pub kind: IpcEndpointKind,
+    pub address: String,
+}
+
+impl IpcEndpoint {
+    /// Create a Windows named pipe endpoint.
+    pub fn windows_named_pipe(user_id: impl AsRef<str>) -> Result<Self, IpcEndpointError> {
+        let user_id = require_non_empty("user_id", user_id.as_ref())?;
+
+        Ok(Self {
+            kind: IpcEndpointKind::WindowsNamedPipe,
+            address: format!(r"\\.\pipe\akrazd-{user_id}"),
+        })
+    }
+
+    /// Create a Unix domain socket endpoint.
+    pub fn unix_socket(path: impl Into<String>) -> Result<Self, IpcEndpointError> {
+        let path = path.into();
+        require_non_empty("path", &path)?;
+
+        Ok(Self {
+            kind: IpcEndpointKind::UnixSocket,
+            address: path,
+        })
+    }
+
+    /// Create an explicitly supplied endpoint address.
+    pub fn manual(address: impl Into<String>) -> Result<Self, IpcEndpointError> {
+        let address = address.into();
+        require_non_empty("address", &address)?;
+
+        Ok(Self {
+            kind: IpcEndpointKind::Manual,
+            address,
+        })
+    }
+}
+
+impl Display for IpcEndpoint {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.address)
+    }
+}
+
+/// Environment facts used to resolve the default local IPC endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IpcEndpointEnvironment {
+    pub operating_system: Option<IpcOperatingSystem>,
+    pub user_id: Option<String>,
+    pub xdg_runtime_dir: Option<String>,
+    pub home_dir: Option<String>,
+}
+
+/// Endpoint resolution failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcEndpointError {
+    UnsupportedOperatingSystem,
+    MissingUserId,
+    MissingXdgRuntimeDir,
+    MissingHomeDir,
+    EmptyValue { field: &'static str },
+}
+
+impl Display for IpcEndpointError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedOperatingSystem => {
+                formatter.write_str("unsupported operating system for local IPC")
+            }
+            Self::MissingUserId => formatter.write_str("missing user id for Windows named pipe"),
+            Self::MissingXdgRuntimeDir => {
+                formatter.write_str("missing XDG_RUNTIME_DIR for Linux Unix socket")
+            }
+            Self::MissingHomeDir => {
+                formatter.write_str("missing home directory for macOS Unix socket")
+            }
+            Self::EmptyValue { field } => write!(formatter, "empty endpoint {field}"),
+        }
+    }
+}
+
+impl Error for IpcEndpointError {}
+
+/// Resolve the default local IPC endpoint for the current process environment.
+pub fn resolve_current_default_endpoint() -> Result<IpcEndpoint, IpcEndpointError> {
+    resolve_default_endpoint(&current_endpoint_environment())
+}
+
+/// Resolve the default local IPC endpoint from supplied environment facts.
+pub fn resolve_default_endpoint(
+    environment: &IpcEndpointEnvironment,
+) -> Result<IpcEndpoint, IpcEndpointError> {
+    match environment.operating_system {
+        Some(IpcOperatingSystem::Windows) => {
+            let user_id = environment
+                .user_id
+                .as_deref()
+                .ok_or(IpcEndpointError::MissingUserId)?;
+
+            IpcEndpoint::windows_named_pipe(user_id)
+        }
+        Some(IpcOperatingSystem::Linux) => {
+            let runtime_dir = environment
+                .xdg_runtime_dir
+                .as_deref()
+                .ok_or(IpcEndpointError::MissingXdgRuntimeDir)?;
+
+            IpcEndpoint::unix_socket(join_unix_path(runtime_dir, &["akraz", "akrazd.sock"]))
+        }
+        Some(IpcOperatingSystem::Macos) => {
+            let home_dir = environment
+                .home_dir
+                .as_deref()
+                .ok_or(IpcEndpointError::MissingHomeDir)?;
+
+            IpcEndpoint::unix_socket(join_unix_path(
+                home_dir,
+                &["Library", "Application Support", "Akraz", "akrazd.sock"],
+            ))
+        }
+        None => Err(IpcEndpointError::UnsupportedOperatingSystem),
+    }
+}
+
+fn current_endpoint_environment() -> IpcEndpointEnvironment {
+    IpcEndpointEnvironment {
+        operating_system: current_operating_system(),
+        user_id: env::var("AKRAZ_USER_ID")
+            .ok()
+            .or_else(|| env::var("USERNAME").ok())
+            .or_else(|| env::var("USER").ok()),
+        xdg_runtime_dir: env::var("XDG_RUNTIME_DIR").ok(),
+        home_dir: env::var("HOME")
+            .ok()
+            .or_else(|| env::var("USERPROFILE").ok()),
+    }
+}
+
+fn current_operating_system() -> Option<IpcOperatingSystem> {
+    if cfg!(target_os = "windows") {
+        Some(IpcOperatingSystem::Windows)
+    } else if cfg!(target_os = "linux") {
+        Some(IpcOperatingSystem::Linux)
+    } else if cfg!(target_os = "macos") {
+        Some(IpcOperatingSystem::Macos)
+    } else {
+        None
+    }
+}
+
+fn join_unix_path(root: &str, segments: &[&str]) -> String {
+    let mut path = root.trim_end_matches('/').to_string();
+    for segment in segments {
+        path.push('/');
+        path.push_str(segment.trim_matches('/'));
+    }
+    path
+}
+
+fn require_non_empty<'a>(field: &'static str, value: &'a str) -> Result<&'a str, IpcEndpointError> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(IpcEndpointError::EmptyValue { field })
+    } else {
+        Ok(value)
+    }
+}
 
 /// JSON-RPC request envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,8 +430,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlModeSnapshot, DaemonStatus, IpcPlatformCapabilities, JsonRpcRequest, JsonRpcSuccess,
-        METHOD_DAEMON_STATUS, ProtocolVersionSnapshot, to_json_line,
+        ControlModeSnapshot, DaemonStatus, IpcEndpoint, IpcEndpointEnvironment, IpcEndpointError,
+        IpcEndpointKind, IpcOperatingSystem, IpcPlatformCapabilities, JsonRpcRequest,
+        JsonRpcSuccess, METHOD_DAEMON_STATUS, ProtocolVersionSnapshot, resolve_default_endpoint,
+        to_json_line,
     };
     use serde_json::json;
 
@@ -318,6 +509,82 @@ mod tests {
                     }
                 }
             })
+        );
+    }
+
+    #[test]
+    fn resolves_windows_named_pipe_endpoint() {
+        let endpoint = resolve_default_endpoint(&IpcEndpointEnvironment {
+            operating_system: Some(IpcOperatingSystem::Windows),
+            user_id: Some("S-1-5-21-1000".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            endpoint,
+            Ok(IpcEndpoint {
+                kind: IpcEndpointKind::WindowsNamedPipe,
+                address: r"\\.\pipe\akrazd-S-1-5-21-1000".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_linux_unix_socket_endpoint() {
+        let endpoint = resolve_default_endpoint(&IpcEndpointEnvironment {
+            operating_system: Some(IpcOperatingSystem::Linux),
+            xdg_runtime_dir: Some("/run/user/1000".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            endpoint,
+            Ok(IpcEndpoint {
+                kind: IpcEndpointKind::UnixSocket,
+                address: "/run/user/1000/akraz/akrazd.sock".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_macos_unix_socket_endpoint() {
+        let endpoint = resolve_default_endpoint(&IpcEndpointEnvironment {
+            operating_system: Some(IpcOperatingSystem::Macos),
+            home_dir: Some("/Users/cherry".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            endpoint,
+            Ok(IpcEndpoint {
+                kind: IpcEndpointKind::UnixSocket,
+                address: "/Users/cherry/Library/Application Support/Akraz/akrazd.sock".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn endpoint_resolution_reports_missing_required_facts() {
+        assert_eq!(
+            resolve_default_endpoint(&IpcEndpointEnvironment {
+                operating_system: Some(IpcOperatingSystem::Windows),
+                ..Default::default()
+            }),
+            Err(IpcEndpointError::MissingUserId)
+        );
+        assert_eq!(
+            resolve_default_endpoint(&IpcEndpointEnvironment {
+                operating_system: Some(IpcOperatingSystem::Linux),
+                ..Default::default()
+            }),
+            Err(IpcEndpointError::MissingXdgRuntimeDir)
+        );
+        assert_eq!(
+            resolve_default_endpoint(&IpcEndpointEnvironment {
+                operating_system: Some(IpcOperatingSystem::Macos),
+                ..Default::default()
+            }),
+            Err(IpcEndpointError::MissingHomeDir)
         );
     }
 }
