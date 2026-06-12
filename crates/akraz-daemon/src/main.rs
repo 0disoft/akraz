@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use akraz_core::RuntimeInputState;
 use akraz_daemon::{DaemonIpcRunConfig, DaemonIpcServer, build_daemon_status, serve_daemon_ipc};
 use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
-use akraz_platform::FakePlatformAdapter;
+use akraz_platform::runtime_platform_adapter;
 
 fn main() -> ExitCode {
     match parse_daemon_command(env::args().skip(1)) {
@@ -45,7 +45,7 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
     } else {
         DaemonIpcRunConfig::serve_forever(endpoint)
     };
-    let server = DaemonIpcServer::new(RuntimeInputState::new(), FakePlatformAdapter::default());
+    let server = DaemonIpcServer::new(RuntimeInputState::new(), runtime_platform_adapter());
 
     eprintln!("akraz-daemon listening at {}", config.endpoint());
     match serve_daemon_ipc(&config, &server) {
@@ -70,7 +70,7 @@ fn format_daemon_ipc_error(error: &IpcTransportError) -> String {
 
 fn print_status() {
     let state = RuntimeInputState::new();
-    let platform = FakePlatformAdapter::default();
+    let platform = runtime_platform_adapter();
     let status = match build_daemon_status(&state, &platform) {
         Ok(status) => status,
         Err(error) => {

@@ -60,6 +60,113 @@ pub trait PlatformAdapter {
     fn release_all(&self) -> Result<(), PlatformError>;
 }
 
+/// Runtime platform adapter selected for the current operating system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePlatformAdapter {
+    #[cfg(windows)]
+    Windows(WindowsPlatformAdapter),
+    #[cfg(not(windows))]
+    Unsupported(UnsupportedPlatformAdapter),
+}
+
+impl PlatformAdapter for RuntimePlatformAdapter {
+    fn name(&self) -> &'static str {
+        match self {
+            #[cfg(windows)]
+            Self::Windows(adapter) => adapter.name(),
+            #[cfg(not(windows))]
+            Self::Unsupported(adapter) => adapter.name(),
+        }
+    }
+
+    fn probe_capabilities(&self) -> Result<PlatformCapabilities, PlatformError> {
+        match self {
+            #[cfg(windows)]
+            Self::Windows(adapter) => adapter.probe_capabilities(),
+            #[cfg(not(windows))]
+            Self::Unsupported(adapter) => adapter.probe_capabilities(),
+        }
+    }
+
+    fn release_all(&self) -> Result<(), PlatformError> {
+        match self {
+            #[cfg(windows)]
+            Self::Windows(adapter) => adapter.release_all(),
+            #[cfg(not(windows))]
+            Self::Unsupported(adapter) => adapter.release_all(),
+        }
+    }
+}
+
+/// Select the platform adapter used by production daemon runtime paths.
+pub fn runtime_platform_adapter() -> RuntimePlatformAdapter {
+    #[cfg(windows)]
+    {
+        RuntimePlatformAdapter::Windows(WindowsPlatformAdapter::new())
+    }
+
+    #[cfg(not(windows))]
+    {
+        RuntimePlatformAdapter::Unsupported(UnsupportedPlatformAdapter::new())
+    }
+}
+
+/// Windows platform adapter.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowsPlatformAdapter;
+
+#[cfg(windows)]
+impl WindowsPlatformAdapter {
+    /// Create the Windows platform adapter.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl PlatformAdapter for WindowsPlatformAdapter {
+    fn name(&self) -> &'static str {
+        "windows"
+    }
+
+    fn probe_capabilities(&self) -> Result<PlatformCapabilities, PlatformError> {
+        Ok(PlatformCapabilities::default())
+    }
+
+    fn release_all(&self) -> Result<(), PlatformError> {
+        Ok(())
+    }
+}
+
+/// Adapter used on operating systems that do not have an implementation yet.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnsupportedPlatformAdapter;
+
+#[cfg(not(windows))]
+impl UnsupportedPlatformAdapter {
+    /// Create the unsupported platform adapter.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(not(windows))]
+impl PlatformAdapter for UnsupportedPlatformAdapter {
+    fn name(&self) -> &'static str {
+        "unsupported"
+    }
+
+    fn probe_capabilities(&self) -> Result<PlatformCapabilities, PlatformError> {
+        Ok(PlatformCapabilities::default())
+    }
+
+    fn release_all(&self) -> Result<(), PlatformError> {
+        Ok(())
+    }
+}
+
 /// Deterministic platform adapter for core and daemon tests.
 #[derive(Debug)]
 pub struct FakePlatformAdapter {
@@ -115,7 +222,10 @@ impl PlatformAdapter for FakePlatformAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{FakePlatformAdapter, PlatformAdapter, PlatformCapabilities, PlatformError};
+    use super::{
+        FakePlatformAdapter, PlatformAdapter, PlatformCapabilities, PlatformError,
+        runtime_platform_adapter,
+    };
 
     fn count_or_panic(adapter: &FakePlatformAdapter) -> u64 {
         match adapter.release_all_count() {
@@ -175,5 +285,21 @@ mod tests {
         assert_eq!(adapter.release_all(), Ok(()));
 
         assert_eq!(count_or_panic(&adapter), 2);
+    }
+
+    #[test]
+    fn runtime_adapter_reports_current_platform_and_closed_capabilities() {
+        let adapter = runtime_platform_adapter();
+
+        if cfg!(windows) {
+            assert_eq!(adapter.name(), "windows");
+        } else {
+            assert_eq!(adapter.name(), "unsupported");
+        }
+        assert_eq!(
+            adapter.probe_capabilities(),
+            Ok(PlatformCapabilities::default())
+        );
+        assert_eq!(adapter.release_all(), Ok(()));
     }
 }
