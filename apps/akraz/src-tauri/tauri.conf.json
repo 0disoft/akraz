@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Akraz",
-  "version": "0.1.0",
-  "identifier": "dev.akraz.app",
+  "version": "0.1.2",
+  "identifier": "io.github.akraz.akraz",
   "build": {
-    "beforeDevCommand": "bun run dev",
-    "beforeBuildCommand": "bun run build",
+    "beforeDevCommand": "bun run prepare:sidecar && bun run dev",
+    "beforeBuildCommand": "bun run prepare:sidecar:release && bun run build",
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../dist"
   },
@@ -26,6 +26,7 @@
   },
   "bundle": {
     "active": true,
+    "externalBin": ["binaries/akraz-daemon"],
     "targets": "all"
   }
 }

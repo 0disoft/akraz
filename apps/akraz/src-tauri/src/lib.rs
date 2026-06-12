@@ -1,5 +1,6 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -10,9 +11,15 @@ use akraz_ipc::{
     METHOD_DAEMON_STATUS, OsLocalIpcClient, call_json_rpc, resolve_current_default_endpoint,
 };
 use serde::Serialize;
+use tauri::async_runtime::Receiver;
+use tauri_plugin_shell::{
+    ShellExt,
+    process::{CommandChild, CommandEvent},
+};
 
 const LOCAL_REQUEST_ID: &str = "tauri";
 const DAEMON_PATH_ENV: &str = "AKRAZ_DAEMON_PATH";
+const DAEMON_SIDECAR_NAME: &str = "akraz-daemon";
 const DAEMON_START_RETRIES: usize = 50;
 const DAEMON_START_RETRY_DELAY: Duration = Duration::from_millis(40);
 
@@ -20,6 +27,7 @@ type ManagedDaemon = Arc<Mutex<DaemonProcessState>>;
 
 pub fn run() -> tauri::Result<()> {
     tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
         .manage(Arc::new(Mutex::new(DaemonProcessState::default())))
         .invoke_handler(tauri::generate_handler![
             daemon_status,
@@ -41,10 +49,11 @@ async fn daemon_status(
 
 #[tauri::command]
 async fn daemon_start(
+    app: tauri::AppHandle,
     managed: tauri::State<'_, ManagedDaemon>,
 ) -> Result<DaemonLifecycleSnapshot, String> {
     let managed = Arc::clone(managed.inner());
-    tauri::async_runtime::spawn_blocking(move || start_daemon(&managed))
+    tauri::async_runtime::spawn_blocking(move || start_daemon(&app, &managed))
         .await
         .map_err(|error| format!("daemon start task failed: {error}"))?
 }
@@ -61,7 +70,52 @@ async fn daemon_stop(
 
 #[derive(Debug, Default)]
 struct DaemonProcessState {
-    child: Option<Child>,
+    child: Option<ManagedDaemonChild>,
+}
+
+#[derive(Debug)]
+enum ManagedDaemonChild {
+    Os(Child),
+    Sidecar(CommandChild),
+}
+
+impl ManagedDaemonChild {
+    fn pid(&self) -> u32 {
+        match self {
+            Self::Os(child) => child.id(),
+            Self::Sidecar(child) => child.pid(),
+        }
+    }
+
+    fn is_running(&mut self) -> bool {
+        match self {
+            Self::Os(child) => matches!(child.try_wait(), Ok(None)),
+            Self::Sidecar(_) => true,
+        }
+    }
+
+    fn kill(self) -> Result<(), String> {
+        match self {
+            Self::Os(mut child) => {
+                child
+                    .kill()
+                    .map_err(|error| format!("failed to stop akraz-daemon: {error}"))?;
+                child.wait().map_err(|error| {
+                    format!("akraz-daemon stopped, but process cleanup failed: {error}")
+                })?;
+                Ok(())
+            }
+            Self::Sidecar(child) => child
+                .kill()
+                .map_err(|error| format!("failed to stop akraz-daemon sidecar: {error}")),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SpawnedDaemonProcess {
+    child: ManagedDaemonChild,
+    sidecar_events: Option<Receiver<CommandEvent>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -139,7 +193,10 @@ fn refresh_daemon_snapshot(managed: &ManagedDaemon) -> Result<DaemonLifecycleSna
     Ok(read_daemon_snapshot().with_managed_pid(managed_pid))
 }
 
-fn start_daemon(managed: &ManagedDaemon) -> Result<DaemonLifecycleSnapshot, String> {
+fn start_daemon(
+    app: &tauri::AppHandle,
+    managed: &ManagedDaemon,
+) -> Result<DaemonLifecycleSnapshot, String> {
     let current = refresh_daemon_snapshot(managed)?;
     match current.phase {
         DaemonLifecyclePhase::Running => {
@@ -158,20 +215,14 @@ fn start_daemon(managed: &ManagedDaemon) -> Result<DaemonLifecycleSnapshot, Stri
         ));
     }
 
-    let executable = match resolve_daemon_executable() {
-        Ok(path) => path,
+    let spawned = match spawn_daemon_process(app) {
+        Ok(spawned) => spawned,
         Err(error) => return Ok(DaemonLifecycleSnapshot::failed(error)),
     };
-    let child = match spawn_daemon_process(&executable) {
-        Ok(child) => child,
-        Err(error) => {
-            return Ok(DaemonLifecycleSnapshot::failed(format!(
-                "failed to start akraz-daemon at {}: {error}",
-                executable.display()
-            )));
-        }
-    };
-    let pid = store_managed_child(managed, child)?;
+    let pid = store_managed_child(managed, spawned.child)?;
+    if let Some(events) = spawned.sidecar_events {
+        watch_sidecar_termination(Arc::clone(managed), pid, events);
+    }
 
     for _ in 0..DAEMON_START_RETRIES {
         if managed_daemon_pid(managed)?.is_none() {
@@ -195,20 +246,13 @@ fn start_daemon(managed: &ManagedDaemon) -> Result<DaemonLifecycleSnapshot, Stri
 }
 
 fn stop_daemon(managed: &ManagedDaemon) -> Result<DaemonLifecycleSnapshot, String> {
-    let Some(mut child) = take_managed_child(managed)? else {
+    let Some(child) = take_managed_child(managed)? else {
         return Ok(read_daemon_snapshot()
             .with_detail("This app did not start the current Akraz background process."));
     };
 
     if let Err(error) = child.kill() {
-        return Ok(DaemonLifecycleSnapshot::failed(format!(
-            "failed to stop akraz-daemon: {error}"
-        )));
-    }
-    if let Err(error) = child.wait() {
-        return Ok(DaemonLifecycleSnapshot::failed(format!(
-            "akraz-daemon stopped, but process cleanup failed: {error}"
-        )));
+        return Ok(DaemonLifecycleSnapshot::failed(error));
     }
 
     Ok(read_daemon_snapshot().with_detail("Akraz stopped."))
@@ -287,11 +331,82 @@ fn classify_daemon_call_error(
     }
 }
 
-fn resolve_daemon_executable() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os(DAEMON_PATH_ENV).filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
+fn spawn_daemon_process(app: &tauri::AppHandle) -> Result<SpawnedDaemonProcess, String> {
+    if let Some(executable) = resolve_env_daemon_executable() {
+        return spawn_os_daemon_process(&executable).map(|child| SpawnedDaemonProcess {
+            child: ManagedDaemonChild::Os(child),
+            sidecar_events: None,
+        });
     }
 
+    match spawn_sidecar_daemon_process(app) {
+        Ok((sidecar_events, child)) => Ok(SpawnedDaemonProcess {
+            child: ManagedDaemonChild::Sidecar(child),
+            sidecar_events: Some(sidecar_events),
+        }),
+        Err(sidecar_error) => {
+            let executable = resolve_adjacent_daemon_executable()?;
+            spawn_os_daemon_process(&executable)
+                .map(|child| SpawnedDaemonProcess {
+                    child: ManagedDaemonChild::Os(child),
+                    sidecar_events: None,
+                })
+                .map_err(|fallback_error| {
+                    format!(
+                        "failed to start bundled akraz-daemon sidecar: {sidecar_error}. Also failed to start adjacent daemon at {}: {fallback_error}",
+                        executable.display()
+                    )
+                })
+        }
+    }
+}
+
+fn spawn_sidecar_daemon_process(
+    app: &tauri::AppHandle,
+) -> Result<(Receiver<CommandEvent>, CommandChild), String> {
+    app.shell()
+        .sidecar(DAEMON_SIDECAR_NAME)
+        .map_err(|error| error.to_string())?
+        .args(["--serve"])
+        .spawn()
+        .map_err(|error| error.to_string())
+}
+
+fn spawn_os_daemon_process(executable: &PathBuf) -> Result<Child, String> {
+    StdCommand::new(executable)
+        .arg("--serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "failed to start akraz-daemon at {}: {error}",
+                executable.display()
+            )
+        })
+}
+
+fn watch_sidecar_termination(managed: ManagedDaemon, pid: u32, mut events: Receiver<CommandEvent>) {
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if matches!(event, CommandEvent::Terminated(_)) {
+                clear_managed_child_if_pid(&managed, pid);
+                break;
+            }
+        }
+    });
+}
+
+fn resolve_env_daemon_executable() -> Option<PathBuf> {
+    resolve_env_daemon_executable_from(std::env::var_os(DAEMON_PATH_ENV))
+}
+
+fn resolve_env_daemon_executable_from(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+fn resolve_adjacent_daemon_executable() -> Result<PathBuf, String> {
     let current_exe = std::env::current_exe()
         .map_err(|error| format!("failed to locate the Akraz app executable: {error}"))?;
     let Some(directory) = current_exe.parent() else {
@@ -309,30 +424,18 @@ fn daemon_executable_name() -> &'static str {
     }
 }
 
-fn spawn_daemon_process(executable: &PathBuf) -> std::io::Result<Child> {
-    Command::new(executable)
-        .arg("--serve")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-}
-
 fn managed_daemon_pid(managed: &ManagedDaemon) -> Result<Option<u32>, String> {
     let mut state = lock_managed_daemon(managed)?;
     let mut clear_child = false;
     let pid = match state.child.as_mut() {
-        Some(child) => match child.try_wait() {
-            Ok(Some(_status)) => {
+        Some(child) => {
+            if child.is_running() {
+                Some(child.pid())
+            } else {
                 clear_child = true;
                 None
             }
-            Ok(None) => Some(child.id()),
-            Err(_error) => {
-                clear_child = true;
-                None
-            }
-        },
+        }
         None => None,
     };
 
@@ -343,24 +446,20 @@ fn managed_daemon_pid(managed: &ManagedDaemon) -> Result<Option<u32>, String> {
     Ok(pid)
 }
 
-fn store_managed_child(managed: &ManagedDaemon, child: Child) -> Result<u32, String> {
+fn store_managed_child(managed: &ManagedDaemon, child: ManagedDaemonChild) -> Result<u32, String> {
     let mut state = lock_managed_daemon(managed)?;
-    let mut child = child;
-    let pid = child.id();
+    let child = child;
+    let pid = child.pid();
     let replace_child = match state.child.as_mut() {
-        Some(existing) => match existing.try_wait() {
-            Ok(Some(_status)) => true,
-            Ok(None) => {
-                if let Err(error) = child.kill() {
-                    return Err(format!(
-                        "failed to clean up duplicate akraz-daemon process: {error}"
-                    ));
-                }
-                let _ = child.wait();
-                return Ok(existing.id());
+        Some(existing) => {
+            if existing.is_running() {
+                let existing_pid = existing.pid();
+                child.kill()?;
+                return Ok(existing_pid);
             }
-            Err(_error) => true,
-        },
+
+            true
+        }
         None => true,
     };
 
@@ -371,16 +470,26 @@ fn store_managed_child(managed: &ManagedDaemon, child: Child) -> Result<u32, Str
     Ok(pid)
 }
 
-fn take_managed_child(managed: &ManagedDaemon) -> Result<Option<Child>, String> {
+fn take_managed_child(managed: &ManagedDaemon) -> Result<Option<ManagedDaemonChild>, String> {
     let mut state = lock_managed_daemon(managed)?;
     let Some(mut child) = state.child.take() else {
         return Ok(None);
     };
 
-    match child.try_wait() {
-        Ok(Some(_status)) => Ok(None),
-        Ok(None) => Ok(Some(child)),
-        Err(_error) => Ok(None),
+    if child.is_running() {
+        Ok(Some(child))
+    } else {
+        Ok(None)
+    }
+}
+
+fn clear_managed_child_if_pid(managed: &ManagedDaemon, pid: u32) {
+    let Ok(mut state) = managed.lock() else {
+        return;
+    };
+
+    if state.child.as_ref().is_some_and(|child| child.pid() == pid) {
+        state.child = None;
     }
 }
 
@@ -394,14 +503,17 @@ fn lock_managed_daemon(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, IpcEndpoint, IpcPlatformCapabilities, IpcTransportError,
         JsonRpcError, JsonRpcFailure, JsonRpcSuccess, ProtocolVersionSnapshot, to_json_line,
     };
 
     use super::{
-        DaemonLifecyclePhase, classify_daemon_call_error, daemon_executable_name,
-        parse_daemon_status_response,
+        DAEMON_SIDECAR_NAME, DaemonLifecyclePhase, classify_daemon_call_error,
+        daemon_executable_name, parse_daemon_status_response, resolve_env_daemon_executable_from,
     };
 
     fn status_fixture() -> DaemonStatus {
@@ -492,5 +604,27 @@ mod tests {
         } else {
             assert_eq!(daemon_executable_name(), "akraz-daemon");
         }
+    }
+
+    #[test]
+    fn sidecar_name_matches_tauri_external_bin_basename() {
+        assert_eq!(DAEMON_SIDECAR_NAME, "akraz-daemon");
+    }
+
+    #[test]
+    fn daemon_path_env_override_ignores_missing_and_empty_values() {
+        assert_eq!(resolve_env_daemon_executable_from(None), None);
+        assert_eq!(
+            resolve_env_daemon_executable_from(Some(OsString::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_path_env_override_accepts_explicit_path() {
+        assert_eq!(
+            resolve_env_daemon_executable_from(Some(OsString::from("custom-daemon"))),
+            Some(PathBuf::from("custom-daemon"))
+        );
     }
 }

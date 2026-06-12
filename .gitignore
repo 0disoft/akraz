@@ -21,6 +21,8 @@ target/
 # Tauri generated output
 **/src-tauri/target/
 **/src-tauri/gen/
+**/src-tauri/binaries/*
+!**/src-tauri/binaries/.gitkeep
 
 # Coverage and test output
 coverage/

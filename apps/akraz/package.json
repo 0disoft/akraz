@@ -1,12 +1,14 @@
 {
   "name": "akraz",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "dev": "vite --host 127.0.0.1",
+    "prepare:sidecar": "bun scripts/prepare-sidecar.mjs",
+    "prepare:sidecar:release": "bun scripts/prepare-sidecar.mjs --release",
     "tauri": "tauri"
   },
   "dependencies": {

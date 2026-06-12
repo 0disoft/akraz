@@ -23,7 +23,8 @@ path = "src/main.rs"
 akraz-ipc = { path = "../../../crates/akraz-ipc" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tauri = "2.11.2"
+tauri = { version = "2.11.2", features = [] }
+tauri-plugin-shell = "2.3.5"
 
 [build-dependencies]
-tauri-build = "2.6.2"
+tauri-build = { version = "2.6.2", features = [] }
