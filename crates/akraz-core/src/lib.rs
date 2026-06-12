@@ -4,6 +4,22 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+/// Stable local device identifier.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeviceId(String);
+
+impl DeviceId {
+    /// Create a device identifier.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Return the identifier as a borrowed string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Stable peer identifier supplied by discovery or pairing code.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PeerId(String);
@@ -132,12 +148,252 @@ pub enum CapturedInputEvent {
     },
 }
 
+/// Input event that should be injected on a remote or local platform adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InjectedInputEvent {
+    Key {
+        key: PhysicalKey,
+        state: PressState,
+    },
+    MouseButton {
+        button: MouseButton,
+        state: PressState,
+    },
+    PointerMoved {
+        delta_x: i32,
+        delta_y: i32,
+    },
+}
+
+impl From<CapturedInputEvent> for InjectedInputEvent {
+    fn from(event: CapturedInputEvent) -> Self {
+        match event {
+            CapturedInputEvent::Key { key, state } => Self::Key { key, state },
+            CapturedInputEvent::MouseButton { button, state } => {
+                Self::MouseButton { button, state }
+            }
+            CapturedInputEvent::PointerMoved { delta_x, delta_y } => {
+                Self::PointerMoved { delta_x, delta_y }
+            }
+        }
+    }
+}
+
+/// Logical point in the local desktop coordinate space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogicalPoint {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Logical size in desktop coordinate units.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogicalSize {
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Logical rectangle describing a screen or desktop bounds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogicalRect {
+    pub origin: LogicalPoint,
+    pub size: LogicalSize,
+}
+
+impl LogicalRect {
+    /// Return the left coordinate.
+    pub fn left(&self) -> i32 {
+        self.origin.x
+    }
+
+    /// Return the top coordinate.
+    pub fn top(&self) -> i32 {
+        self.origin.y
+    }
+
+    /// Return the exclusive right coordinate.
+    pub fn right(&self) -> i32 {
+        self.origin.x.saturating_add(self.size.width)
+    }
+
+    /// Return the exclusive bottom coordinate.
+    pub fn bottom(&self) -> i32 {
+        self.origin.y.saturating_add(self.size.height)
+    }
+
+    /// Return whether the rectangle has positive dimensions.
+    pub fn is_valid(&self) -> bool {
+        self.size.width > 0 && self.size.height > 0
+    }
+
+    /// Return whether a point is inside this rectangle.
+    pub fn contains(&self, point: LogicalPoint) -> bool {
+        self.is_valid()
+            && point.x >= self.left()
+            && point.x < self.right()
+            && point.y >= self.top()
+            && point.y < self.bottom()
+    }
+
+    fn clamp_x(&self, x: i32) -> i32 {
+        if !self.is_valid() {
+            return self.left();
+        }
+
+        x.clamp(self.left(), self.right().saturating_sub(1))
+    }
+
+    fn clamp_y(&self, y: i32) -> i32 {
+        if !self.is_valid() {
+            return self.top();
+        }
+
+        y.clamp(self.top(), self.bottom().saturating_sub(1))
+    }
+}
+
+/// Edge of the local screen that can be linked to another peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// One configured edge link from the local screen to a peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenEdgeBinding {
+    pub local_edge: ScreenEdge,
+    pub peer_id: PeerId,
+    pub remote_edge: ScreenEdge,
+}
+
+/// Screen layout facts used by pure edge-crossing decisions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScreenLayout {
+    pub local_bounds: LogicalRect,
+    pub edge_bindings: Vec<ScreenEdgeBinding>,
+}
+
+impl ScreenLayout {
+    /// Create a screen layout for the local desktop bounds.
+    pub fn new(local_bounds: LogicalRect, edge_bindings: Vec<ScreenEdgeBinding>) -> Self {
+        Self {
+            local_bounds,
+            edge_bindings,
+        }
+    }
+
+    fn binding_for(&self, edge: ScreenEdge) -> Option<&ScreenEdgeBinding> {
+        self.edge_bindings
+            .iter()
+            .find(|binding| binding.local_edge == edge)
+    }
+}
+
+/// Pure result produced when a local pointer crosses a configured screen edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeCrossing {
+    pub peer_id: PeerId,
+    pub local_edge: ScreenEdge,
+    pub remote_edge: ScreenEdge,
+    pub exit_position: LogicalPoint,
+    pub edge_offset: i32,
+}
+
+/// Detect whether a local pointer movement crosses a configured screen edge.
+pub fn detect_edge_crossing(
+    previous: LogicalPoint,
+    next: LogicalPoint,
+    layout: &ScreenLayout,
+) -> Option<EdgeCrossing> {
+    if !layout.local_bounds.contains(previous) || layout.local_bounds.contains(next) {
+        return None;
+    }
+
+    let edge = crossed_edge(previous, next, layout.local_bounds)?;
+    let binding = layout.binding_for(edge)?;
+    let edge_offset = match edge {
+        ScreenEdge::Left | ScreenEdge::Right => layout.local_bounds.clamp_y(next.y),
+        ScreenEdge::Top | ScreenEdge::Bottom => layout.local_bounds.clamp_x(next.x),
+    };
+
+    Some(EdgeCrossing {
+        peer_id: binding.peer_id.clone(),
+        local_edge: edge,
+        remote_edge: binding.remote_edge,
+        exit_position: next,
+        edge_offset,
+    })
+}
+
+fn crossed_edge(
+    previous: LogicalPoint,
+    next: LogicalPoint,
+    bounds: LogicalRect,
+) -> Option<ScreenEdge> {
+    let mut selected = None;
+
+    select_crossed_edge(
+        &mut selected,
+        ScreenEdge::Left,
+        previous.x >= bounds.left() && next.x < bounds.left(),
+        bounds.left().saturating_sub(next.x),
+    );
+    select_crossed_edge(
+        &mut selected,
+        ScreenEdge::Right,
+        previous.x < bounds.right() && next.x >= bounds.right(),
+        next.x.saturating_sub(bounds.right().saturating_sub(1)),
+    );
+    select_crossed_edge(
+        &mut selected,
+        ScreenEdge::Top,
+        previous.y >= bounds.top() && next.y < bounds.top(),
+        bounds.top().saturating_sub(next.y),
+    );
+    select_crossed_edge(
+        &mut selected,
+        ScreenEdge::Bottom,
+        previous.y < bounds.bottom() && next.y >= bounds.bottom(),
+        next.y.saturating_sub(bounds.bottom().saturating_sub(1)),
+    );
+
+    selected.map(|(edge, _overshoot)| edge)
+}
+
+fn select_crossed_edge(
+    selected: &mut Option<(ScreenEdge, i32)>,
+    edge: ScreenEdge,
+    crossed: bool,
+    overshoot: i32,
+) {
+    if !crossed {
+        return;
+    }
+
+    match selected {
+        Some((_edge, selected_overshoot)) if *selected_overshoot >= overshoot => {}
+        _ => *selected = Some((edge, overshoot)),
+    }
+}
+
 /// Runtime facts consumed by the core state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
     Input(CapturedInputEvent),
-    RemoteEntryRequested { peer_id: PeerId },
-    RemoteEntryConfirmed { session_id: SessionId },
+    LocalPointerMoved {
+        previous: LogicalPoint,
+        next: LogicalPoint,
+        layout: ScreenLayout,
+    },
+    RemoteEntryRequested {
+        peer_id: PeerId,
+    },
+    RemoteEntryConfirmed {
+        session_id: SessionId,
+    },
     RemoteLeaveRequested,
     LocalControlConfirmed,
     TransportLost,
@@ -147,10 +403,17 @@ pub enum RuntimeEvent {
 /// Side effects the imperative shell must perform after a successful transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreAction {
-    StartRemoteSession { peer_id: PeerId },
-    ForwardInput { event: CapturedInputEvent },
+    StartRemoteSession {
+        peer_id: PeerId,
+        crossing: Option<EdgeCrossing>,
+    },
+    ForwardInput {
+        event: InjectedInputEvent,
+    },
     ReleaseAllInputs,
-    StopRemoteSession { session_id: Option<SessionId> },
+    StopRemoteSession {
+        session_id: Option<SessionId>,
+    },
 }
 
 /// Expected transition failures returned by the core state machine.
@@ -181,6 +444,7 @@ pub struct RuntimeInputState {
     pending_peer_id: Option<PeerId>,
     active_peer_id: Option<PeerId>,
     active_session_id: Option<SessionId>,
+    last_local_pointer: Option<LogicalPoint>,
     pressed_keys: BTreeSet<PhysicalKey>,
     pressed_buttons: BTreeSet<MouseButton>,
     modifiers: ModifierState,
@@ -212,6 +476,11 @@ impl RuntimeInputState {
         self.active_session_id.as_ref()
     }
 
+    /// Return the last local pointer position recorded by the state machine.
+    pub fn last_local_pointer(&self) -> Option<LogicalPoint> {
+        self.last_local_pointer
+    }
+
     /// Return the currently pressed physical keys.
     pub fn pressed_keys(&self) -> &BTreeSet<PhysicalKey> {
         &self.pressed_keys
@@ -234,6 +503,11 @@ impl RuntimeInputState {
     ) -> Result<Vec<CoreAction>, CoreTransitionError> {
         match event {
             RuntimeEvent::Input(input) => Ok(self.apply_input(input)),
+            RuntimeEvent::LocalPointerMoved {
+                previous,
+                next,
+                layout,
+            } => self.apply_local_pointer_move(previous, next, &layout),
             RuntimeEvent::RemoteEntryRequested { peer_id } => self.request_remote_entry(peer_id),
             RuntimeEvent::RemoteEntryConfirmed { session_id } => {
                 self.confirm_remote_entry(session_id)
@@ -249,9 +523,32 @@ impl RuntimeInputState {
         self.record_input(&input);
 
         if self.mode == ControlMode::Remote {
-            vec![CoreAction::ForwardInput { event: input }]
+            vec![CoreAction::ForwardInput {
+                event: InjectedInputEvent::from(input),
+            }]
         } else {
             Vec::new()
+        }
+    }
+
+    fn apply_local_pointer_move(
+        &mut self,
+        previous: LogicalPoint,
+        next: LogicalPoint,
+        layout: &ScreenLayout,
+    ) -> Result<Vec<CoreAction>, CoreTransitionError> {
+        if self.mode != ControlMode::Local {
+            return Err(CoreTransitionError::InvalidTransition {
+                mode: self.mode,
+                event: "LocalPointerMoved",
+            });
+        }
+
+        if let Some(crossing) = detect_edge_crossing(previous, next, layout) {
+            self.request_remote_entry_from_crossing(crossing)
+        } else {
+            self.last_local_pointer = Some(next);
+            Ok(Vec::new())
         }
     }
 
@@ -269,7 +566,32 @@ impl RuntimeInputState {
         self.mode = ControlMode::EnteringRemote;
         self.pending_peer_id = Some(peer_id.clone());
 
-        Ok(vec![CoreAction::StartRemoteSession { peer_id }])
+        Ok(vec![CoreAction::StartRemoteSession {
+            peer_id,
+            crossing: None,
+        }])
+    }
+
+    fn request_remote_entry_from_crossing(
+        &mut self,
+        crossing: EdgeCrossing,
+    ) -> Result<Vec<CoreAction>, CoreTransitionError> {
+        if self.mode != ControlMode::Local {
+            return Err(CoreTransitionError::InvalidTransition {
+                mode: self.mode,
+                event: "LocalPointerMoved",
+            });
+        }
+
+        let peer_id = crossing.peer_id.clone();
+        self.mode = ControlMode::EnteringRemote;
+        self.pending_peer_id = Some(peer_id.clone());
+        self.last_local_pointer = Some(crossing.exit_position);
+
+        Ok(vec![CoreAction::StartRemoteSession {
+            peer_id,
+            crossing: Some(crossing),
+        }])
     }
 
     fn confirm_remote_entry(
@@ -404,11 +726,34 @@ impl RuntimeInputState {
     }
 }
 
+/// Result produced by a deterministic runtime replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeReplayResult {
+    pub state: RuntimeInputState,
+    pub actions: Vec<CoreAction>,
+}
+
+/// Replay a finite runtime event stream against a fresh state machine.
+pub fn replay_runtime_events(
+    events: &[RuntimeEvent],
+) -> Result<RuntimeReplayResult, CoreTransitionError> {
+    let mut state = RuntimeInputState::new();
+    let mut actions = Vec::new();
+
+    for event in events {
+        actions.extend(state.apply_event(event.clone())?);
+    }
+
+    Ok(RuntimeReplayResult { state, actions })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CapturedInputEvent, ControlMode, CoreAction, CoreTransitionError, MouseButton, PeerId,
-        PhysicalKey, PressState, RuntimeEvent, RuntimeInputState, SessionId,
+        CapturedInputEvent, ControlMode, CoreAction, CoreTransitionError, EdgeCrossing,
+        InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize, MouseButton, PeerId,
+        PhysicalKey, PressState, RuntimeEvent, RuntimeInputState, ScreenEdge, ScreenEdgeBinding,
+        ScreenLayout, SessionId, detect_edge_crossing, replay_runtime_events,
     };
 
     fn apply_ok(state: &mut RuntimeInputState, event: RuntimeEvent) -> Vec<CoreAction> {
@@ -494,6 +839,7 @@ mod tests {
             start_actions,
             vec![CoreAction::StartRemoteSession {
                 peer_id: peer_id.clone(),
+                crossing: None,
             }]
         );
 
@@ -545,7 +891,86 @@ mod tests {
         };
         let actions = apply_ok(&mut state, RuntimeEvent::Input(input.clone()));
 
-        assert_eq!(actions, vec![CoreAction::ForwardInput { event: input }]);
+        assert_eq!(
+            actions,
+            vec![CoreAction::ForwardInput {
+                event: InjectedInputEvent::from(input),
+            }]
+        );
+    }
+
+    #[test]
+    fn edge_crossing_selects_configured_peer() {
+        let layout = right_edge_layout();
+        let previous = LogicalPoint { x: 1919, y: 540 };
+        let next = LogicalPoint { x: 1920, y: 540 };
+
+        assert_eq!(
+            detect_edge_crossing(previous, next, &layout),
+            Some(EdgeCrossing {
+                peer_id: PeerId::new("right-peer"),
+                local_edge: ScreenEdge::Right,
+                remote_edge: ScreenEdge::Left,
+                exit_position: next,
+                edge_offset: 540,
+            })
+        );
+    }
+
+    #[test]
+    fn edge_crossing_ignores_unconfigured_edges_and_in_bounds_moves() {
+        let layout = right_edge_layout();
+
+        assert_eq!(
+            detect_edge_crossing(
+                LogicalPoint { x: 100, y: 100 },
+                LogicalPoint { x: 101, y: 100 },
+                &layout,
+            ),
+            None
+        );
+        assert_eq!(
+            detect_edge_crossing(
+                LogicalPoint { x: 0, y: 540 },
+                LogicalPoint { x: -1, y: 540 },
+                &layout,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn local_pointer_crossing_requests_remote_entry() {
+        let mut state = RuntimeInputState::new();
+        let previous = LogicalPoint { x: 1919, y: 700 };
+        let next = LogicalPoint { x: 1936, y: 700 };
+        let layout = right_edge_layout();
+
+        let actions = apply_ok(
+            &mut state,
+            RuntimeEvent::LocalPointerMoved {
+                previous,
+                next,
+                layout,
+            },
+        );
+
+        assert_eq!(state.mode(), ControlMode::EnteringRemote);
+        assert_eq!(state.pending_peer_id(), Some(&PeerId::new("right-peer")));
+        assert_eq!(state.last_local_pointer(), Some(next));
+        assert_eq!(
+            actions,
+            vec![CoreAction::StartRemoteSession {
+                peer_id: PeerId::new("right-peer"),
+                crossing: Some(EdgeCrossing {
+                    peer_id: PeerId::new("right-peer"),
+                    local_edge: ScreenEdge::Right,
+                    remote_edge: ScreenEdge::Left,
+                    exit_position: next,
+                    edge_offset: 700,
+                }),
+            }]
+        );
     }
 
     #[test]
@@ -574,6 +999,24 @@ mod tests {
         assert!(state.pressed_keys().is_empty());
         assert!(state.pressed_buttons().is_empty());
         assert_eq!(state.modifiers(), Default::default());
+    }
+
+    #[test]
+    fn replay_releases_shift_when_transport_is_lost() {
+        let events = vec![
+            RuntimeEvent::Input(CapturedInputEvent::Key {
+                key: PhysicalKey::LeftShift,
+                state: PressState::Pressed,
+            }),
+            RuntimeEvent::TransportLost,
+        ];
+
+        let result = replay_ok(&events);
+
+        assert_eq!(result.actions, vec![CoreAction::ReleaseAllInputs]);
+        assert_eq!(result.state.mode(), ControlMode::Suspended);
+        assert!(result.state.pressed_keys().is_empty());
+        assert_eq!(result.state.modifiers(), Default::default());
     }
 
     #[test]
@@ -647,5 +1090,80 @@ mod tests {
 
         assert!(apply_ok(&mut state, RuntimeEvent::RecoveryCompleted).is_empty());
         assert_eq!(state.mode(), ControlMode::Local);
+    }
+
+    #[test]
+    fn replay_drives_local_remote_local_lifecycle() {
+        let events = vec![
+            RuntimeEvent::LocalPointerMoved {
+                previous: LogicalPoint { x: 1919, y: 540 },
+                next: LogicalPoint { x: 1920, y: 540 },
+                layout: right_edge_layout(),
+            },
+            RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-5"),
+            },
+            RuntimeEvent::Input(CapturedInputEvent::PointerMoved {
+                delta_x: 10,
+                delta_y: 0,
+            }),
+            RuntimeEvent::RemoteLeaveRequested,
+            RuntimeEvent::LocalControlConfirmed,
+        ];
+
+        let result = replay_ok(&events);
+
+        assert_eq!(result.state.mode(), ControlMode::Local);
+        assert!(result.state.active_peer_id().is_none());
+        assert!(result.state.active_session_id().is_none());
+        assert_eq!(
+            result.actions,
+            vec![
+                CoreAction::StartRemoteSession {
+                    peer_id: PeerId::new("right-peer"),
+                    crossing: Some(EdgeCrossing {
+                        peer_id: PeerId::new("right-peer"),
+                        local_edge: ScreenEdge::Right,
+                        remote_edge: ScreenEdge::Left,
+                        exit_position: LogicalPoint { x: 1920, y: 540 },
+                        edge_offset: 540,
+                    }),
+                },
+                CoreAction::ForwardInput {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 10,
+                        delta_y: 0,
+                    },
+                },
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-5")),
+                },
+            ]
+        );
+    }
+
+    fn right_edge_layout() -> ScreenLayout {
+        ScreenLayout::new(
+            LogicalRect {
+                origin: LogicalPoint { x: 0, y: 0 },
+                size: LogicalSize {
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            vec![ScreenEdgeBinding {
+                local_edge: ScreenEdge::Right,
+                peer_id: PeerId::new("right-peer"),
+                remote_edge: ScreenEdge::Left,
+            }],
+        )
+    }
+
+    fn replay_ok(events: &[RuntimeEvent]) -> super::RuntimeReplayResult {
+        match replay_runtime_events(events) {
+            Ok(result) => result,
+            Err(error) => panic!("expected replay to succeed: {error}"),
+        }
     }
 }
