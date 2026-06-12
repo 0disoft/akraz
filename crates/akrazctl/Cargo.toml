@@ -1,5 +1,5 @@
 [package]
-name = "akraz-daemon"
+name = "akrazctl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,16 +10,13 @@ repository.workspace = true
 [lints]
 workspace = true
 
-[lib]
-name = "akraz_daemon"
-path = "src/lib.rs"
-
 [[bin]]
-name = "akraz-daemon"
+name = "akrazctl"
 path = "src/main.rs"
 
 [dependencies]
 akraz-core = { path = "../akraz-core" }
+akraz-daemon = { path = "../akraz-daemon" }
 akraz-ipc = { path = "../akraz-ipc" }
-akraz-protocol = { path = "../akraz-protocol" }
 akraz-platform = { path = "../akraz-platform" }
+serde = { workspace = true }

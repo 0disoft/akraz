@@ -2,7 +2,8 @@ use std::env;
 use std::process::ExitCode;
 
 use akraz_core::RuntimeInputState;
-use akraz_protocol::ProtocolVersion;
+use akraz_daemon::build_daemon_status;
+use akraz_platform::FakePlatformAdapter;
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -33,9 +34,19 @@ fn print_version() {
 
 fn print_status() {
     let state = RuntimeInputState::new();
-    let protocol = ProtocolVersion::CURRENT;
+    let platform = FakePlatformAdapter::default();
+    let status = match build_daemon_status(&state, &platform) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("failed to build daemon status: {error}");
+            return;
+        }
+    };
 
-    println!("akraz-daemon {}", env!("CARGO_PKG_VERSION"));
-    println!("mode: {:?}", state.mode());
-    println!("protocol: {}.{}", protocol.major, protocol.minor);
+    println!("akraz-daemon {}", status.daemon_version);
+    println!("mode: {:?}", status.mode);
+    println!(
+        "protocol: {}.{}",
+        status.protocol.major, status.protocol.minor
+    );
 }

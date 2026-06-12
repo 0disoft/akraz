@@ -4,7 +4,9 @@ members = [
   "crates/akraz-core",
   "crates/akraz-protocol",
   "crates/akraz-platform",
+  "crates/akraz-ipc",
   "crates/akraz-daemon",
+  "crates/akrazctl",
 ]
 
 [workspace.package]
@@ -20,3 +22,7 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
