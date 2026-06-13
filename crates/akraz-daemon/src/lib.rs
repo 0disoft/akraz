@@ -33,6 +33,21 @@ const DEFAULT_CAPTURE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Shared daemon runtime state observed by IPC and capture workers.
 pub type SharedRuntimeInputState = Arc<Mutex<RuntimeInputState>>;
 
+/// Dispatches side effects requested by the core input state machine.
+pub trait CoreActionDispatcher: Send + Sync + 'static {
+    fn dispatch_core_actions(&self, actions: &[CoreAction]) -> Result<(), PlatformError>;
+}
+
+/// No-op dispatcher used until a real peer transport is attached.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NoopCoreActionDispatcher;
+
+impl CoreActionDispatcher for NoopCoreActionDispatcher {
+    fn dispatch_core_actions(&self, _actions: &[CoreAction]) -> Result<(), PlatformError> {
+        Ok(())
+    }
+}
+
 /// Configuration used to translate captured pointer deltas into core routing events.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaemonInputRoutingConfig {
@@ -269,13 +284,34 @@ pub fn start_daemon_input_capture_with_edge_bindings(
     config: DaemonInputCaptureConfig,
     edge_bindings: Vec<ScreenEdgeBinding>,
 ) -> Result<DaemonInputCaptureWorker, PlatformError> {
+    start_daemon_input_capture_with_edge_bindings_and_dispatcher(
+        state,
+        platform,
+        config,
+        edge_bindings,
+        NoopCoreActionDispatcher,
+    )
+}
+
+/// Start daemon input capture using platform geometry, configured edge bindings, and dispatcher.
+pub fn start_daemon_input_capture_with_edge_bindings_and_dispatcher<D>(
+    state: SharedRuntimeInputState,
+    platform: &impl PlatformAdapter,
+    config: DaemonInputCaptureConfig,
+    edge_bindings: Vec<ScreenEdgeBinding>,
+    dispatcher: D,
+) -> Result<DaemonInputCaptureWorker, PlatformError>
+where
+    D: CoreActionDispatcher,
+{
     let geometry = platform.read_desktop_geometry()?;
 
-    start_daemon_input_capture_with_routing(
+    start_daemon_input_capture_with_routing_and_dispatcher(
         state,
         platform,
         config,
         DaemonInputRoutingConfig::from_desktop_geometry(geometry, edge_bindings),
+        dispatcher,
     )
 }
 
@@ -286,13 +322,40 @@ pub fn start_daemon_input_capture_with_routing(
     config: DaemonInputCaptureConfig,
     routing: DaemonInputRoutingConfig,
 ) -> Result<DaemonInputCaptureWorker, PlatformError> {
+    start_daemon_input_capture_with_routing_and_dispatcher(
+        state,
+        platform,
+        config,
+        routing,
+        NoopCoreActionDispatcher,
+    )
+}
+
+/// Start daemon input capture with explicit routing and side-effect dispatch.
+pub fn start_daemon_input_capture_with_routing_and_dispatcher<D>(
+    state: SharedRuntimeInputState,
+    platform: &impl PlatformAdapter,
+    config: DaemonInputCaptureConfig,
+    routing: DaemonInputRoutingConfig,
+    dispatcher: D,
+) -> Result<DaemonInputCaptureWorker, PlatformError>
+where
+    D: CoreActionDispatcher,
+{
     let capture = platform.start_input_capture(config.input_capture)?;
     let running = Arc::new(AtomicBool::new(true));
     let worker_running = Arc::clone(&running);
     let thread = thread::Builder::new()
         .name("akraz-daemon-input-capture".to_string())
         .spawn(move || {
-            run_daemon_input_capture_worker(state, capture, worker_running, config, routing)
+            run_daemon_input_capture_worker(
+                state,
+                capture,
+                worker_running,
+                config,
+                routing,
+                dispatcher,
+            )
         })
         .map_err(|error| {
             PlatformError::new(format!(
@@ -303,25 +366,35 @@ pub fn start_daemon_input_capture_with_routing(
     Ok(DaemonInputCaptureWorker::new(running, thread))
 }
 
-fn run_daemon_input_capture_worker(
+fn run_daemon_input_capture_worker<D>(
     state: SharedRuntimeInputState,
     capture: InputCaptureSession,
     running: Arc<AtomicBool>,
     config: DaemonInputCaptureConfig,
     routing: DaemonInputRoutingConfig,
-) -> Result<(), PlatformError> {
+    dispatcher: D,
+) -> Result<(), PlatformError>
+where
+    D: CoreActionDispatcher,
+{
     let idle_poll_interval = config.bounded_idle_poll_interval();
     let mut router = CapturedInputRouter::new(routing);
 
     while running.load(Ordering::Acquire) {
         match capture.recv_timeout(idle_poll_interval) {
             Ok(event) => {
-                apply_routed_capture_event(&state, &mut router, event)?;
-                drain_ready_capture_events(
-                    &state,
-                    &capture,
-                    &mut router,
-                    config.bounded_drain_batch_size(),
+                dispatch_core_action_batch(
+                    &dispatcher,
+                    apply_routed_capture_event(&state, &mut router, event)?,
+                )?;
+                dispatch_core_action_batch(
+                    &dispatcher,
+                    drain_ready_capture_events(
+                        &state,
+                        &capture,
+                        &mut router,
+                        config.bounded_drain_batch_size(),
+                    )?,
                 )?;
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -330,6 +403,17 @@ fn run_daemon_input_capture_worker(
     }
 
     capture.stop()
+}
+
+fn dispatch_core_action_batch(
+    dispatcher: &impl CoreActionDispatcher,
+    actions: Vec<CoreAction>,
+) -> Result<(), PlatformError> {
+    if actions.is_empty() {
+        return Ok(());
+    }
+
+    dispatcher.dispatch_core_actions(&actions)
 }
 
 fn drain_ready_capture_events(
@@ -540,8 +624,8 @@ fn push_missing_capability_issue(
 mod tests {
     use akraz_core::{
         CapturedInputEvent, ControlMode, CoreAction, EdgeCrossing, InjectedInputEvent,
-        LogicalPoint, LogicalRect, LogicalSize, PeerId, PhysicalKey, PressState, RuntimeInputState,
-        ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
+        LogicalPoint, LogicalRect, LogicalSize, PeerId, PhysicalKey, PressState, RuntimeEvent,
+        RuntimeInputState, ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
     };
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, DaemonStatusParams, IpcEndpoint,
@@ -550,17 +634,18 @@ mod tests {
     };
     use akraz_platform::{
         DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, PlatformAdapter,
-        PlatformCapabilities,
+        PlatformCapabilities, PlatformError,
     };
     use serde_json::json;
 
     use super::{
-        CapturedInputRouter, DAEMON_VERSION, DaemonInputCaptureConfig, DaemonInputRoutingConfig,
-        DaemonIpcRunConfig, DaemonIpcServer, apply_routed_capture_event_to_state,
-        build_daemon_status, build_permissions_probe, drain_capture_events,
-        handle_ipc_request_line, serve_daemon_ipc, shared_runtime_state,
+        CapturedInputRouter, CoreActionDispatcher, DAEMON_VERSION, DaemonInputCaptureConfig,
+        DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer,
+        apply_routed_capture_event_to_state, build_daemon_status, build_permissions_probe,
+        drain_capture_events, handle_ipc_request_line, serve_daemon_ipc, shared_runtime_state,
         start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
         start_daemon_input_capture_with_routing,
+        start_daemon_input_capture_with_routing_and_dispatcher,
     };
 
     fn status_or_panic(
@@ -661,6 +746,28 @@ mod tests {
         }
 
         Err(last_error.unwrap_or_else(|| "retry exhausted".to_string()))
+    }
+
+    #[derive(Debug, Default, Clone)]
+    struct RecordingCoreActionDispatcher {
+        actions: std::sync::Arc<std::sync::Mutex<Vec<CoreAction>>>,
+    }
+
+    impl RecordingCoreActionDispatcher {
+        fn snapshot(&self) -> Vec<CoreAction> {
+            self.actions.lock().expect("recorded action lock").clone()
+        }
+    }
+
+    impl CoreActionDispatcher for RecordingCoreActionDispatcher {
+        fn dispatch_core_actions(&self, actions: &[CoreAction]) -> Result<(), PlatformError> {
+            self.actions
+                .lock()
+                .map_err(|_| PlatformError::new("recorded action lock was poisoned"))?
+                .extend_from_slice(actions);
+
+            Ok(())
+        }
     }
 
     #[test]
@@ -1060,6 +1167,115 @@ mod tests {
 
         worker.stop().expect("stop capture worker");
         panic!("expected capture worker to route pointer crossing");
+    }
+
+    #[test]
+    fn daemon_input_capture_worker_dispatches_edge_crossing_action() {
+        let platform = FakePlatformAdapter::default().with_captured_events(vec![
+            CapturedInputEvent::PointerMoved {
+                delta_x: 1,
+                delta_y: 0,
+            },
+        ]);
+        let state = shared_runtime_state(RuntimeInputState::new());
+        let dispatcher = RecordingCoreActionDispatcher::default();
+        let expected_action = CoreAction::StartRemoteSession {
+            peer_id: PeerId::new("right-peer"),
+            crossing: Some(EdgeCrossing {
+                peer_id: PeerId::new("right-peer"),
+                local_edge: ScreenEdge::Right,
+                remote_edge: ScreenEdge::Left,
+                exit_position: LogicalPoint { x: 1920, y: 540 },
+                edge_offset: 540,
+            }),
+        };
+
+        let worker = start_daemon_input_capture_with_routing_and_dispatcher(
+            state,
+            &platform,
+            DaemonInputCaptureConfig {
+                input_capture: InputCaptureConfig {
+                    event_buffer_capacity: 8,
+                },
+                drain_batch_size: 8,
+                idle_poll_interval: std::time::Duration::from_millis(1),
+            },
+            DaemonInputRoutingConfig {
+                screen_layout: right_edge_layout(),
+                initial_pointer: LogicalPoint { x: 1919, y: 540 },
+            },
+            dispatcher.clone(),
+        )
+        .expect("daemon capture worker");
+
+        for _ in 0..20 {
+            if dispatcher.snapshot().contains(&expected_action) {
+                worker.stop().expect("stop capture worker");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        worker.stop().expect("stop capture worker");
+        panic!("expected capture worker to dispatch edge crossing action");
+    }
+
+    #[test]
+    fn daemon_input_capture_worker_dispatches_remote_forward_action() {
+        let platform = FakePlatformAdapter::default().with_captured_events(vec![
+            CapturedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            },
+        ]);
+        let mut initial_state = RuntimeInputState::new();
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            })
+            .expect("remote entry request");
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-1"),
+            })
+            .expect("remote entry confirmed");
+        let state = shared_runtime_state(initial_state);
+        let dispatcher = RecordingCoreActionDispatcher::default();
+        let expected_action = CoreAction::ForwardInput {
+            event: InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            },
+        };
+
+        let worker = start_daemon_input_capture_with_routing_and_dispatcher(
+            state,
+            &platform,
+            DaemonInputCaptureConfig {
+                input_capture: InputCaptureConfig {
+                    event_buffer_capacity: 8,
+                },
+                drain_batch_size: 8,
+                idle_poll_interval: std::time::Duration::from_millis(1),
+            },
+            DaemonInputRoutingConfig {
+                screen_layout: right_edge_layout(),
+                initial_pointer: LogicalPoint { x: 1919, y: 540 },
+            },
+            dispatcher.clone(),
+        )
+        .expect("daemon capture worker");
+
+        for _ in 0..20 {
+            if dispatcher.snapshot().contains(&expected_action) {
+                worker.stop().expect("stop capture worker");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        worker.stop().expect("stop capture worker");
+        panic!("expected capture worker to dispatch remote forward action");
     }
 
     #[test]
