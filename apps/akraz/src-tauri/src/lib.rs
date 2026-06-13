@@ -1,4 +1,6 @@
 use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
@@ -11,6 +13,7 @@ use akraz_ipc::{
     METHOD_DAEMON_STATUS, OsLocalIpcClient, call_json_rpc, resolve_current_default_endpoint,
 };
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 use tauri::async_runtime::Receiver;
 use tauri_plugin_shell::{
     ShellExt,
@@ -25,6 +28,7 @@ const DAEMON_SERVE_ARG: &str = "--serve";
 const DAEMON_CAPTURE_INPUT_ARG: &str = "--capture-input";
 const DAEMON_EDGE_BINDING_ARG: &str = "--edge-binding";
 const DAEMON_LIFECYCLE_SMOKE_FLAG: &str = "--akraz-smoke-daemon-lifecycle";
+const SETTINGS_FILE_NAME: &str = "settings.json";
 const DAEMON_START_RETRIES: usize = 50;
 const DAEMON_START_RETRY_DELAY: Duration = Duration::from_millis(40);
 const DAEMON_STOP_RETRIES: usize = 50;
@@ -51,7 +55,9 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             daemon_start,
-            daemon_stop
+            daemon_stop,
+            settings_load,
+            settings_save
         ])
 }
 
@@ -162,6 +168,23 @@ async fn daemon_stop(
         .map_err(|error| format!("daemon stop task failed: {error}"))?
 }
 
+#[tauri::command]
+async fn settings_load(app: tauri::AppHandle) -> Result<AppSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || load_app_settings(&app))
+        .await
+        .map_err(|error| format!("settings load task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn settings_save(
+    app: tauri::AppHandle,
+    settings: AppSettings,
+) -> Result<AppSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || save_app_settings(&app, settings))
+        .await
+        .map_err(|error| format!("settings save task failed: {error}"))?
+}
+
 #[derive(Debug, Default)]
 struct DaemonProcessState {
     child: Option<ManagedDaemonChild>,
@@ -212,23 +235,32 @@ struct SpawnedDaemonProcess {
     sidecar_events: Option<Receiver<CommandEvent>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AppSettings {
+    #[serde(default)]
+    capture_input: bool,
+    #[serde(default)]
+    edge_bindings: Vec<DaemonEdgeBindingOption>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DaemonStartOptions {
     capture_input: Option<bool>,
     #[serde(default)]
     edge_bindings: Vec<DaemonEdgeBindingOption>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DaemonEdgeBindingOption {
     local_edge: DaemonScreenEdgeOption,
     peer_id: String,
     remote_edge: DaemonScreenEdgeOption,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum DaemonScreenEdgeOption {
     Left,
@@ -429,6 +461,69 @@ fn call_daemon_status() -> Result<DaemonStatus, DaemonLifecycleSnapshot> {
     parse_daemon_status_response(&response_line).map_err(DaemonLifecycleSnapshot::failed)
 }
 
+fn load_app_settings(app: &tauri::AppHandle) -> Result<AppSettings, String> {
+    let path = app_settings_path(app)?;
+    load_settings_from_path(&path)
+}
+
+fn save_app_settings(app: &tauri::AppHandle, settings: AppSettings) -> Result<AppSettings, String> {
+    let path = app_settings_path(app)?;
+    save_settings_to_path(&path, settings)
+}
+
+fn app_settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("failed to resolve Akraz settings directory: {error}"))?;
+
+    Ok(directory.join(SETTINGS_FILE_NAME))
+}
+
+fn load_settings_from_path(path: &PathBuf) -> Result<AppSettings, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            let settings = serde_json::from_str::<AppSettings>(&contents)
+                .map_err(|error| format!("failed to read Akraz settings: {error}"))?;
+            normalize_settings(settings)
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(AppSettings::default()),
+        Err(error) => Err(format!("failed to read Akraz settings: {error}")),
+    }
+}
+
+fn save_settings_to_path(path: &PathBuf, settings: AppSettings) -> Result<AppSettings, String> {
+    let settings = normalize_settings(settings)?;
+    let Some(directory) = path.parent() else {
+        return Err("failed to resolve Akraz settings directory.".to_string());
+    };
+
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("failed to create Akraz settings directory: {error}"))?;
+    let contents = serde_json::to_string_pretty(&settings)
+        .map_err(|error| format!("failed to encode Akraz settings: {error}"))?;
+    fs::write(path, contents).map_err(|error| format!("failed to save Akraz settings: {error}"))?;
+
+    Ok(settings)
+}
+
+fn normalize_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
+    settings.edge_bindings = settings
+        .edge_bindings
+        .into_iter()
+        .map(normalize_edge_binding)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(settings)
+}
+
+fn normalize_edge_binding(
+    mut binding: DaemonEdgeBindingOption,
+) -> Result<DaemonEdgeBindingOption, String> {
+    binding.peer_id = normalize_peer_id(&binding.peer_id)?.to_string();
+    Ok(binding)
+}
+
 fn parse_daemon_status_response(response_line: &str) -> Result<DaemonStatus, String> {
     let value: serde_json::Value = serde_json::from_str(response_line.trim_end())
         .map_err(|error| format!("daemon returned invalid JSON: {error}"))?;
@@ -565,13 +660,7 @@ fn daemon_spawn_args_from(
 }
 
 fn format_edge_binding_arg(binding: &DaemonEdgeBindingOption) -> Result<String, String> {
-    let peer_id = binding.peer_id.trim();
-    if peer_id.is_empty() {
-        return Err("edge binding peer id is required.".to_string());
-    }
-    if peer_id.contains(':') {
-        return Err("edge binding peer id cannot contain ':'.".to_string());
-    }
+    let peer_id = normalize_peer_id(&binding.peer_id)?;
 
     Ok(format!(
         "{}:{}:{}",
@@ -579,6 +668,18 @@ fn format_edge_binding_arg(binding: &DaemonEdgeBindingOption) -> Result<String, 
         peer_id,
         binding.remote_edge.daemon_arg()
     ))
+}
+
+fn normalize_peer_id(peer_id: &str) -> Result<&str, String> {
+    let peer_id = peer_id.trim();
+    if peer_id.is_empty() {
+        return Err("edge binding peer id is required.".to_string());
+    }
+    if peer_id.contains(':') {
+        return Err("edge binding peer id cannot contain ':'.".to_string());
+    }
+
+    Ok(peer_id)
 }
 
 fn daemon_capture_input_enabled_from(value: Option<OsString>) -> bool {
@@ -715,11 +816,12 @@ mod tests {
     };
 
     use super::{
-        DAEMON_CAPTURE_INPUT_ARG, DAEMON_EDGE_BINDING_ARG, DAEMON_LIFECYCLE_SMOKE_FLAG,
-        DAEMON_SERVE_ARG, DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase,
-        DaemonScreenEdgeOption, DaemonStartOptions, classify_daemon_call_error,
-        daemon_capture_input_enabled_from, daemon_executable_name, daemon_spawn_args_from,
-        format_edge_binding_arg, parse_daemon_status_response, resolve_env_daemon_executable_from,
+        AppSettings, DAEMON_CAPTURE_INPUT_ARG, DAEMON_EDGE_BINDING_ARG,
+        DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_SERVE_ARG, DAEMON_SIDECAR_NAME,
+        DaemonEdgeBindingOption, DaemonLifecyclePhase, DaemonScreenEdgeOption, DaemonStartOptions,
+        classify_daemon_call_error, daemon_capture_input_enabled_from, daemon_executable_name,
+        daemon_spawn_args_from, format_edge_binding_arg, load_settings_from_path,
+        parse_daemon_status_response, resolve_env_daemon_executable_from, save_settings_to_path,
         should_run_daemon_lifecycle_smoke,
     };
 
@@ -915,6 +1017,61 @@ mod tests {
     }
 
     #[test]
+    fn settings_load_defaults_when_file_is_missing() {
+        let path = unique_settings_path("missing");
+
+        assert_eq!(load_settings_from_path(&path), Ok(AppSettings::default()));
+    }
+
+    #[test]
+    fn settings_save_normalizes_and_loads_edge_bindings() {
+        let path = unique_settings_path("roundtrip");
+        let settings = AppSettings {
+            capture_input: true,
+            edge_bindings: vec![DaemonEdgeBindingOption {
+                local_edge: DaemonScreenEdgeOption::Right,
+                peer_id: " linux-laptop ".to_string(),
+                remote_edge: DaemonScreenEdgeOption::Left,
+            }],
+        };
+
+        let saved = save_settings_to_path(&path, settings).expect("save settings");
+
+        assert_eq!(
+            saved,
+            AppSettings {
+                capture_input: true,
+                edge_bindings: vec![DaemonEdgeBindingOption {
+                    local_edge: DaemonScreenEdgeOption::Right,
+                    peer_id: "linux-laptop".to_string(),
+                    remote_edge: DaemonScreenEdgeOption::Left,
+                }],
+            }
+        );
+        assert_eq!(load_settings_from_path(&path), Ok(saved));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_save_rejects_edge_bindings_that_break_daemon_cli_contract() {
+        let path = unique_settings_path("invalid");
+        let settings = AppSettings {
+            capture_input: true,
+            edge_bindings: vec![DaemonEdgeBindingOption {
+                local_edge: DaemonScreenEdgeOption::Right,
+                peer_id: "linux:laptop".to_string(),
+                remote_edge: DaemonScreenEdgeOption::Left,
+            }],
+        };
+
+        assert_eq!(
+            save_settings_to_path(&path, settings),
+            Err("edge binding peer id cannot contain ':'.".to_string())
+        );
+    }
+
+    #[test]
     fn edge_binding_arg_rejects_values_that_break_daemon_cli_contract() {
         assert_eq!(
             format_edge_binding_arg(&DaemonEdgeBindingOption {
@@ -932,5 +1089,19 @@ mod tests {
             }),
             Err("edge binding peer id cannot contain ':'.".to_string())
         );
+    }
+
+    fn unique_settings_path(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+
+        std::env::temp_dir()
+            .join(format!(
+                "akraz-settings-test-{label}-{}",
+                std::process::id()
+            ))
+            .join(format!("{nanos}.json"))
     }
 }

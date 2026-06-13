@@ -2,7 +2,8 @@
   import { onMount } from 'svelte';
 
   import { daemonState } from './lib/state/daemonState.svelte';
-  import type { ControlMode, DaemonLifecyclePhase, PlatformCapabilities } from './lib/api/types';
+  import { settingsState } from './lib/state/settingsState.svelte';
+  import type { ControlMode, DaemonLifecyclePhase, PlatformCapabilities, ScreenEdge } from './lib/api/types';
 
   const modeLabels: Record<ControlMode, string> = {
     Local: '로컬',
@@ -27,8 +28,18 @@
     { key: 'canInjectKeyboard', label: '키보드 보내기' },
   ];
 
+  const edgeLabels: Record<ScreenEdge, string> = {
+    left: '왼쪽',
+    right: '오른쪽',
+    top: '위',
+    bottom: '아래',
+  };
+
+  const edgeOptions: ScreenEdge[] = ['left', 'right', 'top', 'bottom'];
+
   onMount(() => {
     void daemonState.refresh();
+    void settingsState.load();
   });
 
   function canStartDaemon() {
@@ -46,6 +57,16 @@
     }
 
     return daemonState.snapshot?.detail ?? '백그라운드 연결을 시작할 수 있어.';
+  }
+
+  function settingsMessage() {
+    if (settingsState.lastError) {
+      return settingsState.lastError;
+    }
+    if (settingsState.saved) {
+      return '저장됨';
+    }
+    return '저장 전';
   }
 </script>
 
@@ -68,8 +89,8 @@
         <button
           type="button"
           class="control-button"
-          disabled={daemonState.isBusy || !canStartDaemon()}
-          onclick={() => daemonState.start()}
+          disabled={daemonState.isBusy || settingsState.isBusy || !canStartDaemon()}
+          onclick={() => daemonState.start(settingsState.startOptions)}
         >
           {daemonState.operation === 'start' ? '시작 중' : '시작'}
         </button>
@@ -138,5 +159,90 @@
         </div>
       </div>
     {/if}
+
+    <section class="section-block settings-block" aria-labelledby="settings-title">
+      <div class="section-heading-row">
+        <h2 id="settings-title">수동 연결</h2>
+        <span class:error-text={settingsState.lastError}>{settingsMessage()}</span>
+      </div>
+
+      <label class="toggle-row">
+        <input
+          type="checkbox"
+          checked={settingsState.settings.captureInput}
+          onchange={(event) => settingsState.updateCaptureInput(event.currentTarget.checked)}
+        />
+        <span>입력 잡기</span>
+      </label>
+
+      <div class="edge-list" aria-label="화면 끝 연결">
+        {#each settingsState.settings.edgeBindings as binding, index}
+          <div class="edge-row">
+            <label>
+              <span>내 화면</span>
+              <select
+                value={binding.localEdge}
+                onchange={(event) => settingsState.updateEdgeBinding(index, 'localEdge', event.currentTarget.value)}
+              >
+                {#each edgeOptions as edge}
+                  <option value={edge}>{edgeLabels[edge]}</option>
+                {/each}
+              </select>
+            </label>
+
+            <label class="peer-field">
+              <span>기기 ID</span>
+              <input
+                type="text"
+                value={binding.peerId}
+                placeholder="linux-laptop"
+                spellcheck="false"
+                onchange={(event) => settingsState.updateEdgeBinding(index, 'peerId', event.currentTarget.value)}
+              />
+            </label>
+
+            <label>
+              <span>상대 화면</span>
+              <select
+                value={binding.remoteEdge}
+                onchange={(event) => settingsState.updateEdgeBinding(index, 'remoteEdge', event.currentTarget.value)}
+              >
+                {#each edgeOptions as edge}
+                  <option value={edge}>{edgeLabels[edge]}</option>
+                {/each}
+              </select>
+            </label>
+
+            <button
+              type="button"
+              class="icon-button"
+              aria-label="연결 삭제"
+              onclick={() => settingsState.removeEdgeBinding(index)}
+            >
+              ×
+            </button>
+          </div>
+        {/each}
+      </div>
+
+      <div class="settings-actions">
+        <button
+          type="button"
+          class="control-button secondary"
+          disabled={settingsState.isBusy}
+          onclick={() => settingsState.addEdgeBinding()}
+        >
+          추가
+        </button>
+        <button
+          type="button"
+          class="control-button"
+          disabled={settingsState.isBusy}
+          onclick={() => settingsState.save()}
+        >
+          {settingsState.operation === 'save' ? '저장 중' : '저장'}
+        </button>
+      </div>
+    </section>
   </section>
 </main>

@@ -1,0 +1,96 @@
+import { settingsClient } from "../api/settingsClient";
+import type { AppSettings, ScreenEdge, ScreenEdgeBinding } from "../api/types";
+
+type SettingsOperation = "load" | "save";
+
+function defaultSettings(): AppSettings {
+  return {
+    captureInput: false,
+    edgeBindings: [],
+  };
+}
+
+function defaultEdgeBinding(): ScreenEdgeBinding {
+  return {
+    localEdge: "right",
+    peerId: "",
+    remoteEdge: "left",
+  };
+}
+
+export class SettingsState {
+  settings = $state<AppSettings>(defaultSettings());
+  operation = $state<SettingsOperation | null>(null);
+  lastError = $state<string | null>(null);
+  saved = $state(false);
+
+  get isBusy(): boolean {
+    return this.operation !== null;
+  }
+
+  get startOptions() {
+    return {
+      captureInput: this.settings.captureInput,
+      edgeBindings: this.settings.edgeBindings,
+    };
+  }
+
+  addEdgeBinding() {
+    this.settings.edgeBindings = [...this.settings.edgeBindings, defaultEdgeBinding()];
+    this.saved = false;
+  }
+
+  removeEdgeBinding(index: number) {
+    this.settings.edgeBindings = this.settings.edgeBindings.filter(
+      (_, itemIndex) => itemIndex !== index,
+    );
+    this.saved = false;
+  }
+
+  updateCaptureInput(captureInput: boolean) {
+    this.settings.captureInput = captureInput;
+    this.saved = false;
+  }
+
+  updateEdgeBinding(index: number, field: keyof ScreenEdgeBinding, value: string) {
+    this.settings.edgeBindings = this.settings.edgeBindings.map((binding, itemIndex) => {
+      if (itemIndex !== index) {
+        return binding;
+      }
+
+      return {
+        ...binding,
+        [field]: field === "peerId" ? value : (value as ScreenEdge),
+      };
+    });
+    this.saved = false;
+  }
+
+  async load() {
+    await this.run("load", async () => {
+      this.settings = await settingsClient.load();
+      this.saved = false;
+    });
+  }
+
+  async save() {
+    await this.run("save", async () => {
+      this.settings = await settingsClient.save(this.settings);
+      this.saved = true;
+    });
+  }
+
+  private async run(operation: SettingsOperation, action: () => Promise<void>) {
+    this.operation = operation;
+    this.lastError = null;
+    try {
+      await action();
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.operation = null;
+    }
+  }
+}
+
+export const settingsState = new SettingsState();

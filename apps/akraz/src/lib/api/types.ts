@@ -52,3 +52,8 @@ export interface DaemonStartOptions {
   captureInput?: boolean;
   edgeBindings?: ScreenEdgeBinding[];
 }
+
+export interface AppSettings {
+  captureInput: boolean;
+  edgeBindings: ScreenEdgeBinding[];
+}
