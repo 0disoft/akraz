@@ -22,7 +22,8 @@ use akraz_ipc::{
     to_json_line,
 };
 use akraz_platform::{
-    DesktopGeometry, InputCaptureConfig, InputCaptureSession, PlatformAdapter, PlatformError,
+    DesktopGeometry, InputCaptureConfig, InputCapturePolicy, InputCaptureSession, PlatformAdapter,
+    PlatformError,
 };
 use akraz_protocol::ProtocolVersion;
 use serde::{Deserialize, Serialize};
@@ -1175,6 +1176,7 @@ where
     D: CoreActionDispatcher,
 {
     let capture = platform.start_input_capture(config.input_capture)?;
+    sync_capture_policy_with_state(&capture, &state)?;
     let running = Arc::new(AtomicBool::new(true));
     let worker_running = Arc::clone(&running);
     let thread = thread::Builder::new()
@@ -1213,12 +1215,14 @@ where
     let mut router = CapturedInputRouter::new(routing);
 
     while running.load(Ordering::Acquire) {
+        sync_capture_policy_with_state(&capture, &state)?;
         match capture.recv_timeout(idle_poll_interval) {
             Ok(event) => {
                 dispatch_core_action_batch(
                     &dispatcher,
                     apply_routed_capture_event(&state, &mut router, event)?,
                 )?;
+                sync_capture_policy_with_state(&capture, &state)?;
                 dispatch_core_action_batch(
                     &dispatcher,
                     drain_ready_capture_events(
@@ -1228,13 +1232,39 @@ where
                         config.bounded_drain_batch_size(),
                     )?,
                 )?;
+                sync_capture_policy_with_state(&capture, &state)?;
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                sync_capture_policy_with_state(&capture, &state)?;
+            }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
 
     capture.stop()
+}
+
+fn sync_capture_policy_with_state(
+    capture: &InputCaptureSession,
+    state: &SharedRuntimeInputState,
+) -> Result<(), PlatformError> {
+    let mode = state
+        .lock()
+        .map_err(|_| PlatformError::new("daemon runtime state is unavailable"))?
+        .mode();
+
+    capture.set_policy(input_capture_policy_for_control_mode(mode));
+    Ok(())
+}
+
+fn input_capture_policy_for_control_mode(mode: ControlMode) -> InputCapturePolicy {
+    match mode {
+        ControlMode::Remote => InputCapturePolicy::ConsumeCapturedInput,
+        ControlMode::Local
+        | ControlMode::EnteringRemote
+        | ControlMode::LeavingRemote
+        | ControlMode::Suspended => InputCapturePolicy::PassThrough,
+    }
 }
 
 fn dispatch_core_action_batch(
@@ -1465,8 +1495,8 @@ mod tests {
         METHOD_DAEMON_STATUS, OsLocalIpcClient, call_json_rpc, to_json_line,
     };
     use akraz_platform::{
-        DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, PlatformAdapter,
-        PlatformCapabilities, PlatformError,
+        DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, InputCapturePolicy,
+        PlatformAdapter, PlatformCapabilities, PlatformError,
     };
     use serde_json::json;
 
@@ -1477,11 +1507,12 @@ mod tests {
         PeerTransportMessage, PeerTransportSessionFrame, TcpPeerSessionTransport, TcpPeerTransport,
         TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
         build_permissions_probe, drain_capture_events, execute_peer_transport_command,
-        handle_ipc_request_line, serve_daemon_ipc, serve_tcp_peer_transport_commands,
-        serve_tcp_peer_transport_session, serve_tcp_peer_transport_session_and_execute,
-        shared_runtime_state, start_daemon_input_capture,
-        start_daemon_input_capture_with_edge_bindings, start_daemon_input_capture_with_routing,
-        start_daemon_input_capture_with_routing_and_dispatcher,
+        handle_ipc_request_line, input_capture_policy_for_control_mode, serve_daemon_ipc,
+        serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
+        serve_tcp_peer_transport_session_and_execute, shared_runtime_state,
+        start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
+        start_daemon_input_capture_with_routing,
+        start_daemon_input_capture_with_routing_and_dispatcher, sync_capture_policy_with_state,
     };
 
     fn status_or_panic(
@@ -1811,6 +1842,67 @@ mod tests {
                     delta_y: 2,
                 },
             }]
+        );
+    }
+
+    #[test]
+    fn input_capture_policy_consumes_only_remote_mode() {
+        assert_eq!(
+            input_capture_policy_for_control_mode(ControlMode::Local),
+            InputCapturePolicy::PassThrough
+        );
+        assert_eq!(
+            input_capture_policy_for_control_mode(ControlMode::EnteringRemote),
+            InputCapturePolicy::PassThrough
+        );
+        assert_eq!(
+            input_capture_policy_for_control_mode(ControlMode::Remote),
+            InputCapturePolicy::ConsumeCapturedInput
+        );
+        assert_eq!(
+            input_capture_policy_for_control_mode(ControlMode::LeavingRemote),
+            InputCapturePolicy::PassThrough
+        );
+        assert_eq!(
+            input_capture_policy_for_control_mode(ControlMode::Suspended),
+            InputCapturePolicy::PassThrough
+        );
+    }
+
+    #[test]
+    fn capture_policy_sync_follows_shared_remote_state() {
+        let platform = FakePlatformAdapter::default();
+        let capture = platform
+            .start_input_capture(InputCaptureConfig::default())
+            .expect("fake capture session");
+        let state = shared_runtime_state(RuntimeInputState::new());
+
+        sync_capture_policy_with_state(&capture, &state).expect("sync local policy");
+
+        assert_eq!(
+            platform.input_capture_policy(),
+            InputCapturePolicy::PassThrough
+        );
+
+        {
+            let mut state = state.lock().expect("shared state lock");
+            state
+                .apply_event(RuntimeEvent::RemoteEntryRequested {
+                    peer_id: PeerId::new("right-peer"),
+                })
+                .expect("remote entry request");
+            state
+                .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+                    session_id: SessionId::new("session-1"),
+                })
+                .expect("remote entry confirmed");
+        }
+
+        sync_capture_policy_with_state(&capture, &state).expect("sync remote policy");
+
+        assert_eq!(
+            platform.input_capture_policy(),
+            InputCapturePolicy::ConsumeCapturedInput
         );
     }
 

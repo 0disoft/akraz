@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
@@ -129,23 +130,88 @@ impl Default for InputCaptureConfig {
     }
 }
 
+/// Local handling policy for captured OS input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputCapturePolicy {
+    /// Observe input and let the local desktop continue processing it.
+    #[default]
+    PassThrough,
+    /// Forward captured input and prevent the local desktop from also processing it.
+    ConsumeCapturedInput,
+}
+
+impl InputCapturePolicy {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::PassThrough => 0,
+            Self::ConsumeCapturedInput => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::ConsumeCapturedInput,
+            _ => Self::PassThrough,
+        }
+    }
+
+    #[cfg(windows)]
+    fn consumes_captured_input(self) -> bool {
+        self == Self::ConsumeCapturedInput
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SharedInputCapturePolicy {
+    value: Arc<AtomicU8>,
+}
+
+impl SharedInputCapturePolicy {
+    fn new(policy: InputCapturePolicy) -> Self {
+        Self {
+            value: Arc::new(AtomicU8::new(policy.as_u8())),
+        }
+    }
+
+    fn load(&self) -> InputCapturePolicy {
+        InputCapturePolicy::from_u8(self.value.load(Ordering::Acquire))
+    }
+
+    fn store(&self, policy: InputCapturePolicy) {
+        self.value.store(policy.as_u8(), Ordering::Release);
+    }
+}
+
+impl Default for SharedInputCapturePolicy {
+    fn default() -> Self {
+        Self::new(InputCapturePolicy::default())
+    }
+}
+
 /// Running platform input capture session.
 pub struct InputCaptureSession {
     events: Receiver<CapturedInputEvent>,
     shutdown: Option<InputCaptureShutdown>,
+    policy: SharedInputCapturePolicy,
 }
 
 impl InputCaptureSession {
-    fn new(events: Receiver<CapturedInputEvent>, shutdown: InputCaptureShutdown) -> Self {
+    fn new(
+        events: Receiver<CapturedInputEvent>,
+        shutdown: InputCaptureShutdown,
+        policy: SharedInputCapturePolicy,
+    ) -> Self {
         Self {
             events,
             shutdown: Some(shutdown),
+            policy,
         }
     }
 
-    fn from_preloaded_events(
+    fn from_preloaded_events_with_policy(
         events: impl IntoIterator<Item = CapturedInputEvent>,
         config: InputCaptureConfig,
+        policy: SharedInputCapturePolicy,
     ) -> Self {
         let (sender, receiver) = sync_channel(config.bounded_capacity());
         for event in events {
@@ -155,7 +221,17 @@ impl InputCaptureSession {
         }
         drop(sender);
 
-        Self::new(receiver, InputCaptureShutdown::Noop)
+        Self::new(receiver, InputCaptureShutdown::Noop, policy)
+    }
+
+    /// Return the local input handling policy used by this capture session.
+    pub fn policy(&self) -> InputCapturePolicy {
+        self.policy.load()
+    }
+
+    /// Update whether captured input should pass through to the local desktop or be consumed.
+    pub fn set_policy(&self, policy: InputCapturePolicy) {
+        self.policy.store(policy);
     }
 
     /// Receive the next captured input event without blocking.
@@ -463,6 +539,7 @@ thread_local! {
 #[derive(Default)]
 struct WindowsCaptureThreadState {
     sender: Option<SyncSender<CapturedInputEvent>>,
+    policy: Option<SharedInputCapturePolicy>,
     last_pointer: Option<(i32, i32)>,
 }
 
@@ -472,9 +549,11 @@ fn start_windows_input_capture(
 ) -> Result<InputCaptureSession, PlatformError> {
     let (event_sender, event_receiver) = sync_channel(config.bounded_capacity());
     let (ready_sender, ready_receiver) = sync_channel(1);
+    let policy = SharedInputCapturePolicy::default();
+    let thread_policy = policy.clone();
     let thread = thread::Builder::new()
         .name("akraz-windows-input-capture".to_string())
-        .spawn(move || run_windows_input_capture_thread(event_sender, ready_sender))
+        .spawn(move || run_windows_input_capture_thread(event_sender, ready_sender, thread_policy))
         .map_err(|error| PlatformError::new(format!("failed to start input capture: {error}")))?;
 
     match ready_receiver.recv() {
@@ -484,6 +563,7 @@ fn start_windows_input_capture(
                 thread_id,
                 thread: Some(thread),
             }),
+            policy,
         )),
         Ok(Err(error)) => {
             let _ = thread.join();
@@ -502,6 +582,7 @@ fn start_windows_input_capture(
 fn run_windows_input_capture_thread(
     sender: SyncSender<CapturedInputEvent>,
     ready: SyncSender<Result<u32, PlatformError>>,
+    policy: SharedInputCapturePolicy,
 ) {
     let thread_id = unsafe { GetCurrentThreadId() };
     let mut message = MSG::default();
@@ -513,6 +594,7 @@ fn run_windows_input_capture_thread(
     WINDOWS_CAPTURE_STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.sender = Some(sender);
+        state.policy = Some(policy);
         state.last_pointer = None;
     });
 
@@ -521,6 +603,7 @@ fn run_windows_input_capture_thread(
     WINDOWS_CAPTURE_STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.sender = None;
+        state.policy = None;
         state.last_pointer = None;
     });
 
@@ -658,30 +741,57 @@ unsafe extern "system" fn low_level_hook_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let mut consume = false;
     if code >= 0 {
-        forward_captured_windows_event(wparam, lparam);
+        consume = forward_captured_windows_event(wparam, lparam);
     }
 
-    // SAFETY: This hook never consumes input and forwards the notification to the next hook.
+    if consume {
+        return 1;
+    }
+
+    // SAFETY: The hook forwards notifications that are not captured under the active policy.
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }
 
 #[cfg(windows)]
-fn forward_captured_windows_event(wparam: WPARAM, lparam: LPARAM) {
+fn forward_captured_windows_event(wparam: WPARAM, lparam: LPARAM) -> bool {
     WINDOWS_CAPTURE_STATE.with(|state| {
         let mut state = state.borrow_mut();
-        let event = captured_event_from_windows_hook(wparam as u32, lparam, &mut state);
-        let Some(event) = event else {
-            return;
+        let Some(capture) = windows_capture_from_hook(wparam as u32, lparam, &mut state) else {
+            return false;
         };
         let Some(sender) = state.sender.as_ref() else {
-            return;
+            return capture.consume;
         };
 
-        match sender.try_send(event) {
+        match sender.try_send(capture.event) {
             Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
         }
-    });
+        capture.consume
+    })
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsCapturedHookEvent {
+    event: CapturedInputEvent,
+    consume: bool,
+}
+
+#[cfg(windows)]
+fn windows_capture_from_hook(
+    message: u32,
+    lparam: LPARAM,
+    state: &mut WindowsCaptureThreadState,
+) -> Option<WindowsCapturedHookEvent> {
+    let event = captured_event_from_windows_hook(message, lparam, state)?;
+    let consume = state
+        .policy
+        .as_ref()
+        .is_some_and(|policy| policy.load().consumes_captured_input());
+
+    Some(WindowsCapturedHookEvent { event, consume })
 }
 
 #[cfg(windows)]
@@ -1110,6 +1220,7 @@ pub struct FakePlatformAdapter {
     capabilities: PlatformCapabilities,
     desktop_geometry: DesktopGeometry,
     captured_events: Vec<CapturedInputEvent>,
+    capture_policy: SharedInputCapturePolicy,
     injected_events: Mutex<Vec<InjectedInputEvent>>,
     release_all_count: Mutex<u64>,
 }
@@ -1121,6 +1232,7 @@ impl FakePlatformAdapter {
             capabilities,
             desktop_geometry: fake_desktop_geometry(),
             captured_events: Vec::new(),
+            capture_policy: SharedInputCapturePolicy::default(),
             injected_events: Mutex::new(Vec::new()),
             release_all_count: Mutex::new(0),
         }
@@ -1158,6 +1270,11 @@ impl FakePlatformAdapter {
             .map_err(|_| PlatformError::new("fake platform injection log lock was poisoned"))
             .map(|events| events.clone())
     }
+
+    /// Return the current capture policy observed by fake capture sessions.
+    pub fn input_capture_policy(&self) -> InputCapturePolicy {
+        self.capture_policy.load()
+    }
 }
 
 impl Default for FakePlatformAdapter {
@@ -1183,9 +1300,10 @@ impl PlatformAdapter for FakePlatformAdapter {
         &self,
         config: InputCaptureConfig,
     ) -> Result<InputCaptureSession, PlatformError> {
-        Ok(InputCaptureSession::from_preloaded_events(
+        Ok(InputCaptureSession::from_preloaded_events_with_policy(
             self.captured_events.clone(),
             config,
+            self.capture_policy.clone(),
         ))
     }
 
@@ -1232,8 +1350,8 @@ mod tests {
     };
 
     use super::{
-        DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, PlatformAdapter,
-        PlatformCapabilities, PlatformError, runtime_platform_adapter,
+        DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, InputCapturePolicy,
+        PlatformAdapter, PlatformCapabilities, PlatformError, runtime_platform_adapter,
     };
 
     #[cfg(windows)]
@@ -1346,6 +1464,28 @@ mod tests {
             })
         );
         assert_eq!(session.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn fake_adapter_capture_policy_follows_capture_session_updates() {
+        let adapter = FakePlatformAdapter::default();
+        let session = adapter
+            .start_input_capture(InputCaptureConfig::default())
+            .expect("fake capture session");
+
+        assert_eq!(session.policy(), InputCapturePolicy::PassThrough);
+        assert_eq!(
+            adapter.input_capture_policy(),
+            InputCapturePolicy::PassThrough
+        );
+
+        session.set_policy(InputCapturePolicy::ConsumeCapturedInput);
+
+        assert_eq!(session.policy(), InputCapturePolicy::ConsumeCapturedInput);
+        assert_eq!(
+            adapter.input_capture_policy(),
+            InputCapturePolicy::ConsumeCapturedInput
+        );
     }
 
     #[test]
