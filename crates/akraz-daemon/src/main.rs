@@ -2,10 +2,10 @@ use std::env;
 use std::fmt::{Display, Formatter};
 use std::process::ExitCode;
 
-use akraz_core::RuntimeInputState;
+use akraz_core::{PeerId, RuntimeInputState, ScreenEdge, ScreenEdgeBinding};
 use akraz_daemon::{
     DaemonInputCaptureConfig, DaemonInputCaptureWorker, DaemonIpcRunConfig, DaemonIpcServer,
-    build_daemon_status, serve_daemon_ipc, start_daemon_input_capture,
+    build_daemon_status, serve_daemon_ipc, start_daemon_input_capture_with_edge_bindings,
 };
 use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
 use akraz_platform::runtime_platform_adapter;
@@ -51,10 +51,11 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
     let platform = runtime_platform_adapter();
     let server = DaemonIpcServer::new(RuntimeInputState::new(), platform);
     let capture_worker = if options.capture_input {
-        match start_daemon_input_capture(
+        match start_daemon_input_capture_with_edge_bindings(
             server.shared_state(),
             &platform,
             DaemonInputCaptureConfig::default(),
+            options.edge_bindings.clone(),
         ) {
             Ok(worker) => Some(worker),
             Err(error) => {
@@ -137,6 +138,7 @@ struct ServeOptions {
     endpoint: Option<IpcEndpoint>,
     once: bool,
     capture_input: bool,
+    edge_bindings: Vec<ScreenEdgeBinding>,
 }
 
 fn parse_daemon_command<I>(args: I) -> Result<DaemonCommand, DaemonUsageError>
@@ -155,7 +157,8 @@ where
         argument
             if argument.starts_with("--endpoint")
                 || argument == "--once"
-                || argument == "--capture-input" =>
+                || argument == "--capture-input"
+                || argument.starts_with("--edge-binding") =>
         {
             parse_serve_options(std::iter::once(first).chain(args))
         }
@@ -190,6 +193,13 @@ where
             options.once = true;
         } else if argument == "--capture-input" {
             options.capture_input = true;
+        } else if let Some(value) = argument.strip_prefix("--edge-binding=") {
+            options.edge_bindings.push(parse_edge_binding(value)?);
+        } else if argument == "--edge-binding" {
+            let value = args
+                .next()
+                .ok_or(DaemonUsageError::MissingEdgeBindingValue)?;
+            options.edge_bindings.push(parse_edge_binding(&value)?);
         } else if let Some(value) = argument.strip_prefix("--endpoint=") {
             options.endpoint = Some(IpcEndpoint::manual(value).map_err(DaemonUsageError::from)?);
         } else if argument == "--endpoint" {
@@ -203,10 +213,44 @@ where
     Ok(DaemonCommand::Serve(options))
 }
 
+fn parse_edge_binding(value: &str) -> Result<ScreenEdgeBinding, DaemonUsageError> {
+    let mut parts = value.split(':');
+    let Some(local_edge) = parts.next() else {
+        return Err(DaemonUsageError::InvalidEdgeBinding(value.to_string()));
+    };
+    let Some(peer_id) = parts.next() else {
+        return Err(DaemonUsageError::InvalidEdgeBinding(value.to_string()));
+    };
+    let Some(remote_edge) = parts.next() else {
+        return Err(DaemonUsageError::InvalidEdgeBinding(value.to_string()));
+    };
+    if parts.next().is_some() || peer_id.trim().is_empty() {
+        return Err(DaemonUsageError::InvalidEdgeBinding(value.to_string()));
+    }
+
+    Ok(ScreenEdgeBinding {
+        local_edge: parse_screen_edge(local_edge)?,
+        peer_id: PeerId::new(peer_id.trim()),
+        remote_edge: parse_screen_edge(remote_edge)?,
+    })
+}
+
+fn parse_screen_edge(value: &str) -> Result<ScreenEdge, DaemonUsageError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "left" => Ok(ScreenEdge::Left),
+        "right" => Ok(ScreenEdge::Right),
+        "top" => Ok(ScreenEdge::Top),
+        "bottom" => Ok(ScreenEdge::Bottom),
+        _ => Err(DaemonUsageError::InvalidEdgeBinding(value.to_string())),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DaemonUsageError {
     MissingEndpointValue,
+    MissingEdgeBindingValue,
     InvalidEndpoint(String),
+    InvalidEdgeBinding(String),
     UnknownArgument(String),
 }
 
@@ -220,7 +264,14 @@ impl Display for DaemonUsageError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingEndpointValue => formatter.write_str("missing value for --endpoint"),
+            Self::MissingEdgeBindingValue => {
+                formatter.write_str("missing value for --edge-binding")
+            }
             Self::InvalidEndpoint(error) => write!(formatter, "invalid endpoint: {error}"),
+            Self::InvalidEdgeBinding(value) => write!(
+                formatter,
+                "invalid edge binding: {value}. Expected <local-edge>:<peer-id>:<remote-edge>"
+            ),
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument: {argument}"),
         }
     }
@@ -228,6 +279,7 @@ impl Display for DaemonUsageError {
 
 #[cfg(test)]
 mod tests {
+    use akraz_core::{PeerId, ScreenEdge, ScreenEdgeBinding};
     use akraz_ipc::{IpcEndpoint, IpcEndpointKind, IpcTransportError};
 
     use super::{
@@ -243,6 +295,7 @@ mod tests {
                 endpoint: None,
                 once: false,
                 capture_input: false,
+                edge_bindings: Vec::new(),
             }))
         );
     }
@@ -267,6 +320,7 @@ mod tests {
                 }),
                 once: true,
                 capture_input: true,
+                edge_bindings: Vec::new(),
             }))
         );
         assert_eq!(
@@ -280,6 +334,45 @@ mod tests {
                 }),
                 once: true,
                 capture_input: true,
+                edge_bindings: Vec::new(),
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_edge_binding_options() {
+        let binding = ScreenEdgeBinding {
+            local_edge: ScreenEdge::Right,
+            peer_id: PeerId::new("linux-laptop"),
+            remote_edge: ScreenEdge::Left,
+        };
+
+        assert_eq!(
+            parse_daemon_command(
+                [
+                    "--serve",
+                    "--capture-input",
+                    "--edge-binding",
+                    "right:linux-laptop:left"
+                ]
+                .map(String::from)
+            ),
+            Ok(DaemonCommand::Serve(ServeOptions {
+                endpoint: None,
+                once: false,
+                capture_input: true,
+                edge_bindings: vec![binding.clone()],
+            }))
+        );
+        assert_eq!(
+            parse_daemon_command(
+                ["--capture-input", "--edge-binding=RIGHT:linux-laptop:LEFT"].map(String::from)
+            ),
+            Ok(DaemonCommand::Serve(ServeOptions {
+                endpoint: None,
+                once: false,
+                capture_input: true,
+                edge_bindings: vec![binding],
             }))
         );
     }
@@ -301,6 +394,20 @@ mod tests {
         assert_eq!(
             parse_daemon_command(["--endpoint"].map(String::from)),
             Err(DaemonUsageError::MissingEndpointValue)
+        );
+        assert_eq!(
+            parse_daemon_command(["--edge-binding"].map(String::from)),
+            Err(DaemonUsageError::MissingEdgeBindingValue)
+        );
+        assert_eq!(
+            parse_daemon_command(["--edge-binding", "right::left"].map(String::from)),
+            Err(DaemonUsageError::InvalidEdgeBinding(
+                "right::left".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_daemon_command(["--edge-binding", "east:peer:left"].map(String::from)),
+            Err(DaemonUsageError::InvalidEdgeBinding("east".to_string()))
         );
         assert_eq!(
             parse_daemon_command(["--status", "--once"].map(String::from)),

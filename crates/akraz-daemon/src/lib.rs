@@ -9,7 +9,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use akraz_core::{
-    CapturedInputEvent, CoreAction, CoreTransitionError, RuntimeEvent, RuntimeInputState,
+    CapturedInputEvent, ControlMode, CoreAction, CoreTransitionError, LogicalPoint, RuntimeEvent,
+    RuntimeInputState, ScreenEdgeBinding, ScreenLayout,
 };
 use akraz_ipc::{
     DaemonStatus, IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError,
@@ -17,7 +18,9 @@ use akraz_ipc::{
     PermissionsProbe, ProtocolVersionSnapshot, parse_request_line, serve_os_local_ipc_once,
     to_json_line,
 };
-use akraz_platform::{InputCaptureConfig, InputCaptureSession, PlatformAdapter, PlatformError};
+use akraz_platform::{
+    DesktopGeometry, InputCaptureConfig, InputCaptureSession, PlatformAdapter, PlatformError,
+};
 use akraz_protocol::ProtocolVersion;
 
 /// Current daemon package version.
@@ -29,6 +32,41 @@ const DEFAULT_CAPTURE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Shared daemon runtime state observed by IPC and capture workers.
 pub type SharedRuntimeInputState = Arc<Mutex<RuntimeInputState>>;
+
+/// Configuration used to translate captured pointer deltas into core routing events.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonInputRoutingConfig {
+    pub screen_layout: ScreenLayout,
+    pub initial_pointer: LogicalPoint,
+}
+
+impl DaemonInputRoutingConfig {
+    /// Build routing config from platform desktop geometry and configured peer edge bindings.
+    pub fn from_desktop_geometry(
+        geometry: DesktopGeometry,
+        edge_bindings: Vec<ScreenEdgeBinding>,
+    ) -> Self {
+        Self {
+            screen_layout: ScreenLayout::new(geometry.virtual_screen_bounds, edge_bindings),
+            initial_pointer: geometry.pointer_position,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedInputRouter {
+    screen_layout: ScreenLayout,
+    current_pointer: LogicalPoint,
+}
+
+impl CapturedInputRouter {
+    fn new(config: DaemonInputRoutingConfig) -> Self {
+        Self {
+            screen_layout: config.screen_layout,
+            current_pointer: config.initial_pointer,
+        }
+    }
+}
 
 /// Daemon OS IPC serving configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,12 +259,41 @@ pub fn start_daemon_input_capture(
     platform: &impl PlatformAdapter,
     config: DaemonInputCaptureConfig,
 ) -> Result<DaemonInputCaptureWorker, PlatformError> {
+    start_daemon_input_capture_with_edge_bindings(state, platform, config, Vec::new())
+}
+
+/// Start daemon input capture using platform geometry and configured edge bindings.
+pub fn start_daemon_input_capture_with_edge_bindings(
+    state: SharedRuntimeInputState,
+    platform: &impl PlatformAdapter,
+    config: DaemonInputCaptureConfig,
+    edge_bindings: Vec<ScreenEdgeBinding>,
+) -> Result<DaemonInputCaptureWorker, PlatformError> {
+    let geometry = platform.read_desktop_geometry()?;
+
+    start_daemon_input_capture_with_routing(
+        state,
+        platform,
+        config,
+        DaemonInputRoutingConfig::from_desktop_geometry(geometry, edge_bindings),
+    )
+}
+
+/// Start daemon input capture with explicit pointer routing configuration.
+pub fn start_daemon_input_capture_with_routing(
+    state: SharedRuntimeInputState,
+    platform: &impl PlatformAdapter,
+    config: DaemonInputCaptureConfig,
+    routing: DaemonInputRoutingConfig,
+) -> Result<DaemonInputCaptureWorker, PlatformError> {
     let capture = platform.start_input_capture(config.input_capture)?;
     let running = Arc::new(AtomicBool::new(true));
     let worker_running = Arc::clone(&running);
     let thread = thread::Builder::new()
         .name("akraz-daemon-input-capture".to_string())
-        .spawn(move || run_daemon_input_capture_worker(state, capture, worker_running, config))
+        .spawn(move || {
+            run_daemon_input_capture_worker(state, capture, worker_running, config, routing)
+        })
         .map_err(|error| {
             PlatformError::new(format!(
                 "failed to start daemon input capture worker: {error}"
@@ -241,14 +308,21 @@ fn run_daemon_input_capture_worker(
     capture: InputCaptureSession,
     running: Arc<AtomicBool>,
     config: DaemonInputCaptureConfig,
+    routing: DaemonInputRoutingConfig,
 ) -> Result<(), PlatformError> {
     let idle_poll_interval = config.bounded_idle_poll_interval();
+    let mut router = CapturedInputRouter::new(routing);
 
     while running.load(Ordering::Acquire) {
         match capture.recv_timeout(idle_poll_interval) {
             Ok(event) => {
-                apply_captured_input_event(&state, event)?;
-                drain_ready_capture_events(&state, &capture, config.bounded_drain_batch_size())?;
+                apply_routed_capture_event(&state, &mut router, event)?;
+                drain_ready_capture_events(
+                    &state,
+                    &capture,
+                    &mut router,
+                    config.bounded_drain_batch_size(),
+                )?;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
@@ -261,26 +335,57 @@ fn run_daemon_input_capture_worker(
 fn drain_ready_capture_events(
     state: &SharedRuntimeInputState,
     capture: &InputCaptureSession,
+    router: &mut CapturedInputRouter,
     max_events: usize,
 ) -> Result<Vec<CoreAction>, PlatformError> {
-    let mut state = state
-        .lock()
-        .map_err(|_| PlatformError::new("daemon runtime state is unavailable"))?;
+    let mut actions = Vec::new();
 
-    drain_capture_events(&mut state, capture, max_events).map_err(capture_transition_error)
+    for _ in 0..max_events {
+        match capture.try_recv() {
+            Ok(event) => actions.extend(apply_routed_capture_event(state, router, event)?),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+
+    Ok(actions)
 }
 
-fn apply_captured_input_event(
+fn apply_routed_capture_event(
     state: &SharedRuntimeInputState,
+    router: &mut CapturedInputRouter,
     event: CapturedInputEvent,
 ) -> Result<Vec<CoreAction>, PlatformError> {
     let mut state = state
         .lock()
         .map_err(|_| PlatformError::new("daemon runtime state is unavailable"))?;
 
-    state
-        .apply_event(RuntimeEvent::Input(event))
-        .map_err(capture_transition_error)
+    apply_routed_capture_event_to_state(&mut state, router, event).map_err(capture_transition_error)
+}
+
+fn apply_routed_capture_event_to_state(
+    state: &mut RuntimeInputState,
+    router: &mut CapturedInputRouter,
+    event: CapturedInputEvent,
+) -> Result<Vec<CoreAction>, CoreTransitionError> {
+    match event {
+        CapturedInputEvent::PointerMoved { delta_x, delta_y }
+            if state.mode() == ControlMode::Local =>
+        {
+            let previous = router.current_pointer;
+            let next = LogicalPoint {
+                x: previous.x.saturating_add(delta_x),
+                y: previous.y.saturating_add(delta_y),
+            };
+            router.current_pointer = next;
+
+            state.apply_event(RuntimeEvent::LocalPointerMoved {
+                previous,
+                next,
+                layout: router.screen_layout.clone(),
+            })
+        }
+        event => state.apply_event(RuntimeEvent::Input(event)),
+    }
 }
 
 fn capture_transition_error(error: CoreTransitionError) -> PlatformError {
@@ -433,22 +538,29 @@ fn push_missing_capability_issue(
 
 #[cfg(test)]
 mod tests {
-    use akraz_core::{CapturedInputEvent, ControlMode, PhysicalKey, PressState, RuntimeInputState};
+    use akraz_core::{
+        CapturedInputEvent, ControlMode, CoreAction, EdgeCrossing, InjectedInputEvent,
+        LogicalPoint, LogicalRect, LogicalSize, PeerId, PhysicalKey, PressState, RuntimeInputState,
+        ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
+    };
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, DaemonStatusParams, IpcEndpoint,
         IpcPlatformCapabilities, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer,
         METHOD_DAEMON_STATUS, OsLocalIpcClient, call_json_rpc, to_json_line,
     };
     use akraz_platform::{
-        FakePlatformAdapter, InputCaptureConfig, PlatformAdapter, PlatformCapabilities,
+        DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, PlatformAdapter,
+        PlatformCapabilities,
     };
     use serde_json::json;
 
     use super::{
-        DAEMON_VERSION, DaemonInputCaptureConfig, DaemonIpcRunConfig, DaemonIpcServer,
+        CapturedInputRouter, DAEMON_VERSION, DaemonInputCaptureConfig, DaemonInputRoutingConfig,
+        DaemonIpcRunConfig, DaemonIpcServer, apply_routed_capture_event_to_state,
         build_daemon_status, build_permissions_probe, drain_capture_events,
         handle_ipc_request_line, serve_daemon_ipc, shared_runtime_state,
-        start_daemon_input_capture,
+        start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
+        start_daemon_input_capture_with_routing,
     };
 
     fn status_or_panic(
@@ -465,6 +577,36 @@ mod tests {
         match build_permissions_probe(platform) {
             Ok(probe) => probe,
             Err(error) => panic!("expected permission probe: {error}"),
+        }
+    }
+
+    fn right_edge_layout() -> ScreenLayout {
+        ScreenLayout::new(
+            LogicalRect {
+                origin: LogicalPoint { x: 0, y: 0 },
+                size: LogicalSize {
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            vec![ScreenEdgeBinding {
+                local_edge: ScreenEdge::Right,
+                peer_id: PeerId::new("right-peer"),
+                remote_edge: ScreenEdge::Left,
+            }],
+        )
+    }
+
+    fn desktop_geometry_at_right_edge() -> DesktopGeometry {
+        DesktopGeometry {
+            pointer_position: LogicalPoint { x: 1919, y: 540 },
+            virtual_screen_bounds: LogicalRect {
+                origin: LogicalPoint { x: 0, y: 0 },
+                size: LogicalSize {
+                    width: 1920,
+                    height: 1080,
+                },
+            },
         }
     }
 
@@ -597,6 +739,125 @@ mod tests {
     }
 
     #[test]
+    fn routed_pointer_delta_updates_local_pointer_without_edge_crossing() {
+        let mut state = RuntimeInputState::new();
+        let mut router = CapturedInputRouter::new(DaemonInputRoutingConfig {
+            screen_layout: right_edge_layout(),
+            initial_pointer: LogicalPoint { x: 100, y: 100 },
+        });
+
+        let actions = apply_routed_capture_event_to_state(
+            &mut state,
+            &mut router,
+            CapturedInputEvent::PointerMoved {
+                delta_x: 5,
+                delta_y: -3,
+            },
+        )
+        .expect("routed pointer move");
+
+        assert!(actions.is_empty());
+        assert_eq!(state.mode(), ControlMode::Local);
+        assert_eq!(
+            state.last_local_pointer(),
+            Some(LogicalPoint { x: 105, y: 97 })
+        );
+    }
+
+    #[test]
+    fn routing_config_uses_platform_geometry_and_configured_edges() {
+        let config = DaemonInputRoutingConfig::from_desktop_geometry(
+            desktop_geometry_at_right_edge(),
+            vec![ScreenEdgeBinding {
+                local_edge: ScreenEdge::Right,
+                peer_id: PeerId::new("right-peer"),
+                remote_edge: ScreenEdge::Left,
+            }],
+        );
+
+        assert_eq!(config.initial_pointer, LogicalPoint { x: 1919, y: 540 });
+        assert_eq!(config.screen_layout, right_edge_layout());
+    }
+
+    #[test]
+    fn routed_pointer_delta_requests_remote_entry_on_edge_crossing() {
+        let mut state = RuntimeInputState::new();
+        let mut router = CapturedInputRouter::new(DaemonInputRoutingConfig {
+            screen_layout: right_edge_layout(),
+            initial_pointer: LogicalPoint { x: 1919, y: 540 },
+        });
+
+        let actions = apply_routed_capture_event_to_state(
+            &mut state,
+            &mut router,
+            CapturedInputEvent::PointerMoved {
+                delta_x: 1,
+                delta_y: 0,
+            },
+        )
+        .expect("routed edge crossing");
+
+        assert_eq!(state.mode(), ControlMode::EnteringRemote);
+        assert_eq!(state.pending_peer_id(), Some(&PeerId::new("right-peer")));
+        assert_eq!(
+            state.last_local_pointer(),
+            Some(LogicalPoint { x: 1920, y: 540 })
+        );
+        assert_eq!(
+            actions,
+            vec![CoreAction::StartRemoteSession {
+                peer_id: PeerId::new("right-peer"),
+                crossing: Some(EdgeCrossing {
+                    peer_id: PeerId::new("right-peer"),
+                    local_edge: ScreenEdge::Right,
+                    remote_edge: ScreenEdge::Left,
+                    exit_position: LogicalPoint { x: 1920, y: 540 },
+                    edge_offset: 540,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn routed_pointer_delta_remains_forwardable_while_remote() {
+        let mut state = RuntimeInputState::new();
+        state
+            .apply_event(akraz_core::RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            })
+            .expect("remote entry request");
+        state
+            .apply_event(akraz_core::RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-1"),
+            })
+            .expect("remote entry confirmed");
+        let mut router = CapturedInputRouter::new(DaemonInputRoutingConfig {
+            screen_layout: right_edge_layout(),
+            initial_pointer: LogicalPoint { x: 1919, y: 540 },
+        });
+
+        let actions = apply_routed_capture_event_to_state(
+            &mut state,
+            &mut router,
+            CapturedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            },
+        )
+        .expect("routed remote pointer move");
+
+        assert_eq!(
+            actions,
+            vec![CoreAction::ForwardInput {
+                event: InjectedInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            }]
+        );
+    }
+
+    #[test]
     fn ipc_dispatch_handles_daemon_status_request() {
         let state = RuntimeInputState::new();
         let platform = FakePlatformAdapter::default();
@@ -713,6 +974,140 @@ mod tests {
 
         worker.stop().expect("stop capture worker");
         panic!("expected capture worker to drain preloaded key events");
+    }
+
+    #[test]
+    fn daemon_input_capture_worker_uses_platform_geometry_for_initial_pointer() {
+        let platform = FakePlatformAdapter::default()
+            .with_desktop_geometry(desktop_geometry_at_right_edge())
+            .with_captured_events(vec![CapturedInputEvent::PointerMoved {
+                delta_x: 1,
+                delta_y: 0,
+            }]);
+        let state = shared_runtime_state(RuntimeInputState::new());
+
+        let worker = start_daemon_input_capture(
+            state.clone(),
+            &platform,
+            DaemonInputCaptureConfig {
+                input_capture: InputCaptureConfig {
+                    event_buffer_capacity: 8,
+                },
+                drain_batch_size: 8,
+                idle_poll_interval: std::time::Duration::from_millis(1),
+            },
+        )
+        .expect("daemon capture worker");
+
+        for _ in 0..20 {
+            let state = state.lock().expect("runtime state lock");
+            if state.last_local_pointer() == Some(LogicalPoint { x: 1920, y: 540 }) {
+                assert_eq!(state.mode(), ControlMode::Local);
+                drop(state);
+                worker.stop().expect("stop capture worker");
+                return;
+            }
+            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        worker.stop().expect("stop capture worker");
+        panic!("expected capture worker to use platform geometry");
+    }
+
+    #[test]
+    fn daemon_input_capture_worker_routes_pointer_crossing_into_shared_state() {
+        let platform = FakePlatformAdapter::default().with_captured_events(vec![
+            CapturedInputEvent::PointerMoved {
+                delta_x: 1,
+                delta_y: 0,
+            },
+        ]);
+        let state = shared_runtime_state(RuntimeInputState::new());
+
+        let worker = start_daemon_input_capture_with_routing(
+            state.clone(),
+            &platform,
+            DaemonInputCaptureConfig {
+                input_capture: InputCaptureConfig {
+                    event_buffer_capacity: 8,
+                },
+                drain_batch_size: 8,
+                idle_poll_interval: std::time::Duration::from_millis(1),
+            },
+            DaemonInputRoutingConfig {
+                screen_layout: right_edge_layout(),
+                initial_pointer: LogicalPoint { x: 1919, y: 540 },
+            },
+        )
+        .expect("daemon capture worker");
+
+        for _ in 0..20 {
+            let state = state.lock().expect("runtime state lock");
+            if state.mode() == ControlMode::EnteringRemote {
+                assert_eq!(state.pending_peer_id(), Some(&PeerId::new("right-peer")));
+                assert_eq!(
+                    state.last_local_pointer(),
+                    Some(LogicalPoint { x: 1920, y: 540 })
+                );
+                drop(state);
+                worker.stop().expect("stop capture worker");
+                return;
+            }
+            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        worker.stop().expect("stop capture worker");
+        panic!("expected capture worker to route pointer crossing");
+    }
+
+    #[test]
+    fn daemon_input_capture_worker_routes_configured_edge_binding_from_platform_geometry() {
+        let platform = FakePlatformAdapter::default()
+            .with_desktop_geometry(desktop_geometry_at_right_edge())
+            .with_captured_events(vec![CapturedInputEvent::PointerMoved {
+                delta_x: 1,
+                delta_y: 0,
+            }]);
+        let state = shared_runtime_state(RuntimeInputState::new());
+
+        let worker = start_daemon_input_capture_with_edge_bindings(
+            state.clone(),
+            &platform,
+            DaemonInputCaptureConfig {
+                input_capture: InputCaptureConfig {
+                    event_buffer_capacity: 8,
+                },
+                drain_batch_size: 8,
+                idle_poll_interval: std::time::Duration::from_millis(1),
+            },
+            vec![ScreenEdgeBinding {
+                local_edge: ScreenEdge::Right,
+                peer_id: PeerId::new("right-peer"),
+                remote_edge: ScreenEdge::Left,
+            }],
+        )
+        .expect("daemon capture worker");
+
+        for _ in 0..20 {
+            let state = state.lock().expect("runtime state lock");
+            if state.mode() == ControlMode::EnteringRemote {
+                assert_eq!(state.pending_peer_id(), Some(&PeerId::new("right-peer")));
+                assert_eq!(
+                    state.last_local_pointer(),
+                    Some(LogicalPoint { x: 1920, y: 540 })
+                );
+                drop(state);
+                worker.stop().expect("stop capture worker");
+                return;
+            }
+            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        worker.stop().expect("stop capture worker");
+        panic!("expected configured edge binding to route pointer crossing");
     }
 
     #[cfg(any(unix, windows))]

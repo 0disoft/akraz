@@ -9,7 +9,10 @@ use std::sync::mpsc::{
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use akraz_core::{CapturedInputEvent, MouseButton, PhysicalKey, PressState};
+use akraz_core::{
+    CapturedInputEvent, LogicalPoint, LogicalRect, LogicalSize, MouseButton, PhysicalKey,
+    PressState,
+};
 
 #[cfg(windows)]
 use std::mem::size_of;
@@ -22,7 +25,7 @@ use std::cell::RefCell;
 use std::thread;
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
 #[cfg(windows)]
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(windows)]
@@ -38,12 +41,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED,
-    LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW,
-    PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WINDOWS_HOOK_ID, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+    CallNextHookEx, GetCursorPos, GetMessageW, GetSystemMetrics, HHOOK, KBDLLHOOKSTRUCT,
+    LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSG,
+    MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetWindowsHookExW,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOWS_HOOK_ID, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    XBUTTON1, XBUTTON2,
 };
 
 /// Capabilities reported by a platform adapter.
@@ -53,6 +58,13 @@ pub struct PlatformCapabilities {
     pub can_capture_keyboard: bool,
     pub can_inject_pointer: bool,
     pub can_inject_keyboard: bool,
+}
+
+/// Local desktop geometry facts reported by a platform adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopGeometry {
+    pub pointer_position: LogicalPoint,
+    pub virtual_screen_bounds: LogicalRect,
 }
 
 impl PlatformCapabilities {
@@ -195,6 +207,14 @@ pub trait PlatformAdapter {
     /// Probe platform input capabilities.
     fn probe_capabilities(&self) -> Result<PlatformCapabilities, PlatformError>;
 
+    /// Read current desktop geometry used by input routing.
+    fn read_desktop_geometry(&self) -> Result<DesktopGeometry, PlatformError> {
+        Err(PlatformError::new(format!(
+            "{} desktop geometry is not available",
+            self.name()
+        )))
+    }
+
     /// Start capturing platform input events into a bounded event queue.
     fn start_input_capture(
         &self,
@@ -235,6 +255,15 @@ impl PlatformAdapter for RuntimePlatformAdapter {
             Self::Windows(adapter) => adapter.probe_capabilities(),
             #[cfg(not(windows))]
             Self::Unsupported(adapter) => adapter.probe_capabilities(),
+        }
+    }
+
+    fn read_desktop_geometry(&self) -> Result<DesktopGeometry, PlatformError> {
+        match self {
+            #[cfg(windows)]
+            Self::Windows(adapter) => adapter.read_desktop_geometry(),
+            #[cfg(not(windows))]
+            Self::Unsupported(adapter) => adapter.read_desktop_geometry(),
         }
     }
 
@@ -296,6 +325,10 @@ impl PlatformAdapter for WindowsPlatformAdapter {
         Ok(probe_windows_capabilities())
     }
 
+    fn read_desktop_geometry(&self) -> Result<DesktopGeometry, PlatformError> {
+        read_windows_desktop_geometry()
+    }
+
     fn start_input_capture(
         &self,
         config: InputCaptureConfig,
@@ -341,6 +374,56 @@ fn windows_capabilities_from_probe_results(results: WindowsProbeResults) -> Plat
         can_inject_pointer: results.can_send_mouse_input,
         can_inject_keyboard: false,
     }
+}
+
+#[cfg(windows)]
+fn read_windows_desktop_geometry() -> Result<DesktopGeometry, PlatformError> {
+    let pointer_position = read_windows_pointer_position()?;
+    let virtual_screen_bounds = read_windows_virtual_screen_bounds()?;
+
+    Ok(DesktopGeometry {
+        pointer_position,
+        virtual_screen_bounds,
+    })
+}
+
+#[cfg(windows)]
+fn read_windows_pointer_position() -> Result<LogicalPoint, PlatformError> {
+    let mut point = POINT::default();
+    // SAFETY: point is a valid POINT pointer that Windows writes synchronously.
+    let ok = unsafe { GetCursorPos(&mut point) };
+    if ok == 0 {
+        return Err(PlatformError::new("failed to read cursor position"));
+    }
+
+    Ok(LogicalPoint {
+        x: point.x,
+        y: point.y,
+    })
+}
+
+#[cfg(windows)]
+fn read_windows_virtual_screen_bounds() -> Result<LogicalRect, PlatformError> {
+    let bounds = LogicalRect {
+        origin: LogicalPoint {
+            // SAFETY: GetSystemMetrics does not dereference Rust pointers.
+            x: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+            // SAFETY: GetSystemMetrics does not dereference Rust pointers.
+            y: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+        },
+        size: LogicalSize {
+            // SAFETY: GetSystemMetrics does not dereference Rust pointers.
+            width: unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+            // SAFETY: GetSystemMetrics does not dereference Rust pointers.
+            height: unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+        },
+    };
+
+    if !bounds.is_valid() {
+        return Err(PlatformError::new("failed to read virtual screen bounds"));
+    }
+
+    Ok(bounds)
 }
 
 #[cfg(windows)]
@@ -756,6 +839,7 @@ impl PlatformAdapter for UnsupportedPlatformAdapter {
 #[derive(Debug)]
 pub struct FakePlatformAdapter {
     capabilities: PlatformCapabilities,
+    desktop_geometry: DesktopGeometry,
     captured_events: Vec<CapturedInputEvent>,
     release_all_count: Mutex<u64>,
 }
@@ -765,9 +849,16 @@ impl FakePlatformAdapter {
     pub fn new(capabilities: PlatformCapabilities) -> Self {
         Self {
             capabilities,
+            desktop_geometry: fake_desktop_geometry(),
             captured_events: Vec::new(),
             release_all_count: Mutex::new(0),
         }
+    }
+
+    /// Return a fake adapter that reports the supplied desktop geometry.
+    pub fn with_desktop_geometry(mut self, desktop_geometry: DesktopGeometry) -> Self {
+        self.desktop_geometry = desktop_geometry;
+        self
     }
 
     /// Return a fake adapter that preloads captured input events when capture starts.
@@ -805,6 +896,10 @@ impl PlatformAdapter for FakePlatformAdapter {
         Ok(self.capabilities.clone())
     }
 
+    fn read_desktop_geometry(&self) -> Result<DesktopGeometry, PlatformError> {
+        Ok(self.desktop_geometry)
+    }
+
     fn start_input_capture(
         &self,
         config: InputCaptureConfig,
@@ -826,15 +921,30 @@ impl PlatformAdapter for FakePlatformAdapter {
     }
 }
 
+fn fake_desktop_geometry() -> DesktopGeometry {
+    DesktopGeometry {
+        pointer_position: LogicalPoint { x: 0, y: 0 },
+        virtual_screen_bounds: LogicalRect {
+            origin: LogicalPoint { x: 0, y: 0 },
+            size: LogicalSize {
+                width: 1920,
+                height: 1080,
+            },
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::TryRecvError;
 
-    use akraz_core::{CapturedInputEvent, PhysicalKey, PressState};
+    use akraz_core::{
+        CapturedInputEvent, LogicalPoint, LogicalRect, LogicalSize, PhysicalKey, PressState,
+    };
 
     use super::{
-        FakePlatformAdapter, InputCaptureConfig, PlatformAdapter, PlatformCapabilities,
-        PlatformError, runtime_platform_adapter,
+        DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, PlatformAdapter,
+        PlatformCapabilities, PlatformError, runtime_platform_adapter,
     };
 
     #[cfg(windows)]
@@ -901,6 +1011,23 @@ mod tests {
     }
 
     #[test]
+    fn fake_adapter_reports_configured_desktop_geometry() {
+        let geometry = DesktopGeometry {
+            pointer_position: LogicalPoint { x: 1919, y: 540 },
+            virtual_screen_bounds: LogicalRect {
+                origin: LogicalPoint { x: 0, y: 0 },
+                size: LogicalSize {
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+        };
+        let adapter = FakePlatformAdapter::default().with_desktop_geometry(geometry);
+
+        assert_eq!(adapter.read_desktop_geometry(), Ok(geometry));
+    }
+
+    #[test]
     fn fake_adapter_preloads_bounded_capture_events() {
         let adapter = FakePlatformAdapter::default().with_captured_events(vec![
             CapturedInputEvent::Key {
@@ -942,6 +1069,20 @@ mod tests {
             );
         }
         assert_eq!(adapter.release_all(), Ok(()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_adapter_reports_real_desktop_geometry() {
+        let adapter = runtime_platform_adapter();
+        let geometry = adapter.read_desktop_geometry().expect("desktop geometry");
+
+        assert!(geometry.virtual_screen_bounds.is_valid());
+        assert!(
+            geometry
+                .virtual_screen_bounds
+                .contains(geometry.pointer_position)
+        );
     }
 
     #[cfg(windows)]
