@@ -2,15 +2,16 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::mpsc::TryRecvError;
 
-use akraz_core::RuntimeInputState;
+use akraz_core::{CoreAction, CoreTransitionError, RuntimeEvent, RuntimeInputState};
 use akraz_ipc::{
     DaemonStatus, IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError,
     JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PermissionIssue,
     PermissionsProbe, ProtocolVersionSnapshot, parse_request_line, serve_os_local_ipc_once,
     to_json_line,
 };
-use akraz_platform::{PlatformAdapter, PlatformError};
+use akraz_platform::{InputCaptureSession, PlatformAdapter, PlatformError};
 use akraz_protocol::ProtocolVersion;
 
 /// Current daemon package version.
@@ -93,6 +94,24 @@ where
         serve_os_local_ipc_once(config.endpoint(), server)?;
         handled_requests += 1;
     }
+}
+
+/// Drain captured input events into the core runtime state without blocking.
+pub fn drain_capture_events(
+    state: &mut RuntimeInputState,
+    capture: &InputCaptureSession,
+    max_events: usize,
+) -> Result<Vec<CoreAction>, CoreTransitionError> {
+    let mut actions = Vec::new();
+
+    for _ in 0..max_events {
+        match capture.try_recv() {
+            Ok(event) => actions.extend(state.apply_event(RuntimeEvent::Input(event))?),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+
+    Ok(actions)
 }
 
 /// Error returned while encoding a daemon IPC response.
@@ -241,18 +260,20 @@ fn push_missing_capability_issue(
 
 #[cfg(test)]
 mod tests {
-    use akraz_core::{ControlMode, RuntimeInputState};
+    use akraz_core::{CapturedInputEvent, ControlMode, PhysicalKey, PressState, RuntimeInputState};
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, DaemonStatusParams, IpcEndpoint,
         IpcPlatformCapabilities, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer,
         METHOD_DAEMON_STATUS, OsLocalIpcClient, call_json_rpc, to_json_line,
     };
-    use akraz_platform::{FakePlatformAdapter, PlatformCapabilities};
+    use akraz_platform::{
+        FakePlatformAdapter, InputCaptureConfig, PlatformAdapter, PlatformCapabilities,
+    };
     use serde_json::json;
 
     use super::{
         DAEMON_VERSION, DaemonIpcRunConfig, DaemonIpcServer, build_daemon_status,
-        build_permissions_probe, handle_ipc_request_line, serve_daemon_ipc,
+        build_permissions_probe, drain_capture_events, handle_ipc_request_line, serve_daemon_ipc,
     };
 
     fn status_or_panic(
@@ -363,6 +384,40 @@ mod tests {
         assert_eq!(probe.issues.len(), 2);
         assert_eq!(probe.issues[0].code, "capture_keyboard_unavailable");
         assert_eq!(probe.issues[1].code, "inject_keyboard_unavailable");
+    }
+
+    #[test]
+    fn drain_capture_events_applies_bounded_input_to_core_state() {
+        let platform = FakePlatformAdapter::default().with_captured_events(vec![
+            CapturedInputEvent::Key {
+                key: PhysicalKey::LeftShift,
+                state: PressState::Pressed,
+            },
+            CapturedInputEvent::Key {
+                key: PhysicalKey::LeftShift,
+                state: PressState::Released,
+            },
+        ]);
+        let capture = platform
+            .start_input_capture(InputCaptureConfig {
+                event_buffer_capacity: 8,
+            })
+            .expect("fake capture session");
+        let mut state = RuntimeInputState::new();
+
+        let first_actions =
+            drain_capture_events(&mut state, &capture, 1).expect("first capture drain");
+
+        assert!(first_actions.is_empty());
+        assert!(state.pressed_keys().contains(&PhysicalKey::LeftShift));
+        assert!(state.modifiers().left_shift);
+
+        let second_actions =
+            drain_capture_events(&mut state, &capture, 8).expect("second capture drain");
+
+        assert!(second_actions.is_empty());
+        assert!(!state.pressed_keys().contains(&PhysicalKey::LeftShift));
+        assert!(!state.modifiers().left_shift);
     }
 
     #[test]

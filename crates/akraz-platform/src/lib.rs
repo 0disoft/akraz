@@ -3,6 +3,48 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Mutex;
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
+};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use akraz_core::{CapturedInputEvent, MouseButton, PhysicalKey, PressState};
+
+#[cfg(windows)]
+use std::mem::size_of;
+#[cfg(windows)]
+use std::ptr::{null, null_mut};
+
+#[cfg(windows)]
+use std::cell::RefCell;
+#[cfg(windows)]
+use std::thread;
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+#[cfg(windows)]
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+#[cfg(windows)]
+use windows_sys::Win32::System::StationsAndDesktops::{
+    CloseDesktop, DESKTOP_HOOKCONTROL, DESKTOP_READOBJECTS, HDESK, OpenInputDesktop,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+#[cfg(windows)]
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT, SendInput, VK_LCONTROL, VK_LMENU,
+    VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
+};
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED,
+    LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW,
+    PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WINDOWS_HOOK_ID, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+};
 
 /// Capabilities reported by a platform adapter.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -48,6 +90,103 @@ impl Display for PlatformError {
 
 impl Error for PlatformError {}
 
+/// Default number of captured input events buffered before new events are dropped.
+pub const DEFAULT_INPUT_CAPTURE_BUFFER_CAPACITY: usize = 256;
+
+/// Configuration used when starting a platform input capture session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputCaptureConfig {
+    pub event_buffer_capacity: usize,
+}
+
+impl InputCaptureConfig {
+    fn bounded_capacity(self) -> usize {
+        self.event_buffer_capacity.max(1)
+    }
+}
+
+impl Default for InputCaptureConfig {
+    fn default() -> Self {
+        Self {
+            event_buffer_capacity: DEFAULT_INPUT_CAPTURE_BUFFER_CAPACITY,
+        }
+    }
+}
+
+/// Running platform input capture session.
+pub struct InputCaptureSession {
+    events: Receiver<CapturedInputEvent>,
+    shutdown: Option<InputCaptureShutdown>,
+}
+
+impl InputCaptureSession {
+    fn new(events: Receiver<CapturedInputEvent>, shutdown: InputCaptureShutdown) -> Self {
+        Self {
+            events,
+            shutdown: Some(shutdown),
+        }
+    }
+
+    fn from_preloaded_events(
+        events: impl IntoIterator<Item = CapturedInputEvent>,
+        config: InputCaptureConfig,
+    ) -> Self {
+        let (sender, receiver) = sync_channel(config.bounded_capacity());
+        for event in events {
+            if sender.try_send(event).is_err() {
+                break;
+            }
+        }
+        drop(sender);
+
+        Self::new(receiver, InputCaptureShutdown::Noop)
+    }
+
+    /// Receive the next captured input event without blocking.
+    pub fn try_recv(&self) -> Result<CapturedInputEvent, TryRecvError> {
+        self.events.try_recv()
+    }
+
+    /// Receive the next captured input event until the timeout expires.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<CapturedInputEvent, RecvTimeoutError> {
+        self.events.recv_timeout(timeout)
+    }
+
+    /// Stop input capture and wait for its background resources to exit.
+    pub fn stop(mut self) -> Result<(), PlatformError> {
+        stop_input_capture(self.shutdown.take())
+    }
+}
+
+impl Drop for InputCaptureSession {
+    fn drop(&mut self) {
+        let _ = stop_input_capture(self.shutdown.take());
+    }
+}
+
+enum InputCaptureShutdown {
+    Noop,
+    #[cfg(windows)]
+    Windows(WindowsCaptureShutdown),
+}
+
+impl InputCaptureShutdown {
+    fn stop(self) -> Result<(), PlatformError> {
+        match self {
+            Self::Noop => Ok(()),
+            #[cfg(windows)]
+            Self::Windows(shutdown) => shutdown.stop(),
+        }
+    }
+}
+
+fn stop_input_capture(shutdown: Option<InputCaptureShutdown>) -> Result<(), PlatformError> {
+    match shutdown {
+        Some(shutdown) => shutdown.stop(),
+        None => Ok(()),
+    }
+}
+
 /// OS-independent platform adapter interface.
 pub trait PlatformAdapter {
     /// Stable adapter name, such as `windows` or `fake`.
@@ -55,6 +194,17 @@ pub trait PlatformAdapter {
 
     /// Probe platform input capabilities.
     fn probe_capabilities(&self) -> Result<PlatformCapabilities, PlatformError>;
+
+    /// Start capturing platform input events into a bounded event queue.
+    fn start_input_capture(
+        &self,
+        _config: InputCaptureConfig,
+    ) -> Result<InputCaptureSession, PlatformError> {
+        Err(PlatformError::new(format!(
+            "{} input capture is not available",
+            self.name()
+        )))
+    }
 
     /// Release all currently pressed keys and buttons known to the adapter.
     fn release_all(&self) -> Result<(), PlatformError>;
@@ -85,6 +235,18 @@ impl PlatformAdapter for RuntimePlatformAdapter {
             Self::Windows(adapter) => adapter.probe_capabilities(),
             #[cfg(not(windows))]
             Self::Unsupported(adapter) => adapter.probe_capabilities(),
+        }
+    }
+
+    fn start_input_capture(
+        &self,
+        config: InputCaptureConfig,
+    ) -> Result<InputCaptureSession, PlatformError> {
+        match self {
+            #[cfg(windows)]
+            Self::Windows(adapter) => adapter.start_input_capture(config),
+            #[cfg(not(windows))]
+            Self::Unsupported(adapter) => adapter.start_input_capture(config),
         }
     }
 
@@ -131,12 +293,435 @@ impl PlatformAdapter for WindowsPlatformAdapter {
     }
 
     fn probe_capabilities(&self) -> Result<PlatformCapabilities, PlatformError> {
-        Ok(PlatformCapabilities::default())
+        Ok(probe_windows_capabilities())
+    }
+
+    fn start_input_capture(
+        &self,
+        config: InputCaptureConfig,
+    ) -> Result<InputCaptureSession, PlatformError> {
+        start_windows_input_capture(config)
     }
 
     fn release_all(&self) -> Result<(), PlatformError> {
         Ok(())
     }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsProbeResults {
+    can_open_input_desktop: bool,
+    can_install_mouse_hook: bool,
+    can_install_keyboard_hook: bool,
+    can_send_mouse_input: bool,
+}
+
+#[cfg(windows)]
+fn probe_windows_capabilities() -> PlatformCapabilities {
+    let can_open_input_desktop = InputDesktopHandle::open_for_hook_probe().is_some();
+    let can_install_mouse_hook =
+        can_open_input_desktop && LowLevelHookHandle::install(WH_MOUSE_LL).is_some();
+    let can_install_keyboard_hook =
+        can_open_input_desktop && LowLevelHookHandle::install(WH_KEYBOARD_LL).is_some();
+
+    windows_capabilities_from_probe_results(WindowsProbeResults {
+        can_open_input_desktop,
+        can_install_mouse_hook,
+        can_install_keyboard_hook,
+        can_send_mouse_input: can_send_zero_delta_mouse_input(),
+    })
+}
+
+#[cfg(windows)]
+fn windows_capabilities_from_probe_results(results: WindowsProbeResults) -> PlatformCapabilities {
+    PlatformCapabilities {
+        can_capture_pointer: results.can_open_input_desktop && results.can_install_mouse_hook,
+        can_capture_keyboard: results.can_open_input_desktop && results.can_install_keyboard_hook,
+        can_inject_pointer: results.can_send_mouse_input,
+        can_inject_keyboard: false,
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    static WINDOWS_CAPTURE_STATE: RefCell<WindowsCaptureThreadState> =
+        RefCell::new(WindowsCaptureThreadState::default());
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct WindowsCaptureThreadState {
+    sender: Option<SyncSender<CapturedInputEvent>>,
+    last_pointer: Option<(i32, i32)>,
+}
+
+#[cfg(windows)]
+fn start_windows_input_capture(
+    config: InputCaptureConfig,
+) -> Result<InputCaptureSession, PlatformError> {
+    let (event_sender, event_receiver) = sync_channel(config.bounded_capacity());
+    let (ready_sender, ready_receiver) = sync_channel(1);
+    let thread = thread::Builder::new()
+        .name("akraz-windows-input-capture".to_string())
+        .spawn(move || run_windows_input_capture_thread(event_sender, ready_sender))
+        .map_err(|error| PlatformError::new(format!("failed to start input capture: {error}")))?;
+
+    match ready_receiver.recv() {
+        Ok(Ok(thread_id)) => Ok(InputCaptureSession::new(
+            event_receiver,
+            InputCaptureShutdown::Windows(WindowsCaptureShutdown {
+                thread_id,
+                thread: Some(thread),
+            }),
+        )),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(error)
+        }
+        Err(error) => {
+            let _ = thread.join();
+            Err(PlatformError::new(format!(
+                "input capture failed before startup: {error}"
+            )))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_windows_input_capture_thread(
+    sender: SyncSender<CapturedInputEvent>,
+    ready: SyncSender<Result<u32, PlatformError>>,
+) {
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let mut message = MSG::default();
+    // SAFETY: message is a valid MSG pointer and a null HWND creates this thread's message queue.
+    unsafe {
+        PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
+    }
+
+    WINDOWS_CAPTURE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.sender = Some(sender);
+        state.last_pointer = None;
+    });
+
+    let result = run_windows_input_capture_message_loop(thread_id, &ready);
+
+    WINDOWS_CAPTURE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.sender = None;
+        state.last_pointer = None;
+    });
+
+    if let Err(error) = result {
+        let _ = ready.try_send(Err(error));
+    }
+}
+
+#[cfg(windows)]
+fn run_windows_input_capture_message_loop(
+    thread_id: u32,
+    ready: &SyncSender<Result<u32, PlatformError>>,
+) -> Result<(), PlatformError> {
+    let _input_desktop = InputDesktopHandle::open_for_hook_probe()
+        .ok_or_else(|| PlatformError::new("failed to open input desktop for capture"))?;
+    let _mouse_hook = LowLevelHookHandle::install(WH_MOUSE_LL)
+        .ok_or_else(|| PlatformError::new("failed to install low-level mouse hook"))?;
+    let _keyboard_hook = LowLevelHookHandle::install(WH_KEYBOARD_LL)
+        .ok_or_else(|| PlatformError::new("failed to install low-level keyboard hook"))?;
+
+    let _ = ready.try_send(Ok(thread_id));
+
+    let mut message = MSG::default();
+    loop {
+        // SAFETY: message is a valid MSG pointer and a null HWND retrieves thread messages.
+        let result = unsafe { GetMessageW(&mut message, null_mut(), 0, 0) };
+        if result == -1 {
+            return Err(PlatformError::new("input capture message loop failed"));
+        }
+        if result == 0 || message.message == WM_QUIT {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsCaptureShutdown {
+    thread_id: u32,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl WindowsCaptureShutdown {
+    fn stop(mut self) -> Result<(), PlatformError> {
+        // SAFETY: thread_id is the id reported by the capture thread after creating its message
+        // queue. Posting WM_QUIT asks the capture thread to leave GetMessageW.
+        let posted = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) };
+        if posted == 0 {
+            return Err(PlatformError::new("failed to stop input capture thread"));
+        }
+
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| PlatformError::new("input capture thread panicked"))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct InputDesktopHandle {
+    handle: HDESK,
+}
+
+#[cfg(windows)]
+impl InputDesktopHandle {
+    fn open_for_hook_probe() -> Option<Self> {
+        let desired_access = DESKTOP_READOBJECTS | DESKTOP_HOOKCONTROL;
+        // SAFETY: The call does not dereference Rust pointers. A non-null desktop handle is
+        // wrapped immediately and closed by Drop.
+        let handle = unsafe { OpenInputDesktop(0, 0, desired_access) };
+
+        if handle.is_null() {
+            None
+        } else {
+            Some(Self { handle })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for InputDesktopHandle {
+    fn drop(&mut self) {
+        // SAFETY: self.handle is a non-null HDESK returned by OpenInputDesktop and is owned by
+        // this wrapper. Drop cannot recover from cleanup failure.
+        unsafe {
+            CloseDesktop(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct LowLevelHookHandle {
+    handle: HHOOK,
+}
+
+#[cfg(windows)]
+impl LowLevelHookHandle {
+    fn install(hook_id: WINDOWS_HOOK_ID) -> Option<Self> {
+        // SAFETY: A null module name asks Windows for the module handle of this process image.
+        let module = unsafe { GetModuleHandleW(null()) };
+        if module.is_null() {
+            return None;
+        }
+
+        // SAFETY: low_level_hook_proc has the required system ABI and does not capture Rust
+        // state. The returned hook handle is owned by LowLevelHookHandle and unhooked in Drop.
+        let handle = unsafe { SetWindowsHookExW(hook_id, Some(low_level_hook_proc), module, 0) };
+        if handle.is_null() {
+            None
+        } else {
+            Some(Self { handle })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LowLevelHookHandle {
+    fn drop(&mut self) {
+        // SAFETY: self.handle is a non-null HHOOK returned by SetWindowsHookExW and is owned by
+        // this wrapper. Drop cannot recover from cleanup failure.
+        unsafe {
+            UnhookWindowsHookEx(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn low_level_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code >= 0 {
+        forward_captured_windows_event(wparam, lparam);
+    }
+
+    // SAFETY: This hook never consumes input and forwards the notification to the next hook.
+    unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
+}
+
+#[cfg(windows)]
+fn forward_captured_windows_event(wparam: WPARAM, lparam: LPARAM) {
+    WINDOWS_CAPTURE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let event = captured_event_from_windows_hook(wparam as u32, lparam, &mut state);
+        let Some(event) = event else {
+            return;
+        };
+        let Some(sender) = state.sender.as_ref() else {
+            return;
+        };
+
+        match sender.try_send(event) {
+            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        }
+    });
+}
+
+#[cfg(windows)]
+fn captured_event_from_windows_hook(
+    message: u32,
+    lparam: LPARAM,
+    state: &mut WindowsCaptureThreadState,
+) -> Option<CapturedInputEvent> {
+    match message {
+        WM_MOUSEMOVE => captured_pointer_move(lparam, state),
+        WM_LBUTTONDOWN => Some(CapturedInputEvent::MouseButton {
+            button: MouseButton::Left,
+            state: PressState::Pressed,
+        }),
+        WM_LBUTTONUP => Some(CapturedInputEvent::MouseButton {
+            button: MouseButton::Left,
+            state: PressState::Released,
+        }),
+        WM_RBUTTONDOWN => Some(CapturedInputEvent::MouseButton {
+            button: MouseButton::Right,
+            state: PressState::Pressed,
+        }),
+        WM_RBUTTONUP => Some(CapturedInputEvent::MouseButton {
+            button: MouseButton::Right,
+            state: PressState::Released,
+        }),
+        WM_MBUTTONDOWN => Some(CapturedInputEvent::MouseButton {
+            button: MouseButton::Middle,
+            state: PressState::Pressed,
+        }),
+        WM_MBUTTONUP => Some(CapturedInputEvent::MouseButton {
+            button: MouseButton::Middle,
+            state: PressState::Released,
+        }),
+        WM_XBUTTONDOWN => captured_x_button(lparam, PressState::Pressed),
+        WM_XBUTTONUP => captured_x_button(lparam, PressState::Released),
+        WM_KEYDOWN | WM_SYSKEYDOWN => captured_keyboard_input(lparam, PressState::Pressed),
+        WM_KEYUP | WM_SYSKEYUP => captured_keyboard_input(lparam, PressState::Released),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn captured_pointer_move(
+    lparam: LPARAM,
+    state: &mut WindowsCaptureThreadState,
+) -> Option<CapturedInputEvent> {
+    let mouse = windows_mouse_hook_data(lparam)?;
+    if mouse.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0 {
+        return None;
+    }
+
+    let next = (mouse.pt.x, mouse.pt.y);
+    let previous = state.last_pointer.replace(next)?;
+    let delta_x = next.0.saturating_sub(previous.0);
+    let delta_y = next.1.saturating_sub(previous.1);
+
+    if delta_x == 0 && delta_y == 0 {
+        None
+    } else {
+        Some(CapturedInputEvent::PointerMoved { delta_x, delta_y })
+    }
+}
+
+#[cfg(windows)]
+fn captured_x_button(lparam: LPARAM, state: PressState) -> Option<CapturedInputEvent> {
+    let mouse = windows_mouse_hook_data(lparam)?;
+    if mouse.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0 {
+        return None;
+    }
+
+    let button = match ((mouse.mouseData >> 16) & 0xffff) as u16 {
+        XBUTTON1 => MouseButton::Back,
+        XBUTTON2 => MouseButton::Forward,
+        other => MouseButton::Other(other),
+    };
+
+    Some(CapturedInputEvent::MouseButton { button, state })
+}
+
+#[cfg(windows)]
+fn captured_keyboard_input(lparam: LPARAM, state: PressState) -> Option<CapturedInputEvent> {
+    let keyboard = windows_keyboard_hook_data(lparam)?;
+    if keyboard.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) != 0 {
+        return None;
+    }
+
+    Some(CapturedInputEvent::Key {
+        key: physical_key_from_windows_hook(keyboard),
+        state,
+    })
+}
+
+#[cfg(windows)]
+fn physical_key_from_windows_hook(keyboard: KBDLLHOOKSTRUCT) -> PhysicalKey {
+    match keyboard.vkCode as u16 {
+        VK_LSHIFT => PhysicalKey::LeftShift,
+        VK_RSHIFT => PhysicalKey::RightShift,
+        VK_LCONTROL => PhysicalKey::LeftControl,
+        VK_RCONTROL => PhysicalKey::RightControl,
+        VK_LMENU => PhysicalKey::LeftAlt,
+        VK_RMENU => PhysicalKey::RightAlt,
+        VK_LWIN => PhysicalKey::LeftMeta,
+        VK_RWIN => PhysicalKey::RightMeta,
+        _ => PhysicalKey::Code(keyboard.scanCode as u16),
+    }
+}
+
+#[cfg(windows)]
+fn windows_mouse_hook_data(lparam: LPARAM) -> Option<MSLLHOOKSTRUCT> {
+    if lparam == 0 {
+        return None;
+    }
+
+    // SAFETY: For mouse hook messages, lparam points to an MSLLHOOKSTRUCT for the duration of the
+    // callback. The value is copied immediately and not retained.
+    Some(unsafe { *(lparam as *const MSLLHOOKSTRUCT) })
+}
+
+#[cfg(windows)]
+fn windows_keyboard_hook_data(lparam: LPARAM) -> Option<KBDLLHOOKSTRUCT> {
+    if lparam == 0 {
+        return None;
+    }
+
+    // SAFETY: For keyboard hook messages, lparam points to a KBDLLHOOKSTRUCT for the duration of
+    // the callback. The value is copied immediately and not retained.
+    Some(unsafe { *(lparam as *const KBDLLHOOKSTRUCT) })
+}
+
+#[cfg(windows)]
+fn can_send_zero_delta_mouse_input() -> bool {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+
+    // SAFETY: input points to one initialized INPUT value and cbSize matches the INPUT ABI size.
+    let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+
+    sent == 1
 }
 
 /// Adapter used on operating systems that do not have an implementation yet.
@@ -171,6 +756,7 @@ impl PlatformAdapter for UnsupportedPlatformAdapter {
 #[derive(Debug)]
 pub struct FakePlatformAdapter {
     capabilities: PlatformCapabilities,
+    captured_events: Vec<CapturedInputEvent>,
     release_all_count: Mutex<u64>,
 }
 
@@ -179,8 +765,18 @@ impl FakePlatformAdapter {
     pub fn new(capabilities: PlatformCapabilities) -> Self {
         Self {
             capabilities,
+            captured_events: Vec::new(),
             release_all_count: Mutex::new(0),
         }
+    }
+
+    /// Return a fake adapter that preloads captured input events when capture starts.
+    pub fn with_captured_events(
+        mut self,
+        events: impl IntoIterator<Item = CapturedInputEvent>,
+    ) -> Self {
+        self.captured_events = events.into_iter().collect();
+        self
     }
 
     /// Return how many times `release_all` has been requested.
@@ -209,6 +805,16 @@ impl PlatformAdapter for FakePlatformAdapter {
         Ok(self.capabilities.clone())
     }
 
+    fn start_input_capture(
+        &self,
+        config: InputCaptureConfig,
+    ) -> Result<InputCaptureSession, PlatformError> {
+        Ok(InputCaptureSession::from_preloaded_events(
+            self.captured_events.clone(),
+            config,
+        ))
+    }
+
     fn release_all(&self) -> Result<(), PlatformError> {
         let mut count = self
             .release_all_count
@@ -222,10 +828,17 @@ impl PlatformAdapter for FakePlatformAdapter {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc::TryRecvError;
+
+    use akraz_core::{CapturedInputEvent, PhysicalKey, PressState};
+
     use super::{
-        FakePlatformAdapter, PlatformAdapter, PlatformCapabilities, PlatformError,
-        runtime_platform_adapter,
+        FakePlatformAdapter, InputCaptureConfig, PlatformAdapter, PlatformCapabilities,
+        PlatformError, runtime_platform_adapter,
     };
+
+    #[cfg(windows)]
+    use super::{WindowsProbeResults, windows_capabilities_from_probe_results};
 
     fn count_or_panic(adapter: &FakePlatformAdapter) -> u64 {
         match adapter.release_all_count() {
@@ -288,18 +901,112 @@ mod tests {
     }
 
     #[test]
-    fn runtime_adapter_reports_current_platform_and_closed_capabilities() {
+    fn fake_adapter_preloads_bounded_capture_events() {
+        let adapter = FakePlatformAdapter::default().with_captured_events(vec![
+            CapturedInputEvent::Key {
+                key: PhysicalKey::LeftShift,
+                state: PressState::Pressed,
+            },
+            CapturedInputEvent::Key {
+                key: PhysicalKey::LeftShift,
+                state: PressState::Released,
+            },
+        ]);
+        let session = adapter
+            .start_input_capture(InputCaptureConfig {
+                event_buffer_capacity: 1,
+            })
+            .expect("fake capture session");
+
+        assert_eq!(
+            session.try_recv(),
+            Ok(CapturedInputEvent::Key {
+                key: PhysicalKey::LeftShift,
+                state: PressState::Pressed,
+            })
+        );
+        assert_eq!(session.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn runtime_adapter_reports_current_platform() {
         let adapter = runtime_platform_adapter();
 
         if cfg!(windows) {
             assert_eq!(adapter.name(), "windows");
         } else {
             assert_eq!(adapter.name(), "unsupported");
+            assert_eq!(
+                adapter.probe_capabilities(),
+                Ok(PlatformCapabilities::default())
+            );
         }
-        assert_eq!(
-            adapter.probe_capabilities(),
-            Ok(PlatformCapabilities::default())
-        );
         assert_eq!(adapter.release_all(), Ok(()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capabilities_map_probe_results_without_assuming_keyboard_injection() {
+        let capabilities = windows_capabilities_from_probe_results(WindowsProbeResults {
+            can_open_input_desktop: true,
+            can_install_mouse_hook: true,
+            can_install_keyboard_hook: true,
+            can_send_mouse_input: true,
+        });
+
+        assert_eq!(
+            capabilities,
+            PlatformCapabilities {
+                can_capture_pointer: true,
+                can_capture_keyboard: true,
+                can_inject_pointer: true,
+                can_inject_keyboard: false,
+            }
+        );
+
+        let blocked_desktop = windows_capabilities_from_probe_results(WindowsProbeResults {
+            can_open_input_desktop: false,
+            can_install_mouse_hook: true,
+            can_install_keyboard_hook: true,
+            can_send_mouse_input: true,
+        });
+
+        assert_eq!(
+            blocked_desktop,
+            PlatformCapabilities {
+                can_capture_pointer: false,
+                can_capture_keyboard: false,
+                can_inject_pointer: true,
+                can_inject_keyboard: false,
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_adapter_reports_real_probe_profile_without_keyboard_injection() {
+        let adapter = runtime_platform_adapter();
+
+        let capabilities = adapter.probe_capabilities().expect("capability probe");
+
+        assert!(!capabilities.can_inject_keyboard);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_input_capture_session_starts_and_stops_when_capture_is_available() {
+        let adapter = runtime_platform_adapter();
+        let capabilities = adapter.probe_capabilities().expect("capability probe");
+        if !capabilities.can_capture_pointer || !capabilities.can_capture_keyboard {
+            return;
+        }
+
+        let session = adapter
+            .start_input_capture(InputCaptureConfig {
+                event_buffer_capacity: 4,
+            })
+            .expect("windows capture session");
+
+        session.stop().expect("stop capture session");
     }
 }
