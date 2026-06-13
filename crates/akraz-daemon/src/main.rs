@@ -10,11 +10,13 @@ use akraz_core::{
 };
 use akraz_daemon::{
     CoreActionDispatcher, DaemonInputCaptureConfig, DaemonInputCaptureWorker, DaemonIpcRunConfig,
-    DaemonIpcServer, DaemonTransportCommand, LoopbackPeerTransport, PeerTransportCommandExecution,
+    DaemonIpcServer, DaemonTransportCommand, LocalPlatformCoreActionDispatcher,
+    LoopbackPeerTransport, NoopCoreActionDispatcher, PeerTransportCommandExecution,
     PeerTransportSession, PeerTransportSessionExecution, TcpPeerSessionTransport, TcpPeerTransport,
     TransportCoreActionDispatcher, build_daemon_status, serve_daemon_ipc,
     serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
-    serve_tcp_peer_transport_session_and_execute, start_daemon_input_capture_with_edge_bindings,
+    serve_tcp_peer_transport_session_and_execute,
+    start_daemon_input_capture_with_edge_bindings_and_dispatcher,
 };
 use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
 use akraz_platform::{FakePlatformAdapter, PlatformError, runtime_platform_adapter};
@@ -65,11 +67,14 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
     let platform = runtime_platform_adapter();
     let server = DaemonIpcServer::new(RuntimeInputState::new(), platform.clone());
     let capture_worker = if options.capture_input {
-        match start_daemon_input_capture_with_edge_bindings(
+        let dispatcher =
+            LocalPlatformCoreActionDispatcher::new(platform.clone(), NoopCoreActionDispatcher);
+        match start_daemon_input_capture_with_edge_bindings_and_dispatcher(
             server.shared_state(),
             &platform,
             DaemonInputCaptureConfig::default(),
             options.edge_bindings.clone(),
+            dispatcher,
         ) {
             Ok(worker) => Some(worker),
             Err(error) => {

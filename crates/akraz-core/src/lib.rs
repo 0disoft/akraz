@@ -100,6 +100,9 @@ pub enum PressState {
     Released,
 }
 
+/// Default panic hotkey key code used by the Windows MVP: Ctrl+Alt+Backspace.
+pub const DEFAULT_PANIC_HOTKEY_KEY: PhysicalKey = PhysicalKey::Code(0x0e);
+
 /// Currently pressed modifier keys.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ModifierState {
@@ -114,6 +117,14 @@ pub struct ModifierState {
 }
 
 impl ModifierState {
+    fn has_control(self) -> bool {
+        self.left_control || self.right_control
+    }
+
+    fn has_alt(self) -> bool {
+        self.left_alt || self.right_alt
+    }
+
     fn update_key(&mut self, key: PhysicalKey, state: PressState) {
         let is_pressed = state == PressState::Pressed;
 
@@ -410,6 +421,7 @@ pub enum CoreAction {
     ForwardInput {
         event: InjectedInputEvent,
     },
+    ReleaseLocalInputs,
     ReleaseAllInputs,
     StopRemoteSession {
         session_id: Option<SessionId>,
@@ -522,6 +534,10 @@ impl RuntimeInputState {
     fn apply_input(&mut self, input: CapturedInputEvent) -> Vec<CoreAction> {
         self.record_input(&input);
 
+        if self.is_panic_hotkey_press(&input) {
+            return self.handle_panic_hotkey();
+        }
+
         if self.mode == ControlMode::Remote {
             vec![CoreAction::ForwardInput {
                 event: InjectedInputEvent::from(input),
@@ -529,6 +545,17 @@ impl RuntimeInputState {
         } else {
             Vec::new()
         }
+    }
+
+    fn is_panic_hotkey_press(&self, input: &CapturedInputEvent) -> bool {
+        matches!(
+            input,
+            CapturedInputEvent::Key {
+                key: DEFAULT_PANIC_HOTKEY_KEY,
+                state: PressState::Pressed,
+            }
+        ) && self.modifiers.has_control()
+            && self.modifiers.has_alt()
     }
 
     fn apply_local_pointer_move(
@@ -644,6 +671,29 @@ impl RuntimeInputState {
         Ok(actions)
     }
 
+    fn handle_panic_hotkey(&mut self) -> Vec<CoreAction> {
+        let should_release_remote = self.mode == ControlMode::Remote
+            || self.mode == ControlMode::EnteringRemote
+            || self.mode == ControlMode::LeavingRemote
+            || self.pending_peer_id.is_some()
+            || self.active_peer_id.is_some()
+            || self.active_session_id.is_some();
+        let session_id = self.active_session_id.take();
+
+        self.clear_input();
+        self.pending_peer_id = None;
+        self.active_peer_id = None;
+        self.mode = ControlMode::Local;
+
+        let mut actions = vec![CoreAction::ReleaseLocalInputs];
+        if should_release_remote {
+            actions.push(CoreAction::ReleaseAllInputs);
+            actions.push(CoreAction::StopRemoteSession { session_id });
+        }
+
+        actions
+    }
+
     fn confirm_local_control(&mut self) -> Result<Vec<CoreAction>, CoreTransitionError> {
         if self.mode != ControlMode::LeavingRemote {
             return Err(CoreTransitionError::InvalidTransition {
@@ -750,10 +800,10 @@ pub fn replay_runtime_events(
 #[cfg(test)]
 mod tests {
     use super::{
-        CapturedInputEvent, ControlMode, CoreAction, CoreTransitionError, EdgeCrossing,
-        InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize, MouseButton, PeerId,
-        PhysicalKey, PressState, RuntimeEvent, RuntimeInputState, ScreenEdge, ScreenEdgeBinding,
-        ScreenLayout, SessionId, detect_edge_crossing, replay_runtime_events,
+        CapturedInputEvent, ControlMode, CoreAction, CoreTransitionError, DEFAULT_PANIC_HOTKEY_KEY,
+        EdgeCrossing, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize, MouseButton,
+        PeerId, PhysicalKey, PressState, RuntimeEvent, RuntimeInputState, ScreenEdge,
+        ScreenEdgeBinding, ScreenLayout, SessionId, detect_edge_crossing, replay_runtime_events,
     };
 
     fn apply_ok(state: &mut RuntimeInputState, event: RuntimeEvent) -> Vec<CoreAction> {
@@ -896,6 +946,95 @@ mod tests {
             vec![CoreAction::ForwardInput {
                 event: InjectedInputEvent::from(input),
             }]
+        );
+    }
+
+    #[test]
+    fn panic_hotkey_in_local_mode_releases_only_local_inputs() {
+        let mut state = RuntimeInputState::new();
+
+        apply_ok(
+            &mut state,
+            RuntimeEvent::Input(CapturedInputEvent::Key {
+                key: PhysicalKey::LeftControl,
+                state: PressState::Pressed,
+            }),
+        );
+        apply_ok(
+            &mut state,
+            RuntimeEvent::Input(CapturedInputEvent::Key {
+                key: PhysicalKey::LeftAlt,
+                state: PressState::Pressed,
+            }),
+        );
+        let actions = apply_ok(
+            &mut state,
+            RuntimeEvent::Input(CapturedInputEvent::Key {
+                key: DEFAULT_PANIC_HOTKEY_KEY,
+                state: PressState::Pressed,
+            }),
+        );
+
+        assert_eq!(state.mode(), ControlMode::Local);
+        assert!(state.pressed_keys().is_empty());
+        assert_eq!(state.modifiers(), Default::default());
+        assert_eq!(actions, vec![CoreAction::ReleaseLocalInputs]);
+    }
+
+    #[test]
+    fn panic_hotkey_exits_remote_mode_and_requests_release_on_both_sides() {
+        let mut state = RuntimeInputState::new();
+
+        apply_ok(
+            &mut state,
+            RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            },
+        );
+        apply_ok(
+            &mut state,
+            RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-panic"),
+            },
+        );
+        apply_ok(
+            &mut state,
+            RuntimeEvent::Input(CapturedInputEvent::Key {
+                key: PhysicalKey::LeftControl,
+                state: PressState::Pressed,
+            }),
+        );
+        apply_ok(
+            &mut state,
+            RuntimeEvent::Input(CapturedInputEvent::Key {
+                key: PhysicalKey::LeftAlt,
+                state: PressState::Pressed,
+            }),
+        );
+
+        let actions = apply_ok(
+            &mut state,
+            RuntimeEvent::Input(CapturedInputEvent::Key {
+                key: DEFAULT_PANIC_HOTKEY_KEY,
+                state: PressState::Pressed,
+            }),
+        );
+
+        assert_eq!(state.mode(), ControlMode::Local);
+        assert!(state.pending_peer_id().is_none());
+        assert!(state.active_peer_id().is_none());
+        assert!(state.active_session_id().is_none());
+        assert!(state.pressed_keys().is_empty());
+        assert_eq!(state.modifiers(), Default::default());
+        assert_eq!(
+            actions,
+            vec![
+                CoreAction::ReleaseLocalInputs,
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-panic")),
+                },
+            ]
         );
     }
 

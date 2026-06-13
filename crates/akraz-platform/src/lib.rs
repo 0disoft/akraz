@@ -17,6 +17,9 @@ use akraz_core::{
 };
 
 #[cfg(windows)]
+use akraz_core::DEFAULT_PANIC_HOTKEY_KEY;
+
+#[cfg(windows)]
 use std::mem::size_of;
 #[cfg(windows)]
 use std::ptr::{null, null_mut};
@@ -41,8 +44,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VK_LCONTROL,
-    VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VK_BACK,
+    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -896,6 +899,7 @@ fn physical_key_from_windows_hook(keyboard: KBDLLHOOKSTRUCT) -> PhysicalKey {
         VK_RMENU => PhysicalKey::RightAlt,
         VK_LWIN => PhysicalKey::LeftMeta,
         VK_RWIN => PhysicalKey::RightMeta,
+        VK_BACK => DEFAULT_PANIC_HOTKEY_KEY,
         _ => PhysicalKey::Code(keyboard.scanCode as u16),
     }
 }
@@ -1215,14 +1219,14 @@ impl PlatformAdapter for UnsupportedPlatformAdapter {
 }
 
 /// Deterministic platform adapter for core and daemon tests.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FakePlatformAdapter {
     capabilities: PlatformCapabilities,
     desktop_geometry: DesktopGeometry,
     captured_events: Vec<CapturedInputEvent>,
     capture_policy: SharedInputCapturePolicy,
-    injected_events: Mutex<Vec<InjectedInputEvent>>,
-    release_all_count: Mutex<u64>,
+    injected_events: Arc<Mutex<Vec<InjectedInputEvent>>>,
+    release_all_count: Arc<Mutex<u64>>,
 }
 
 impl FakePlatformAdapter {
@@ -1233,8 +1237,8 @@ impl FakePlatformAdapter {
             desktop_geometry: fake_desktop_geometry(),
             captured_events: Vec::new(),
             capture_policy: SharedInputCapturePolicy::default(),
-            injected_events: Mutex::new(Vec::new()),
-            release_all_count: Mutex::new(0),
+            injected_events: Arc::new(Mutex::new(Vec::new())),
+            release_all_count: Arc::new(Mutex::new(0)),
         }
     }
 

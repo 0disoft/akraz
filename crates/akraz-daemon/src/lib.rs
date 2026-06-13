@@ -53,6 +53,46 @@ impl CoreActionDispatcher for NoopCoreActionDispatcher {
     }
 }
 
+/// Dispatcher decorator that executes local platform recovery actions before delegating the rest.
+#[derive(Debug, Clone)]
+pub struct LocalPlatformCoreActionDispatcher<P, D> {
+    platform: P,
+    next: D,
+}
+
+impl<P, D> LocalPlatformCoreActionDispatcher<P, D> {
+    pub fn new(platform: P, next: D) -> Self {
+        Self { platform, next }
+    }
+
+    pub fn platform(&self) -> &P {
+        &self.platform
+    }
+
+    pub fn next(&self) -> &D {
+        &self.next
+    }
+}
+
+impl<P, D> CoreActionDispatcher for LocalPlatformCoreActionDispatcher<P, D>
+where
+    P: PlatformAdapter + Send + Sync + 'static,
+    D: CoreActionDispatcher,
+{
+    fn dispatch_core_actions(&self, actions: &[CoreAction]) -> Result<(), PlatformError> {
+        for action in actions {
+            match action {
+                CoreAction::ReleaseLocalInputs => self.platform.release_all()?,
+                other => self
+                    .next
+                    .dispatch_core_actions(std::slice::from_ref(other))?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Transport-facing command derived from a core side-effect action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonTransportCommand {
@@ -69,20 +109,23 @@ pub enum DaemonTransportCommand {
     },
 }
 
-impl From<&CoreAction> for DaemonTransportCommand {
-    fn from(action: &CoreAction) -> Self {
+impl DaemonTransportCommand {
+    fn from_remote_core_action(action: &CoreAction) -> Option<Self> {
         match action {
-            CoreAction::StartRemoteSession { peer_id, crossing } => Self::StartRemoteSession {
-                peer_id: peer_id.clone(),
-                crossing: crossing.clone(),
-            },
-            CoreAction::ForwardInput { event } => Self::ForwardInput {
+            CoreAction::ReleaseLocalInputs => None,
+            CoreAction::StartRemoteSession { peer_id, crossing } => {
+                Some(Self::StartRemoteSession {
+                    peer_id: peer_id.clone(),
+                    crossing: crossing.clone(),
+                })
+            }
+            CoreAction::ForwardInput { event } => Some(Self::ForwardInput {
                 event: event.clone(),
-            },
-            CoreAction::ReleaseAllInputs => Self::ReleaseAllInputs,
-            CoreAction::StopRemoteSession { session_id } => Self::StopRemoteSession {
+            }),
+            CoreAction::ReleaseAllInputs => Some(Self::ReleaseAllInputs),
+            CoreAction::StopRemoteSession { session_id } => Some(Self::StopRemoteSession {
                 session_id: session_id.clone(),
-            },
+            }),
         }
     }
 }
@@ -117,8 +160,9 @@ where
 {
     fn dispatch_core_actions(&self, actions: &[CoreAction]) -> Result<(), PlatformError> {
         for action in actions {
-            self.transport
-                .dispatch_transport_command(DaemonTransportCommand::from(action))?;
+            if let Some(command) = DaemonTransportCommand::from_remote_core_action(action) {
+                self.transport.dispatch_transport_command(command)?;
+            }
         }
 
         Ok(())
@@ -1485,9 +1529,10 @@ fn push_missing_capability_issue(
 #[cfg(test)]
 mod tests {
     use akraz_core::{
-        CapturedInputEvent, ControlMode, CoreAction, DeviceId, EdgeCrossing, InjectedInputEvent,
-        LogicalPoint, LogicalRect, LogicalSize, MouseButton, PeerId, PhysicalKey, PressState,
-        RuntimeEvent, RuntimeInputState, ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
+        CapturedInputEvent, ControlMode, CoreAction, DEFAULT_PANIC_HOTKEY_KEY, DeviceId,
+        EdgeCrossing, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize, MouseButton,
+        PeerId, PhysicalKey, PressState, RuntimeEvent, RuntimeInputState, ScreenEdge,
+        ScreenEdgeBinding, ScreenLayout, SessionId,
     };
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, DaemonStatusParams, IpcEndpoint,
@@ -1503,15 +1548,15 @@ mod tests {
     use super::{
         CapturedInputRouter, CoreActionDispatcher, DAEMON_VERSION, DaemonInputCaptureConfig,
         DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer, DaemonPeerTransport,
-        DaemonTransportCommand, LoopbackPeerTransport, PeerTransportCommandExecution,
-        PeerTransportMessage, PeerTransportSessionFrame, TcpPeerSessionTransport, TcpPeerTransport,
-        TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
-        build_permissions_probe, drain_capture_events, execute_peer_transport_command,
-        handle_ipc_request_line, input_capture_policy_for_control_mode, serve_daemon_ipc,
-        serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
-        serve_tcp_peer_transport_session_and_execute, shared_runtime_state,
-        start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
-        start_daemon_input_capture_with_routing,
+        DaemonTransportCommand, LocalPlatformCoreActionDispatcher, LoopbackPeerTransport,
+        PeerTransportCommandExecution, PeerTransportMessage, PeerTransportSessionFrame,
+        TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher,
+        apply_routed_capture_event_to_state, build_daemon_status, build_permissions_probe,
+        drain_capture_events, execute_peer_transport_command, handle_ipc_request_line,
+        input_capture_policy_for_control_mode, serve_daemon_ipc, serve_tcp_peer_transport_commands,
+        serve_tcp_peer_transport_session, serve_tcp_peer_transport_session_and_execute,
+        shared_runtime_state, start_daemon_input_capture,
+        start_daemon_input_capture_with_edge_bindings, start_daemon_input_capture_with_routing,
         start_daemon_input_capture_with_routing_and_dispatcher, sync_capture_policy_with_state,
     };
 
@@ -1950,6 +1995,55 @@ mod tests {
                         delta_y: 2,
                     },
                 },
+                DaemonTransportCommand::ReleaseAllInputs,
+                DaemonTransportCommand::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-1")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transport_dispatcher_ignores_local_release_actions() {
+        let transport = LoopbackPeerTransport::default();
+        let dispatcher = TransportCoreActionDispatcher::new(transport.clone());
+
+        dispatcher
+            .dispatch_core_actions(&[CoreAction::ReleaseLocalInputs, CoreAction::ReleaseAllInputs])
+            .expect("transport command dispatch");
+
+        assert_eq!(
+            transport.snapshot().expect("loopback command snapshot"),
+            vec![DaemonTransportCommand::ReleaseAllInputs]
+        );
+    }
+
+    #[test]
+    fn local_platform_dispatcher_releases_local_inputs_and_delegates_remote_actions() {
+        let platform = FakePlatformAdapter::default();
+        let transport = LoopbackPeerTransport::default();
+        let dispatcher = LocalPlatformCoreActionDispatcher::new(
+            platform.clone(),
+            TransportCoreActionDispatcher::new(transport.clone()),
+        );
+
+        dispatcher
+            .dispatch_core_actions(&[
+                CoreAction::ReleaseLocalInputs,
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-1")),
+                },
+            ])
+            .expect("local platform dispatch");
+
+        assert_eq!(
+            platform.release_all_count().expect("local release count"),
+            1
+        );
+        assert_eq!(
+            transport.snapshot().expect("loopback command snapshot"),
+            vec![
                 DaemonTransportCommand::ReleaseAllInputs,
                 DaemonTransportCommand::StopRemoteSession {
                     session_id: Some(SessionId::new("session-1")),
@@ -2656,6 +2750,101 @@ mod tests {
 
         worker.stop().expect("stop capture worker");
         panic!("expected capture worker to dispatch edge crossing transport command");
+    }
+
+    #[test]
+    fn daemon_input_capture_worker_dispatches_panic_hotkey_recovery() {
+        let platform = FakePlatformAdapter::default().with_captured_events(vec![
+            CapturedInputEvent::Key {
+                key: PhysicalKey::LeftControl,
+                state: PressState::Pressed,
+            },
+            CapturedInputEvent::Key {
+                key: PhysicalKey::LeftAlt,
+                state: PressState::Pressed,
+            },
+            CapturedInputEvent::Key {
+                key: DEFAULT_PANIC_HOTKEY_KEY,
+                state: PressState::Pressed,
+            },
+        ]);
+        let mut initial_state = RuntimeInputState::new();
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            })
+            .expect("remote entry request");
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-1"),
+            })
+            .expect("remote entry confirmed");
+        let state = shared_runtime_state(initial_state);
+        let transport = LoopbackPeerTransport::default();
+        let dispatcher = LocalPlatformCoreActionDispatcher::new(
+            platform.clone(),
+            TransportCoreActionDispatcher::new(transport.clone()),
+        );
+        let expected_release = DaemonTransportCommand::ReleaseAllInputs;
+        let expected_stop = DaemonTransportCommand::StopRemoteSession {
+            session_id: Some(SessionId::new("session-1")),
+        };
+
+        let worker = start_daemon_input_capture_with_routing_and_dispatcher(
+            state.clone(),
+            &platform,
+            DaemonInputCaptureConfig {
+                input_capture: InputCaptureConfig {
+                    event_buffer_capacity: 8,
+                },
+                drain_batch_size: 8,
+                idle_poll_interval: std::time::Duration::from_millis(1),
+            },
+            DaemonInputRoutingConfig {
+                screen_layout: right_edge_layout(),
+                initial_pointer: LogicalPoint { x: 1919, y: 540 },
+            },
+            dispatcher,
+        )
+        .expect("daemon capture worker");
+
+        for _ in 0..20 {
+            let commands = transport.snapshot().expect("loopback command snapshot");
+            if commands.contains(&expected_release)
+                && commands.contains(&expected_stop)
+                && platform.release_all_count().expect("local release count") == 1
+            {
+                worker.stop().expect("stop capture worker");
+                assert_eq!(
+                    state.lock().expect("shared state lock").mode(),
+                    ControlMode::Local
+                );
+                assert_eq!(
+                    commands,
+                    vec![
+                        DaemonTransportCommand::ForwardInput {
+                            event: InjectedInputEvent::Key {
+                                key: PhysicalKey::LeftControl,
+                                state: PressState::Pressed,
+                            },
+                        },
+                        DaemonTransportCommand::ForwardInput {
+                            event: InjectedInputEvent::Key {
+                                key: PhysicalKey::LeftAlt,
+                                state: PressState::Pressed,
+                            },
+                        },
+                        expected_release,
+                        expected_stop,
+                    ]
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        worker.stop().expect("stop capture worker");
+        panic!("expected capture worker to dispatch panic hotkey recovery");
     }
 
     #[test]
