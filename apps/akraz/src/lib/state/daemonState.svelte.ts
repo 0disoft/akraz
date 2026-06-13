@@ -1,5 +1,5 @@
 import { daemonClient } from "../api/daemonClient";
-import type { DaemonLifecycleSnapshot, DaemonStatus } from "../api/types";
+import type { DaemonLifecycleSnapshot, DaemonStartOptions, DaemonStatus } from "../api/types";
 
 type DaemonOperation = "refresh" | "start" | "stop";
 
@@ -20,8 +20,8 @@ export class DaemonState {
     await this.run("refresh", () => daemonClient.status());
   }
 
-  async start() {
-    await this.run("start", () => daemonClient.start());
+  async start(options: DaemonStartOptions = {}) {
+    await this.run("start", () => daemonClient.start(options));
   }
 
   async stop() {

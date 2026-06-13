@@ -39,3 +39,16 @@ export interface DaemonLifecycleSnapshot {
   detail: string | null;
   managedPid: number | null;
 }
+
+export type ScreenEdge = "left" | "right" | "top" | "bottom";
+
+export interface ScreenEdgeBinding {
+  localEdge: ScreenEdge;
+  peerId: string;
+  remoteEdge: ScreenEdge;
+}
+
+export interface DaemonStartOptions {
+  captureInput?: boolean;
+  edgeBindings?: ScreenEdgeBinding[];
+}

@@ -10,7 +10,7 @@ use akraz_ipc::{
     JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient,
     METHOD_DAEMON_STATUS, OsLocalIpcClient, call_json_rpc, resolve_current_default_endpoint,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::async_runtime::Receiver;
 use tauri_plugin_shell::{
     ShellExt,
@@ -23,6 +23,7 @@ const DAEMON_CAPTURE_INPUT_ENV: &str = "AKRAZ_DAEMON_CAPTURE_INPUT";
 const DAEMON_SIDECAR_NAME: &str = "akraz-daemon";
 const DAEMON_SERVE_ARG: &str = "--serve";
 const DAEMON_CAPTURE_INPUT_ARG: &str = "--capture-input";
+const DAEMON_EDGE_BINDING_ARG: &str = "--edge-binding";
 const DAEMON_LIFECYCLE_SMOKE_FLAG: &str = "--akraz-smoke-daemon-lifecycle";
 const DAEMON_START_RETRIES: usize = 50;
 const DAEMON_START_RETRY_DELAY: Duration = Duration::from_millis(40);
@@ -80,7 +81,7 @@ fn run_daemon_lifecycle_smoke() -> Result<(), String> {
         ));
     }
 
-    let started = start_daemon(&handle, &managed)?;
+    let started = start_daemon(&handle, &managed, DaemonStartOptions::default())?;
     report.started = Some(started.clone());
     if started.phase != DaemonLifecyclePhase::Running {
         report.stopped = Some(stop_daemon(&managed)?);
@@ -142,9 +143,11 @@ async fn daemon_status(
 async fn daemon_start(
     app: tauri::AppHandle,
     managed: tauri::State<'_, ManagedDaemon>,
+    options: Option<DaemonStartOptions>,
 ) -> Result<DaemonLifecycleSnapshot, String> {
     let managed = Arc::clone(managed.inner());
-    tauri::async_runtime::spawn_blocking(move || start_daemon(&app, &managed))
+    let options = options.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || start_daemon(&app, &managed, options))
         .await
         .map_err(|error| format!("daemon start task failed: {error}"))?
 }
@@ -207,6 +210,42 @@ impl ManagedDaemonChild {
 struct SpawnedDaemonProcess {
     child: ManagedDaemonChild,
     sidecar_events: Option<Receiver<CommandEvent>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DaemonStartOptions {
+    capture_input: Option<bool>,
+    #[serde(default)]
+    edge_bindings: Vec<DaemonEdgeBindingOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DaemonEdgeBindingOption {
+    local_edge: DaemonScreenEdgeOption,
+    peer_id: String,
+    remote_edge: DaemonScreenEdgeOption,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DaemonScreenEdgeOption {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl DaemonScreenEdgeOption {
+    fn daemon_arg(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -287,6 +326,7 @@ fn refresh_daemon_snapshot(managed: &ManagedDaemon) -> Result<DaemonLifecycleSna
 fn start_daemon(
     app: &tauri::AppHandle,
     managed: &ManagedDaemon,
+    options: DaemonStartOptions,
 ) -> Result<DaemonLifecycleSnapshot, String> {
     let current = refresh_daemon_snapshot(managed)?;
     match current.phase {
@@ -306,7 +346,7 @@ fn start_daemon(
         ));
     }
 
-    let spawned = match spawn_daemon_process(app) {
+    let spawned = match spawn_daemon_process(app, &options) {
         Ok(spawned) => spawned,
         Err(error) => return Ok(DaemonLifecycleSnapshot::failed(error)),
     };
@@ -438,22 +478,25 @@ fn classify_daemon_call_error(
     }
 }
 
-fn spawn_daemon_process(app: &tauri::AppHandle) -> Result<SpawnedDaemonProcess, String> {
+fn spawn_daemon_process(
+    app: &tauri::AppHandle,
+    options: &DaemonStartOptions,
+) -> Result<SpawnedDaemonProcess, String> {
     if let Some(executable) = resolve_env_daemon_executable() {
-        return spawn_os_daemon_process(&executable).map(|child| SpawnedDaemonProcess {
+        return spawn_os_daemon_process(&executable, options).map(|child| SpawnedDaemonProcess {
             child: ManagedDaemonChild::Os(child),
             sidecar_events: None,
         });
     }
 
-    match spawn_sidecar_daemon_process(app) {
+    match spawn_sidecar_daemon_process(app, options) {
         Ok((sidecar_events, child)) => Ok(SpawnedDaemonProcess {
             child: ManagedDaemonChild::Sidecar(child),
             sidecar_events: Some(sidecar_events),
         }),
         Err(sidecar_error) => {
             let executable = resolve_adjacent_daemon_executable()?;
-            spawn_os_daemon_process(&executable)
+            spawn_os_daemon_process(&executable, options)
                 .map(|child| SpawnedDaemonProcess {
                     child: ManagedDaemonChild::Os(child),
                     sidecar_events: None,
@@ -470,18 +513,22 @@ fn spawn_daemon_process(app: &tauri::AppHandle) -> Result<SpawnedDaemonProcess, 
 
 fn spawn_sidecar_daemon_process(
     app: &tauri::AppHandle,
+    options: &DaemonStartOptions,
 ) -> Result<(Receiver<CommandEvent>, CommandChild), String> {
     app.shell()
         .sidecar(DAEMON_SIDECAR_NAME)
         .map_err(|error| error.to_string())?
-        .args(daemon_spawn_args())
+        .args(daemon_spawn_args(options)?)
         .spawn()
         .map_err(|error| error.to_string())
 }
 
-fn spawn_os_daemon_process(executable: &PathBuf) -> Result<Child, String> {
+fn spawn_os_daemon_process(
+    executable: &PathBuf,
+    options: &DaemonStartOptions,
+) -> Result<Child, String> {
     StdCommand::new(executable)
-        .args(daemon_spawn_args())
+        .args(daemon_spawn_args(options)?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -494,17 +541,44 @@ fn spawn_os_daemon_process(executable: &PathBuf) -> Result<Child, String> {
         })
 }
 
-fn daemon_spawn_args() -> Vec<&'static str> {
-    daemon_spawn_args_from(std::env::var_os(DAEMON_CAPTURE_INPUT_ENV))
+fn daemon_spawn_args(options: &DaemonStartOptions) -> Result<Vec<String>, String> {
+    daemon_spawn_args_from(options, std::env::var_os(DAEMON_CAPTURE_INPUT_ENV))
 }
 
-fn daemon_spawn_args_from(capture_input: Option<OsString>) -> Vec<&'static str> {
-    let mut args = vec![DAEMON_SERVE_ARG];
-    if daemon_capture_input_enabled_from(capture_input) {
-        args.push(DAEMON_CAPTURE_INPUT_ARG);
+fn daemon_spawn_args_from(
+    options: &DaemonStartOptions,
+    capture_input: Option<OsString>,
+) -> Result<Vec<String>, String> {
+    let mut args = vec![DAEMON_SERVE_ARG.to_string()];
+    if options
+        .capture_input
+        .unwrap_or_else(|| daemon_capture_input_enabled_from(capture_input))
+    {
+        args.push(DAEMON_CAPTURE_INPUT_ARG.to_string());
+    }
+    for binding in &options.edge_bindings {
+        args.push(DAEMON_EDGE_BINDING_ARG.to_string());
+        args.push(format_edge_binding_arg(binding)?);
     }
 
-    args
+    Ok(args)
+}
+
+fn format_edge_binding_arg(binding: &DaemonEdgeBindingOption) -> Result<String, String> {
+    let peer_id = binding.peer_id.trim();
+    if peer_id.is_empty() {
+        return Err("edge binding peer id is required.".to_string());
+    }
+    if peer_id.contains(':') {
+        return Err("edge binding peer id cannot contain ':'.".to_string());
+    }
+
+    Ok(format!(
+        "{}:{}:{}",
+        binding.local_edge.daemon_arg(),
+        peer_id,
+        binding.remote_edge.daemon_arg()
+    ))
 }
 
 fn daemon_capture_input_enabled_from(value: Option<OsString>) -> bool {
@@ -641,10 +715,11 @@ mod tests {
     };
 
     use super::{
-        DAEMON_CAPTURE_INPUT_ARG, DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_SERVE_ARG,
-        DAEMON_SIDECAR_NAME, DaemonLifecyclePhase, classify_daemon_call_error,
+        DAEMON_CAPTURE_INPUT_ARG, DAEMON_EDGE_BINDING_ARG, DAEMON_LIFECYCLE_SMOKE_FLAG,
+        DAEMON_SERVE_ARG, DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase,
+        DaemonScreenEdgeOption, DaemonStartOptions, classify_daemon_call_error,
         daemon_capture_input_enabled_from, daemon_executable_name, daemon_spawn_args_from,
-        parse_daemon_status_response, resolve_env_daemon_executable_from,
+        format_edge_binding_arg, parse_daemon_status_response, resolve_env_daemon_executable_from,
         should_run_daemon_lifecycle_smoke,
     };
 
@@ -794,10 +869,68 @@ mod tests {
 
     #[test]
     fn daemon_spawn_args_include_capture_only_when_enabled() {
-        assert_eq!(daemon_spawn_args_from(None), vec![DAEMON_SERVE_ARG]);
         assert_eq!(
-            daemon_spawn_args_from(Some(OsString::from("1"))),
-            vec![DAEMON_SERVE_ARG, DAEMON_CAPTURE_INPUT_ARG]
+            daemon_spawn_args_from(&DaemonStartOptions::default(), None),
+            Ok(vec![DAEMON_SERVE_ARG.to_string()])
+        );
+        assert_eq!(
+            daemon_spawn_args_from(&DaemonStartOptions::default(), Some(OsString::from("1"))),
+            Ok(vec![
+                DAEMON_SERVE_ARG.to_string(),
+                DAEMON_CAPTURE_INPUT_ARG.to_string()
+            ])
+        );
+        assert_eq!(
+            daemon_spawn_args_from(
+                &DaemonStartOptions {
+                    capture_input: Some(false),
+                    edge_bindings: Vec::new(),
+                },
+                Some(OsString::from("1")),
+            ),
+            Ok(vec![DAEMON_SERVE_ARG.to_string()])
+        );
+    }
+
+    #[test]
+    fn daemon_spawn_args_include_configured_edge_bindings() {
+        let options = DaemonStartOptions {
+            capture_input: Some(true),
+            edge_bindings: vec![DaemonEdgeBindingOption {
+                local_edge: DaemonScreenEdgeOption::Right,
+                peer_id: " linux-laptop ".to_string(),
+                remote_edge: DaemonScreenEdgeOption::Left,
+            }],
+        };
+
+        assert_eq!(
+            daemon_spawn_args_from(&options, None),
+            Ok(vec![
+                DAEMON_SERVE_ARG.to_string(),
+                DAEMON_CAPTURE_INPUT_ARG.to_string(),
+                DAEMON_EDGE_BINDING_ARG.to_string(),
+                "right:linux-laptop:left".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn edge_binding_arg_rejects_values_that_break_daemon_cli_contract() {
+        assert_eq!(
+            format_edge_binding_arg(&DaemonEdgeBindingOption {
+                local_edge: DaemonScreenEdgeOption::Right,
+                peer_id: " ".to_string(),
+                remote_edge: DaemonScreenEdgeOption::Left,
+            }),
+            Err("edge binding peer id is required.".to_string())
+        );
+        assert_eq!(
+            format_edge_binding_arg(&DaemonEdgeBindingOption {
+                local_edge: DaemonScreenEdgeOption::Right,
+                peer_id: "linux:laptop".to_string(),
+                remote_edge: DaemonScreenEdgeOption::Left,
+            }),
+            Err("edge binding peer id cannot contain ':'.".to_string())
         );
     }
 }
