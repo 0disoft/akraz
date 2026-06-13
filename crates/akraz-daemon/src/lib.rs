@@ -303,6 +303,29 @@ pub struct PeerTransportSessionHello {
     pub peer_id: PeerId,
 }
 
+/// Result of executing one remote peer command against a platform adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerTransportCommandExecution {
+    RemoteSessionStarted {
+        peer_id: PeerId,
+        crossing: Option<EdgeCrossing>,
+    },
+    InputForwarded {
+        event: InjectedInputEvent,
+    },
+    InputsReleased,
+    RemoteSessionStopped {
+        session_id: Option<SessionId>,
+    },
+}
+
+/// Executed persistent TCP peer session captured by a bounded receiver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerTransportSessionExecution {
+    pub hello: PeerTransportSessionHello,
+    pub outcomes: Vec<PeerTransportCommandExecution>,
+}
+
 /// Serve a bounded number of TCP peer transport commands and return decoded commands.
 pub fn serve_tcp_peer_transport_commands(
     listener: &TcpListener,
@@ -357,6 +380,63 @@ pub fn serve_tcp_peer_transport_session(
     }
 
     Ok(PeerTransportSession { hello, commands })
+}
+
+/// Serve one persistent TCP peer session and execute each command as it arrives.
+pub fn serve_tcp_peer_transport_session_and_execute<P>(
+    listener: &TcpListener,
+    max_commands: usize,
+    platform: &P,
+) -> Result<PeerTransportSessionExecution, PlatformError>
+where
+    P: PlatformAdapter,
+{
+    let (stream, _) = listener
+        .accept()
+        .map_err(|error| PlatformError::new(format!("failed to accept peer session: {error}")))?;
+    let mut reader = BufReader::new(stream);
+    let hello = read_peer_transport_session_hello(&mut reader)?;
+    let mut outcomes = Vec::with_capacity(max_commands);
+
+    for _ in 0..max_commands {
+        let command = read_peer_transport_session_command(&mut reader)?;
+        outcomes.push(execute_peer_transport_command(platform, &command)?);
+    }
+
+    Ok(PeerTransportSessionExecution { hello, outcomes })
+}
+
+/// Execute one decoded peer transport command against the local platform boundary.
+pub fn execute_peer_transport_command<P>(
+    platform: &P,
+    command: &DaemonTransportCommand,
+) -> Result<PeerTransportCommandExecution, PlatformError>
+where
+    P: PlatformAdapter,
+{
+    match command {
+        DaemonTransportCommand::StartRemoteSession { peer_id, crossing } => {
+            Ok(PeerTransportCommandExecution::RemoteSessionStarted {
+                peer_id: peer_id.clone(),
+                crossing: crossing.clone(),
+            })
+        }
+        DaemonTransportCommand::ForwardInput { event } => {
+            platform.inject_input(event)?;
+            Ok(PeerTransportCommandExecution::InputForwarded {
+                event: event.clone(),
+            })
+        }
+        DaemonTransportCommand::ReleaseAllInputs => {
+            platform.release_all()?;
+            Ok(PeerTransportCommandExecution::InputsReleased)
+        }
+        DaemonTransportCommand::StopRemoteSession { session_id } => {
+            Ok(PeerTransportCommandExecution::RemoteSessionStopped {
+                session_id: session_id.clone(),
+            })
+        }
+    }
 }
 
 fn write_peer_transport_session_frame(
@@ -1393,13 +1473,14 @@ mod tests {
     use super::{
         CapturedInputRouter, CoreActionDispatcher, DAEMON_VERSION, DaemonInputCaptureConfig,
         DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer, DaemonPeerTransport,
-        DaemonTransportCommand, LoopbackPeerTransport, PeerTransportMessage,
-        PeerTransportSessionFrame, TcpPeerSessionTransport, TcpPeerTransport,
+        DaemonTransportCommand, LoopbackPeerTransport, PeerTransportCommandExecution,
+        PeerTransportMessage, PeerTransportSessionFrame, TcpPeerSessionTransport, TcpPeerTransport,
         TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
-        build_permissions_probe, drain_capture_events, handle_ipc_request_line, serve_daemon_ipc,
-        serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session, shared_runtime_state,
-        start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
-        start_daemon_input_capture_with_routing,
+        build_permissions_probe, drain_capture_events, execute_peer_transport_command,
+        handle_ipc_request_line, serve_daemon_ipc, serve_tcp_peer_transport_commands,
+        serve_tcp_peer_transport_session, serve_tcp_peer_transport_session_and_execute,
+        shared_runtime_state, start_daemon_input_capture,
+        start_daemon_input_capture_with_edge_bindings, start_daemon_input_capture_with_routing,
         start_daemon_input_capture_with_routing_and_dispatcher,
     };
 
@@ -1979,6 +2060,135 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn peer_transport_executor_applies_forward_and_release_to_platform() {
+        let platform = FakePlatformAdapter::default();
+
+        let forward = execute_peer_transport_command(
+            &platform,
+            &DaemonTransportCommand::ForwardInput {
+                event: InjectedInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            },
+        )
+        .expect("forward input command");
+        let release =
+            execute_peer_transport_command(&platform, &DaemonTransportCommand::ReleaseAllInputs)
+                .expect("release input command");
+
+        assert_eq!(
+            forward,
+            PeerTransportCommandExecution::InputForwarded {
+                event: InjectedInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            }
+        );
+        assert_eq!(release, PeerTransportCommandExecution::InputsReleased);
+        assert_eq!(
+            platform.injected_events().expect("fake injected events"),
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }]
+        );
+        assert_eq!(
+            platform
+                .release_all_count()
+                .expect("fake release all count"),
+            1
+        );
+    }
+
+    #[test]
+    fn tcp_peer_session_executor_applies_received_commands_to_platform() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread = std::thread::spawn(move || {
+            let platform = FakePlatformAdapter::default();
+            let execution = serve_tcp_peer_transport_session_and_execute(&listener, 4, &platform)?;
+            let injected_events = platform.injected_events()?;
+            let release_all_count = platform.release_all_count()?;
+
+            Ok::<_, PlatformError>((execution, injected_events, release_all_count))
+        });
+        let transport = TcpPeerSessionTransport::connect(
+            PeerId::new("right-peer"),
+            DeviceId::new("windows-desktop"),
+            address,
+        )
+        .expect("connect TCP peer session");
+        let dispatcher = TransportCoreActionDispatcher::new(transport);
+        let crossing = EdgeCrossing {
+            peer_id: PeerId::new("right-peer"),
+            local_edge: ScreenEdge::Right,
+            remote_edge: ScreenEdge::Left,
+            exit_position: LogicalPoint { x: 1920, y: 540 },
+            edge_offset: 540,
+        };
+
+        dispatcher
+            .dispatch_core_actions(&[
+                CoreAction::StartRemoteSession {
+                    peer_id: PeerId::new("right-peer"),
+                    crossing: Some(crossing.clone()),
+                },
+                CoreAction::ForwardInput {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 8,
+                        delta_y: 2,
+                    },
+                },
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-1")),
+                },
+            ])
+            .expect("TCP peer session dispatch");
+        let (execution, injected_events, release_all_count) = server_thread
+            .join()
+            .expect("TCP peer session executor thread")
+            .expect("TCP peer session execution");
+
+        assert_eq!(
+            execution.hello.protocol,
+            akraz_protocol::ProtocolVersion::CURRENT
+        );
+        assert_eq!(execution.hello.device_id, DeviceId::new("windows-desktop"));
+        assert_eq!(execution.hello.peer_id, PeerId::new("right-peer"));
+        assert_eq!(
+            execution.outcomes,
+            vec![
+                PeerTransportCommandExecution::RemoteSessionStarted {
+                    peer_id: PeerId::new("right-peer"),
+                    crossing: Some(crossing),
+                },
+                PeerTransportCommandExecution::InputForwarded {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 8,
+                        delta_y: 2,
+                    },
+                },
+                PeerTransportCommandExecution::InputsReleased,
+                PeerTransportCommandExecution::RemoteSessionStopped {
+                    session_id: Some(SessionId::new("session-1")),
+                },
+            ]
+        );
+        assert_eq!(
+            injected_events,
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }]
+        );
+        assert_eq!(release_all_count, 1);
     }
 
     #[test]

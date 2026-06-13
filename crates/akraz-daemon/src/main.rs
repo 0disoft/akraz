@@ -10,13 +10,14 @@ use akraz_core::{
 };
 use akraz_daemon::{
     CoreActionDispatcher, DaemonInputCaptureConfig, DaemonInputCaptureWorker, DaemonIpcRunConfig,
-    DaemonIpcServer, DaemonTransportCommand, LoopbackPeerTransport, PeerTransportSession,
-    TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher, build_daemon_status,
-    serve_daemon_ipc, serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
-    start_daemon_input_capture_with_edge_bindings,
+    DaemonIpcServer, DaemonTransportCommand, LoopbackPeerTransport, PeerTransportCommandExecution,
+    PeerTransportSession, PeerTransportSessionExecution, TcpPeerSessionTransport, TcpPeerTransport,
+    TransportCoreActionDispatcher, build_daemon_status, serve_daemon_ipc,
+    serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
+    serve_tcp_peer_transport_session_and_execute, start_daemon_input_capture_with_edge_bindings,
 };
 use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
-use akraz_platform::runtime_platform_adapter;
+use akraz_platform::{FakePlatformAdapter, PlatformError, runtime_platform_adapter};
 use serde::Serialize;
 
 fn main() -> ExitCode {
@@ -32,6 +33,7 @@ fn main() -> ExitCode {
         Ok(DaemonCommand::LoopbackTransportSmoke) => run_loopback_transport_smoke(),
         Ok(DaemonCommand::TcpTransportSmoke) => run_tcp_transport_smoke(),
         Ok(DaemonCommand::PeerSessionSmoke) => run_peer_session_smoke(),
+        Ok(DaemonCommand::PeerSessionExecutorSmoke) => run_peer_session_executor_smoke(),
         Ok(DaemonCommand::Serve(options)) => run_daemon(options),
         Err(error) => {
             eprintln!("{error}");
@@ -195,6 +197,25 @@ fn run_peer_session_smoke() -> ExitCode {
     }
 }
 
+fn run_peer_session_executor_smoke() -> ExitCode {
+    match build_peer_session_executor_smoke_report() {
+        Ok(report) => match serde_json::to_string(&report) {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("failed to encode peer session executor smoke report: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("peer session executor smoke failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn build_loopback_transport_smoke_report()
 -> Result<LoopbackTransportSmokeReport, akraz_platform::PlatformError> {
     let transport = LoopbackPeerTransport::new();
@@ -279,6 +300,52 @@ fn build_peer_session_smoke_report() -> Result<PeerSessionSmokeReport, akraz_pla
     ))
 }
 
+fn build_peer_session_executor_smoke_report()
+-> Result<PeerSessionExecutorSmokeReport, akraz_platform::PlatformError> {
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| {
+        akraz_platform::PlatformError::new(format!(
+            "failed to bind peer session executor smoke listener: {error}"
+        ))
+    })?;
+    let address = listener.local_addr().map_err(|error| {
+        akraz_platform::PlatformError::new(format!(
+            "failed to read peer session executor smoke listener address: {error}"
+        ))
+    })?;
+    let server_thread = thread::spawn(move || {
+        let platform = FakePlatformAdapter::default();
+        let execution = serve_tcp_peer_transport_session_and_execute(
+            &listener,
+            loopback_transport_smoke_actions().len(),
+            &platform,
+        )?;
+        let injected_events = platform.injected_events()?;
+        let release_all_count = platform.release_all_count()?;
+
+        Ok::<_, PlatformError>((execution, injected_events, release_all_count))
+    });
+    let transport = TcpPeerSessionTransport::connect(
+        PeerId::new("loopback-peer"),
+        DeviceId::new("local-smoke-device"),
+        address,
+    )?;
+    let dispatcher = TransportCoreActionDispatcher::new(transport);
+
+    dispatcher.dispatch_core_actions(&loopback_transport_smoke_actions())?;
+
+    let (execution, injected_events, release_all_count) =
+        server_thread.join().map_err(|_| {
+            akraz_platform::PlatformError::new("peer session executor smoke server panicked")
+        })??;
+
+    Ok(PeerSessionExecutorSmokeReport::from_execution(
+        env!("CARGO_PKG_VERSION"),
+        &execution,
+        &injected_events,
+        release_all_count,
+    ))
+}
+
 fn loopback_transport_smoke_actions() -> [CoreAction; 4] {
     let crossing = EdgeCrossing {
         peer_id: PeerId::new("loopback-peer"),
@@ -321,6 +388,16 @@ struct PeerSessionSmokeReport {
     commands: Vec<LoopbackTransportSmokeCommand>,
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PeerSessionExecutorSmokeReport {
+    daemon_version: &'static str,
+    hello: PeerSessionSmokeHello,
+    outcomes: Vec<PeerSessionExecutorSmokeOutcome>,
+    injected_inputs: Vec<LoopbackTransportSmokeInputEvent>,
+    release_all_count: u64,
+}
+
 impl PeerSessionSmokeReport {
     fn from_session(daemon_version: &'static str, session: &PeerTransportSession) -> Self {
         Self {
@@ -336,6 +413,35 @@ impl PeerSessionSmokeReport {
                 .iter()
                 .map(LoopbackTransportSmokeCommand::from)
                 .collect(),
+        }
+    }
+}
+
+impl PeerSessionExecutorSmokeReport {
+    fn from_execution(
+        daemon_version: &'static str,
+        execution: &PeerTransportSessionExecution,
+        injected_events: &[InjectedInputEvent],
+        release_all_count: u64,
+    ) -> Self {
+        Self {
+            daemon_version,
+            hello: PeerSessionSmokeHello {
+                protocol_major: execution.hello.protocol.major,
+                protocol_minor: execution.hello.protocol.minor,
+                device_id: execution.hello.device_id.as_str().to_string(),
+                peer_id: execution.hello.peer_id.as_str().to_string(),
+            },
+            outcomes: execution
+                .outcomes
+                .iter()
+                .map(PeerSessionExecutorSmokeOutcome::from)
+                .collect(),
+            injected_inputs: injected_events
+                .iter()
+                .map(LoopbackTransportSmokeInputEvent::from)
+                .collect(),
+            release_all_count,
         }
     }
 }
@@ -369,6 +475,26 @@ enum LoopbackTransportSmokeCommand {
     },
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum PeerSessionExecutorSmokeOutcome {
+    RemoteSessionStarted {
+        peer_id: String,
+        crossing: Option<LoopbackTransportSmokeCrossing>,
+    },
+    InputForwarded {
+        event: LoopbackTransportSmokeInputEvent,
+    },
+    InputsReleased,
+    RemoteSessionStopped {
+        session_id: Option<String>,
+    },
+}
+
 impl From<&DaemonTransportCommand> for LoopbackTransportSmokeCommand {
     fn from(command: &DaemonTransportCommand) -> Self {
         match command {
@@ -387,6 +513,30 @@ impl From<&DaemonTransportCommand> for LoopbackTransportSmokeCommand {
                     .as_ref()
                     .map(|session_id| session_id.as_str().to_string()),
             },
+        }
+    }
+}
+
+impl From<&PeerTransportCommandExecution> for PeerSessionExecutorSmokeOutcome {
+    fn from(outcome: &PeerTransportCommandExecution) -> Self {
+        match outcome {
+            PeerTransportCommandExecution::RemoteSessionStarted { peer_id, crossing } => {
+                Self::RemoteSessionStarted {
+                    peer_id: peer_id.as_str().to_string(),
+                    crossing: crossing.as_ref().map(LoopbackTransportSmokeCrossing::from),
+                }
+            }
+            PeerTransportCommandExecution::InputForwarded { event } => Self::InputForwarded {
+                event: LoopbackTransportSmokeInputEvent::from(event),
+            },
+            PeerTransportCommandExecution::InputsReleased => Self::InputsReleased,
+            PeerTransportCommandExecution::RemoteSessionStopped { session_id } => {
+                Self::RemoteSessionStopped {
+                    session_id: session_id
+                        .as_ref()
+                        .map(|session_id| session_id.as_str().to_string()),
+                }
+            }
         }
     }
 }
@@ -495,6 +645,7 @@ enum DaemonCommand {
     LoopbackTransportSmoke,
     TcpTransportSmoke,
     PeerSessionSmoke,
+    PeerSessionExecutorSmoke,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -524,6 +675,9 @@ where
             reject_trailing_args(args, DaemonCommand::TcpTransportSmoke)
         }
         "--akraz-smoke-peer-session" => reject_trailing_args(args, DaemonCommand::PeerSessionSmoke),
+        "--akraz-smoke-peer-session-executor" => {
+            reject_trailing_args(args, DaemonCommand::PeerSessionExecutorSmoke)
+        }
         "--serve" => parse_serve_options(args),
         argument
             if argument.starts_with("--endpoint")
@@ -656,8 +810,8 @@ mod tests {
     use super::{
         DaemonCommand, DaemonUsageError, LoopbackTransportSmokeCommand,
         LoopbackTransportSmokeInputEvent, ServeOptions, build_loopback_transport_smoke_report,
-        build_peer_session_smoke_report, build_tcp_transport_smoke_report, format_daemon_ipc_error,
-        parse_daemon_command,
+        build_peer_session_executor_smoke_report, build_peer_session_smoke_report,
+        build_tcp_transport_smoke_report, format_daemon_ipc_error, parse_daemon_command,
     };
 
     #[test]
@@ -799,6 +953,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_hidden_peer_session_executor_smoke_command() {
+        assert_eq!(
+            parse_daemon_command(["--akraz-smoke-peer-session-executor"].map(String::from)),
+            Ok(DaemonCommand::PeerSessionExecutorSmoke)
+        );
+        assert_eq!(
+            parse_daemon_command(
+                ["--akraz-smoke-peer-session-executor", "--once"].map(String::from)
+            ),
+            Err(DaemonUsageError::UnknownArgument("--once".to_string()))
+        );
+    }
+
+    #[test]
     fn loopback_transport_smoke_report_covers_transport_commands() {
         let report =
             build_loopback_transport_smoke_report().expect("loopback transport smoke report");
@@ -903,6 +1071,28 @@ mod tests {
                 session_id: Some(session_id),
             } if session_id == "loopback-session"
         ));
+    }
+
+    #[test]
+    fn peer_session_executor_smoke_report_covers_platform_execution() {
+        let report =
+            build_peer_session_executor_smoke_report().expect("peer session executor smoke report");
+
+        assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(report.hello.protocol_major, 1);
+        assert_eq!(report.hello.protocol_minor, 0);
+        assert_eq!(report.hello.device_id, "local-smoke-device");
+        assert_eq!(report.hello.peer_id, "loopback-peer");
+        assert_eq!(report.outcomes.len(), 4);
+        assert_eq!(report.injected_inputs.len(), 1);
+        assert_eq!(
+            report.injected_inputs[0],
+            LoopbackTransportSmokeInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }
+        );
+        assert_eq!(report.release_all_count, 1);
     }
 
     #[test]

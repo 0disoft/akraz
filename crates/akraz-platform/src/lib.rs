@@ -10,8 +10,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use akraz_core::{
-    CapturedInputEvent, LogicalPoint, LogicalRect, LogicalSize, MouseButton, PhysicalKey,
-    PressState,
+    CapturedInputEvent, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize, MouseButton,
+    PhysicalKey, PressState,
 };
 
 #[cfg(windows)]
@@ -226,6 +226,14 @@ pub trait PlatformAdapter {
         )))
     }
 
+    /// Inject one normalized input event into the local desktop.
+    fn inject_input(&self, _event: &InjectedInputEvent) -> Result<(), PlatformError> {
+        Err(PlatformError::new(format!(
+            "{} input injection is not available",
+            self.name()
+        )))
+    }
+
     /// Release all currently pressed keys and buttons known to the adapter.
     fn release_all(&self) -> Result<(), PlatformError>;
 }
@@ -276,6 +284,15 @@ impl PlatformAdapter for RuntimePlatformAdapter {
             Self::Windows(adapter) => adapter.start_input_capture(config),
             #[cfg(not(windows))]
             Self::Unsupported(adapter) => adapter.start_input_capture(config),
+        }
+    }
+
+    fn inject_input(&self, event: &InjectedInputEvent) -> Result<(), PlatformError> {
+        match self {
+            #[cfg(windows)]
+            Self::Windows(adapter) => adapter.inject_input(event),
+            #[cfg(not(windows))]
+            Self::Unsupported(adapter) => adapter.inject_input(event),
         }
     }
 
@@ -334,6 +351,10 @@ impl PlatformAdapter for WindowsPlatformAdapter {
         config: InputCaptureConfig,
     ) -> Result<InputCaptureSession, PlatformError> {
         start_windows_input_capture(config)
+    }
+
+    fn inject_input(&self, event: &InjectedInputEvent) -> Result<(), PlatformError> {
+        inject_windows_input(event)
     }
 
     fn release_all(&self) -> Result<(), PlatformError> {
@@ -787,12 +808,32 @@ fn windows_keyboard_hook_data(lparam: LPARAM) -> Option<KBDLLHOOKSTRUCT> {
 
 #[cfg(windows)]
 fn can_send_zero_delta_mouse_input() -> bool {
+    send_windows_mouse_move(0, 0).is_ok()
+}
+
+#[cfg(windows)]
+fn inject_windows_input(event: &InjectedInputEvent) -> Result<(), PlatformError> {
+    match event {
+        InjectedInputEvent::PointerMoved { delta_x, delta_y } => {
+            send_windows_mouse_move(*delta_x, *delta_y)
+        }
+        InjectedInputEvent::Key { .. } => Err(PlatformError::new(
+            "windows keyboard injection is not implemented yet",
+        )),
+        InjectedInputEvent::MouseButton { .. } => Err(PlatformError::new(
+            "windows mouse button injection is not implemented yet",
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn send_windows_mouse_move(delta_x: i32, delta_y: i32) -> Result<(), PlatformError> {
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
             mi: MOUSEINPUT {
-                dx: 0,
-                dy: 0,
+                dx: delta_x,
+                dy: delta_y,
                 mouseData: 0,
                 dwFlags: MOUSEEVENTF_MOVE,
                 time: 0,
@@ -804,7 +845,11 @@ fn can_send_zero_delta_mouse_input() -> bool {
     // SAFETY: input points to one initialized INPUT value and cbSize matches the INPUT ABI size.
     let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
 
-    sent == 1
+    if sent == 1 {
+        Ok(())
+    } else {
+        Err(PlatformError::new("failed to send Windows mouse input"))
+    }
 }
 
 /// Adapter used on operating systems that do not have an implementation yet.
@@ -841,6 +886,7 @@ pub struct FakePlatformAdapter {
     capabilities: PlatformCapabilities,
     desktop_geometry: DesktopGeometry,
     captured_events: Vec<CapturedInputEvent>,
+    injected_events: Mutex<Vec<InjectedInputEvent>>,
     release_all_count: Mutex<u64>,
 }
 
@@ -851,6 +897,7 @@ impl FakePlatformAdapter {
             capabilities,
             desktop_geometry: fake_desktop_geometry(),
             captured_events: Vec::new(),
+            injected_events: Mutex::new(Vec::new()),
             release_all_count: Mutex::new(0),
         }
     }
@@ -878,6 +925,14 @@ impl FakePlatformAdapter {
             .map_err(|_| PlatformError::new("fake platform release counter lock was poisoned"))?;
 
         Ok(*count)
+    }
+
+    /// Return the input events requested through `inject_input`.
+    pub fn injected_events(&self) -> Result<Vec<InjectedInputEvent>, PlatformError> {
+        self.injected_events
+            .lock()
+            .map_err(|_| PlatformError::new("fake platform injection log lock was poisoned"))
+            .map(|events| events.clone())
     }
 }
 
@@ -910,6 +965,15 @@ impl PlatformAdapter for FakePlatformAdapter {
         ))
     }
 
+    fn inject_input(&self, event: &InjectedInputEvent) -> Result<(), PlatformError> {
+        self.injected_events
+            .lock()
+            .map_err(|_| PlatformError::new("fake platform injection log lock was poisoned"))?
+            .push(event.clone());
+
+        Ok(())
+    }
+
     fn release_all(&self) -> Result<(), PlatformError> {
         let mut count = self
             .release_all_count
@@ -939,7 +1003,8 @@ mod tests {
     use std::sync::mpsc::TryRecvError;
 
     use akraz_core::{
-        CapturedInputEvent, LogicalPoint, LogicalRect, LogicalSize, PhysicalKey, PressState,
+        CapturedInputEvent, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize,
+        PhysicalKey, PressState,
     };
 
     use super::{
@@ -1053,6 +1118,27 @@ mod tests {
             })
         );
         assert_eq!(session.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn fake_adapter_records_injected_input_events() {
+        let adapter = FakePlatformAdapter::default();
+
+        assert_eq!(
+            adapter.inject_input(&InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }),
+            Ok(())
+        );
+
+        assert_eq!(
+            adapter.injected_events().expect("fake injected events"),
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }]
+        );
     }
 
     #[test]
