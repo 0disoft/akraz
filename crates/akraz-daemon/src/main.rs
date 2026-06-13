@@ -3,7 +3,10 @@ use std::fmt::{Display, Formatter};
 use std::process::ExitCode;
 
 use akraz_core::RuntimeInputState;
-use akraz_daemon::{DaemonIpcRunConfig, DaemonIpcServer, build_daemon_status, serve_daemon_ipc};
+use akraz_daemon::{
+    DaemonInputCaptureConfig, DaemonInputCaptureWorker, DaemonIpcRunConfig, DaemonIpcServer,
+    build_daemon_status, serve_daemon_ipc, start_daemon_input_capture,
+};
 use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
 use akraz_platform::runtime_platform_adapter;
 
@@ -45,14 +48,49 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
     } else {
         DaemonIpcRunConfig::serve_forever(endpoint)
     };
-    let server = DaemonIpcServer::new(RuntimeInputState::new(), runtime_platform_adapter());
+    let platform = runtime_platform_adapter();
+    let server = DaemonIpcServer::new(RuntimeInputState::new(), platform);
+    let capture_worker = if options.capture_input {
+        match start_daemon_input_capture(
+            server.shared_state(),
+            &platform,
+            DaemonInputCaptureConfig::default(),
+        ) {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                eprintln!("failed to start daemon input capture: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
 
     eprintln!("akraz-daemon listening at {}", config.endpoint());
-    match serve_daemon_ipc(&config, &server) {
-        Ok(()) => ExitCode::SUCCESS,
+    let result = match serve_daemon_ipc(&config, &server) {
+        Ok(()) => Ok(()),
         Err(error) => {
             eprintln!("{}", format_daemon_ipc_error(&error));
-            ExitCode::FAILURE
+            Err(())
+        }
+    };
+
+    match stop_capture_worker(capture_worker) {
+        Ok(()) if result.is_ok() => ExitCode::SUCCESS,
+        Ok(()) | Err(()) => ExitCode::FAILURE,
+    }
+}
+
+fn stop_capture_worker(worker: Option<DaemonInputCaptureWorker>) -> Result<(), ()> {
+    let Some(worker) = worker else {
+        return Ok(());
+    };
+
+    match worker.stop() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            eprintln!("failed to stop daemon input capture: {error}");
+            Err(())
         }
     }
 }
@@ -98,6 +136,7 @@ enum DaemonCommand {
 struct ServeOptions {
     endpoint: Option<IpcEndpoint>,
     once: bool,
+    capture_input: bool,
 }
 
 fn parse_daemon_command<I>(args: I) -> Result<DaemonCommand, DaemonUsageError>
@@ -113,7 +152,11 @@ where
         "--version" | "-V" => reject_trailing_args(args, DaemonCommand::Version),
         "--status" => reject_trailing_args(args, DaemonCommand::Status),
         "--serve" => parse_serve_options(args),
-        argument if argument.starts_with("--endpoint") || argument == "--once" => {
+        argument
+            if argument.starts_with("--endpoint")
+                || argument == "--once"
+                || argument == "--capture-input" =>
+        {
             parse_serve_options(std::iter::once(first).chain(args))
         }
         argument => Err(DaemonUsageError::UnknownArgument(argument.to_string())),
@@ -145,6 +188,8 @@ where
     while let Some(argument) = args.next() {
         if argument == "--once" {
             options.once = true;
+        } else if argument == "--capture-input" {
+            options.capture_input = true;
         } else if let Some(value) = argument.strip_prefix("--endpoint=") {
             options.endpoint = Some(IpcEndpoint::manual(value).map_err(DaemonUsageError::from)?);
         } else if argument == "--endpoint" {
@@ -197,15 +242,23 @@ mod tests {
             Ok(DaemonCommand::Serve(ServeOptions {
                 endpoint: None,
                 once: false,
+                capture_input: false,
             }))
         );
     }
 
     #[test]
-    fn parses_serve_endpoint_and_once_options() {
+    fn parses_serve_endpoint_once_and_capture_options() {
         assert_eq!(
             parse_daemon_command(
-                ["--serve", "--endpoint", "local-test", "--once"].map(String::from)
+                [
+                    "--serve",
+                    "--endpoint",
+                    "local-test",
+                    "--once",
+                    "--capture-input"
+                ]
+                .map(String::from)
             ),
             Ok(DaemonCommand::Serve(ServeOptions {
                 endpoint: Some(IpcEndpoint {
@@ -213,16 +266,20 @@ mod tests {
                     address: "local-test".to_string(),
                 }),
                 once: true,
+                capture_input: true,
             }))
         );
         assert_eq!(
-            parse_daemon_command(["--endpoint=local-test", "--once"].map(String::from)),
+            parse_daemon_command(
+                ["--endpoint=local-test", "--once", "--capture-input"].map(String::from)
+            ),
             Ok(DaemonCommand::Serve(ServeOptions {
                 endpoint: Some(IpcEndpoint {
                     kind: IpcEndpointKind::Manual,
                     address: "local-test".to_string(),
                 }),
                 once: true,
+                capture_input: true,
             }))
         );
     }

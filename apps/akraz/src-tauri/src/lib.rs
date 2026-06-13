@@ -19,7 +19,10 @@ use tauri_plugin_shell::{
 
 const LOCAL_REQUEST_ID: &str = "tauri";
 const DAEMON_PATH_ENV: &str = "AKRAZ_DAEMON_PATH";
+const DAEMON_CAPTURE_INPUT_ENV: &str = "AKRAZ_DAEMON_CAPTURE_INPUT";
 const DAEMON_SIDECAR_NAME: &str = "akraz-daemon";
+const DAEMON_SERVE_ARG: &str = "--serve";
+const DAEMON_CAPTURE_INPUT_ARG: &str = "--capture-input";
 const DAEMON_LIFECYCLE_SMOKE_FLAG: &str = "--akraz-smoke-daemon-lifecycle";
 const DAEMON_START_RETRIES: usize = 50;
 const DAEMON_START_RETRY_DELAY: Duration = Duration::from_millis(40);
@@ -471,14 +474,14 @@ fn spawn_sidecar_daemon_process(
     app.shell()
         .sidecar(DAEMON_SIDECAR_NAME)
         .map_err(|error| error.to_string())?
-        .args(["--serve"])
+        .args(daemon_spawn_args())
         .spawn()
         .map_err(|error| error.to_string())
 }
 
 fn spawn_os_daemon_process(executable: &PathBuf) -> Result<Child, String> {
     StdCommand::new(executable)
-        .arg("--serve")
+        .args(daemon_spawn_args())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -489,6 +492,28 @@ fn spawn_os_daemon_process(executable: &PathBuf) -> Result<Child, String> {
                 executable.display()
             )
         })
+}
+
+fn daemon_spawn_args() -> Vec<&'static str> {
+    daemon_spawn_args_from(std::env::var_os(DAEMON_CAPTURE_INPUT_ENV))
+}
+
+fn daemon_spawn_args_from(capture_input: Option<OsString>) -> Vec<&'static str> {
+    let mut args = vec![DAEMON_SERVE_ARG];
+    if daemon_capture_input_enabled_from(capture_input) {
+        args.push(DAEMON_CAPTURE_INPUT_ARG);
+    }
+
+    args
+}
+
+fn daemon_capture_input_enabled_from(value: Option<OsString>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let normalized = value.to_string_lossy().trim().to_ascii_lowercase();
+
+    matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
 }
 
 fn watch_sidecar_termination(managed: ManagedDaemon, pid: u32, mut events: Receiver<CommandEvent>) {
@@ -616,9 +641,11 @@ mod tests {
     };
 
     use super::{
-        DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_SIDECAR_NAME, DaemonLifecyclePhase,
-        classify_daemon_call_error, daemon_executable_name, parse_daemon_status_response,
-        resolve_env_daemon_executable_from, should_run_daemon_lifecycle_smoke,
+        DAEMON_CAPTURE_INPUT_ARG, DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_SERVE_ARG,
+        DAEMON_SIDECAR_NAME, DaemonLifecyclePhase, classify_daemon_call_error,
+        daemon_capture_input_enabled_from, daemon_executable_name, daemon_spawn_args_from,
+        parse_daemon_status_response, resolve_env_daemon_executable_from,
+        should_run_daemon_lifecycle_smoke,
     };
 
     fn status_fixture() -> DaemonStatus {
@@ -747,6 +774,30 @@ mod tests {
         assert_eq!(
             resolve_env_daemon_executable_from(Some(OsString::from("custom-daemon"))),
             Some(PathBuf::from("custom-daemon"))
+        );
+    }
+
+    #[test]
+    fn daemon_capture_input_env_accepts_explicit_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(daemon_capture_input_enabled_from(Some(OsString::from(
+                value
+            ))));
+        }
+        for value in ["", "0", "false", "no", "off", "maybe"] {
+            assert!(!daemon_capture_input_enabled_from(Some(OsString::from(
+                value
+            ))));
+        }
+        assert!(!daemon_capture_input_enabled_from(None));
+    }
+
+    #[test]
+    fn daemon_spawn_args_include_capture_only_when_enabled() {
+        assert_eq!(daemon_spawn_args_from(None), vec![DAEMON_SERVE_ARG]);
+        assert_eq!(
+            daemon_spawn_args_from(Some(OsString::from("1"))),
+            vec![DAEMON_SERVE_ARG, DAEMON_CAPTURE_INPUT_ARG]
         );
     }
 }

@@ -2,22 +2,33 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::mpsc::TryRecvError;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use akraz_core::{CoreAction, CoreTransitionError, RuntimeEvent, RuntimeInputState};
+use akraz_core::{
+    CapturedInputEvent, CoreAction, CoreTransitionError, RuntimeEvent, RuntimeInputState,
+};
 use akraz_ipc::{
     DaemonStatus, IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError,
     JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PermissionIssue,
     PermissionsProbe, ProtocolVersionSnapshot, parse_request_line, serve_os_local_ipc_once,
     to_json_line,
 };
-use akraz_platform::{InputCaptureSession, PlatformAdapter, PlatformError};
+use akraz_platform::{InputCaptureConfig, InputCaptureSession, PlatformAdapter, PlatformError};
 use akraz_protocol::ProtocolVersion;
 
 /// Current daemon package version.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const JSONRPC_DAEMON_ERROR: i32 = -32000;
+const DEFAULT_CAPTURE_DRAIN_BATCH_SIZE: usize = 64;
+const DEFAULT_CAPTURE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Shared daemon runtime state observed by IPC and capture workers.
+pub type SharedRuntimeInputState = Arc<Mutex<RuntimeInputState>>;
 
 /// Daemon OS IPC serving configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,14 +63,24 @@ impl DaemonIpcRunConfig {
 /// In-process local IPC server backed by daemon runtime state.
 #[derive(Debug)]
 pub struct DaemonIpcServer<P> {
-    state: RuntimeInputState,
+    state: SharedRuntimeInputState,
     platform: P,
 }
 
 impl<P> DaemonIpcServer<P> {
     /// Create an in-process daemon IPC server.
     pub fn new(state: RuntimeInputState, platform: P) -> Self {
+        Self::from_shared_state(shared_runtime_state(state), platform)
+    }
+
+    /// Create an in-process daemon IPC server from shared runtime state.
+    pub fn from_shared_state(state: SharedRuntimeInputState, platform: P) -> Self {
         Self { state, platform }
+    }
+
+    /// Return the runtime state shared by daemon background workers.
+    pub fn shared_state(&self) -> SharedRuntimeInputState {
+        Arc::clone(&self.state)
     }
 }
 
@@ -68,9 +89,18 @@ where
     P: PlatformAdapter,
 {
     fn handle_request_line(&self, request_line: &str) -> Result<String, IpcTransportError> {
-        handle_ipc_request_line(&self.state, &self.platform, request_line)
+        let state = self.state.lock().map_err(|_| {
+            IpcTransportError::request_failed("daemon runtime state is unavailable")
+        })?;
+
+        handle_ipc_request_line(&state, &self.platform, request_line)
             .map_err(|error| IpcTransportError::request_failed(error.to_string()))
     }
+}
+
+/// Build daemon runtime state shared by IPC and background workers.
+pub fn shared_runtime_state(state: RuntimeInputState) -> SharedRuntimeInputState {
+    Arc::new(Mutex::new(state))
 }
 
 /// Serve daemon IPC requests on an OS-backed endpoint.
@@ -112,6 +142,149 @@ pub fn drain_capture_events(
     }
 
     Ok(actions)
+}
+
+/// Configuration for the daemon capture worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonInputCaptureConfig {
+    pub input_capture: InputCaptureConfig,
+    pub drain_batch_size: usize,
+    pub idle_poll_interval: Duration,
+}
+
+impl DaemonInputCaptureConfig {
+    fn bounded_drain_batch_size(self) -> usize {
+        self.drain_batch_size.max(1)
+    }
+
+    fn bounded_idle_poll_interval(self) -> Duration {
+        if self.idle_poll_interval.is_zero() {
+            DEFAULT_CAPTURE_IDLE_POLL_INTERVAL
+        } else {
+            self.idle_poll_interval
+        }
+    }
+}
+
+impl Default for DaemonInputCaptureConfig {
+    fn default() -> Self {
+        Self {
+            input_capture: InputCaptureConfig::default(),
+            drain_batch_size: DEFAULT_CAPTURE_DRAIN_BATCH_SIZE,
+            idle_poll_interval: DEFAULT_CAPTURE_IDLE_POLL_INTERVAL,
+        }
+    }
+}
+
+/// Background worker that drains captured platform input into daemon runtime state.
+pub struct DaemonInputCaptureWorker {
+    running: Arc<AtomicBool>,
+    thread: Option<JoinHandle<Result<(), PlatformError>>>,
+}
+
+impl DaemonInputCaptureWorker {
+    fn new(running: Arc<AtomicBool>, thread: JoinHandle<Result<(), PlatformError>>) -> Self {
+        Self {
+            running,
+            thread: Some(thread),
+        }
+    }
+
+    /// Stop the capture worker and wait for its resources to exit.
+    pub fn stop(mut self) -> Result<(), PlatformError> {
+        self.stop_inner()
+    }
+
+    fn stop_inner(&mut self) -> Result<(), PlatformError> {
+        self.running.store(false, Ordering::Release);
+
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+
+        match thread.join() {
+            Ok(result) => result,
+            Err(_) => Err(PlatformError::new("daemon input capture worker panicked")),
+        }
+    }
+}
+
+impl Drop for DaemonInputCaptureWorker {
+    fn drop(&mut self) {
+        let _ = self.stop_inner();
+    }
+}
+
+/// Start daemon input capture and continuously drain events into shared runtime state.
+pub fn start_daemon_input_capture(
+    state: SharedRuntimeInputState,
+    platform: &impl PlatformAdapter,
+    config: DaemonInputCaptureConfig,
+) -> Result<DaemonInputCaptureWorker, PlatformError> {
+    let capture = platform.start_input_capture(config.input_capture)?;
+    let running = Arc::new(AtomicBool::new(true));
+    let worker_running = Arc::clone(&running);
+    let thread = thread::Builder::new()
+        .name("akraz-daemon-input-capture".to_string())
+        .spawn(move || run_daemon_input_capture_worker(state, capture, worker_running, config))
+        .map_err(|error| {
+            PlatformError::new(format!(
+                "failed to start daemon input capture worker: {error}"
+            ))
+        })?;
+
+    Ok(DaemonInputCaptureWorker::new(running, thread))
+}
+
+fn run_daemon_input_capture_worker(
+    state: SharedRuntimeInputState,
+    capture: InputCaptureSession,
+    running: Arc<AtomicBool>,
+    config: DaemonInputCaptureConfig,
+) -> Result<(), PlatformError> {
+    let idle_poll_interval = config.bounded_idle_poll_interval();
+
+    while running.load(Ordering::Acquire) {
+        match capture.recv_timeout(idle_poll_interval) {
+            Ok(event) => {
+                apply_captured_input_event(&state, event)?;
+                drain_ready_capture_events(&state, &capture, config.bounded_drain_batch_size())?;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+
+    capture.stop()
+}
+
+fn drain_ready_capture_events(
+    state: &SharedRuntimeInputState,
+    capture: &InputCaptureSession,
+    max_events: usize,
+) -> Result<Vec<CoreAction>, PlatformError> {
+    let mut state = state
+        .lock()
+        .map_err(|_| PlatformError::new("daemon runtime state is unavailable"))?;
+
+    drain_capture_events(&mut state, capture, max_events).map_err(capture_transition_error)
+}
+
+fn apply_captured_input_event(
+    state: &SharedRuntimeInputState,
+    event: CapturedInputEvent,
+) -> Result<Vec<CoreAction>, PlatformError> {
+    let mut state = state
+        .lock()
+        .map_err(|_| PlatformError::new("daemon runtime state is unavailable"))?;
+
+    state
+        .apply_event(RuntimeEvent::Input(event))
+        .map_err(capture_transition_error)
+}
+
+fn capture_transition_error(error: CoreTransitionError) -> PlatformError {
+    PlatformError::new(format!("failed to apply captured input: {error}"))
 }
 
 /// Error returned while encoding a daemon IPC response.
@@ -272,8 +445,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DAEMON_VERSION, DaemonIpcRunConfig, DaemonIpcServer, build_daemon_status,
-        build_permissions_probe, drain_capture_events, handle_ipc_request_line, serve_daemon_ipc,
+        DAEMON_VERSION, DaemonInputCaptureConfig, DaemonIpcRunConfig, DaemonIpcServer,
+        build_daemon_status, build_permissions_probe, drain_capture_events,
+        handle_ipc_request_line, serve_daemon_ipc, shared_runtime_state,
+        start_daemon_input_capture,
     };
 
     fn status_or_panic(
@@ -388,32 +563,33 @@ mod tests {
 
     #[test]
     fn drain_capture_events_applies_bounded_input_to_core_state() {
-        let platform = FakePlatformAdapter::default().with_captured_events(vec![
-            CapturedInputEvent::Key {
+        let press_platform =
+            FakePlatformAdapter::default().with_captured_events(vec![CapturedInputEvent::Key {
                 key: PhysicalKey::LeftShift,
                 state: PressState::Pressed,
-            },
-            CapturedInputEvent::Key {
+            }]);
+        let release_platform =
+            FakePlatformAdapter::default().with_captured_events(vec![CapturedInputEvent::Key {
                 key: PhysicalKey::LeftShift,
                 state: PressState::Released,
-            },
-        ]);
-        let capture = platform
-            .start_input_capture(InputCaptureConfig {
-                event_buffer_capacity: 8,
-            })
-            .expect("fake capture session");
+            }]);
+        let press_capture = press_platform
+            .start_input_capture(InputCaptureConfig::default())
+            .expect("fake press capture session");
+        let release_capture = release_platform
+            .start_input_capture(InputCaptureConfig::default())
+            .expect("fake release capture session");
         let mut state = RuntimeInputState::new();
 
         let first_actions =
-            drain_capture_events(&mut state, &capture, 1).expect("first capture drain");
+            drain_capture_events(&mut state, &press_capture, 1).expect("first capture drain");
 
         assert!(first_actions.is_empty());
         assert!(state.pressed_keys().contains(&PhysicalKey::LeftShift));
         assert!(state.modifiers().left_shift);
 
         let second_actions =
-            drain_capture_events(&mut state, &capture, 8).expect("second capture drain");
+            drain_capture_events(&mut state, &release_capture, 1).expect("second capture drain");
 
         assert!(second_actions.is_empty());
         assert!(!state.pressed_keys().contains(&PhysicalKey::LeftShift));
@@ -466,6 +642,77 @@ mod tests {
 
         assert_eq!(response.id, "req_1");
         assert_eq!(response.result.daemon_version, DAEMON_VERSION);
+    }
+
+    #[test]
+    fn daemon_ipc_server_reads_shared_runtime_state() {
+        let state = shared_runtime_state(RuntimeInputState::new());
+        let server =
+            DaemonIpcServer::from_shared_state(state.clone(), FakePlatformAdapter::default());
+        {
+            let mut state = state.lock().expect("runtime state lock");
+            state
+                .apply_event(akraz_core::RuntimeEvent::RemoteEntryRequested {
+                    peer_id: akraz_core::PeerId::new("right-peer"),
+                })
+                .expect("remote entry request");
+        }
+        let request =
+            JsonRpcRequest::new("req_1", METHOD_DAEMON_STATUS, DaemonStatusParams::default());
+        let request_line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        let response_line = match server.handle_request_line(&request_line) {
+            Ok(line) => line,
+            Err(error) => panic!("expected daemon server response: {error}"),
+        };
+        let response: JsonRpcSuccess<DaemonStatus> = match serde_json::from_str(&response_line) {
+            Ok(response) => response,
+            Err(error) => panic!("expected daemon status response JSON: {error}"),
+        };
+
+        assert_eq!(response.result.mode, ControlModeSnapshot::EnteringRemote);
+    }
+
+    #[test]
+    fn daemon_input_capture_worker_drains_events_into_shared_state() {
+        let platform =
+            FakePlatformAdapter::default().with_captured_events(vec![CapturedInputEvent::Key {
+                key: PhysicalKey::LeftShift,
+                state: PressState::Pressed,
+            }]);
+        let state = shared_runtime_state(RuntimeInputState::new());
+
+        let worker = start_daemon_input_capture(
+            state.clone(),
+            &platform,
+            DaemonInputCaptureConfig {
+                input_capture: InputCaptureConfig {
+                    event_buffer_capacity: 8,
+                },
+                drain_batch_size: 8,
+                idle_poll_interval: std::time::Duration::from_millis(1),
+            },
+        )
+        .expect("daemon capture worker");
+
+        for _ in 0..20 {
+            let state = state.lock().expect("runtime state lock");
+            if state.pressed_keys().contains(&PhysicalKey::LeftShift)
+                && state.modifiers().left_shift
+            {
+                drop(state);
+                worker.stop().expect("stop capture worker");
+                return;
+            }
+            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        worker.stop().expect("stop capture worker");
+        panic!("expected capture worker to drain preloaded key events");
     }
 
     #[cfg(any(unix, windows))]
