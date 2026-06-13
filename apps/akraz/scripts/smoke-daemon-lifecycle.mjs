@@ -8,7 +8,23 @@ const appRoot = dirname(scriptDir);
 const workspaceRoot = join(appRoot, "..", "..");
 const appPackage = JSON.parse(readFileSync(join(appRoot, "package.json"), "utf8"));
 const extension = process.platform === "win32" ? ".exe" : "";
-const smokeFlag = "--akraz-smoke-daemon-lifecycle";
+const smokeProfiles = {
+  lifecycle: {
+    flag: "--akraz-smoke-daemon-lifecycle",
+    label: "daemon lifecycle smoke",
+    expectSettings: false,
+  },
+  "settings-start": {
+    flag: "--akraz-smoke-settings-start",
+    label: "daemon settings start smoke",
+    expectSettings: true,
+  },
+};
+const smokeMode = process.argv[2] ?? "lifecycle";
+const smokeProfile = smokeProfiles[smokeMode];
+if (!smokeProfile) {
+  throw new Error(`unknown daemon smoke mode: ${smokeMode}`);
+}
 const configuredApp = process.env.AKRAZ_SMOKE_APP;
 const appExecutable = configuredApp || join(workspaceRoot, "target", "debug", `akraz${extension}`);
 
@@ -27,7 +43,7 @@ if (configuredApp) {
   });
 }
 
-const smoke = spawnSync(appExecutable, [smokeFlag], {
+const smoke = spawnSync(appExecutable, [smokeProfile.flag], {
   cwd: workspaceRoot,
   encoding: "utf8",
 });
@@ -42,30 +58,53 @@ if (smoke.error) {
   throw smoke.error;
 }
 if (smoke.status !== 0) {
-  throw new Error(`daemon lifecycle smoke failed with exit code ${smoke.status}`);
+  throw new Error(`${smokeProfile.label} failed with exit code ${smoke.status}`);
 }
 
 const reportLine = smoke.stdout.split(/\r?\n/).findLast((line) => line.trimStart().startsWith("{"));
 if (!reportLine) {
-  throw new Error("daemon lifecycle smoke did not emit a JSON report");
+  throw new Error(`${smokeProfile.label} did not emit a JSON report`);
 }
 
 const report = JSON.parse(reportLine);
 assertPhase(report.initial?.phase, "not_running", "initial");
 assertPhase(report.started?.phase, "running", "started");
 assertPhase(report.stopped?.phase, "not_running", "stopped");
+if (smokeProfile.expectSettings) {
+  assertSettings(report.settings);
+}
 
 const daemonVersion = report.started?.status?.daemonVersion;
 if (daemonVersion !== appPackage.version) {
   throw new Error(
-    `daemon lifecycle smoke returned daemon version ${daemonVersion}, expected ${appPackage.version}`,
+    `${smokeProfile.label} returned daemon version ${daemonVersion}, expected ${appPackage.version}`,
   );
 }
 
-console.log("Daemon lifecycle smoke passed.");
+console.log(`${smokeProfile.label[0].toUpperCase()}${smokeProfile.label.slice(1)} passed.`);
 
 function assertPhase(actual, expected, label) {
   if (actual !== expected) {
-    throw new Error(`daemon lifecycle smoke expected ${label} phase ${expected}, got ${actual}`);
+    throw new Error(`${smokeProfile.label} expected ${label} phase ${expected}, got ${actual}`);
+  }
+}
+
+function assertSettings(settings) {
+  if (!settings) {
+    throw new Error(`${smokeProfile.label} did not report saved settings`);
+  }
+  if (settings.captureInput !== true) {
+    throw new Error(`${smokeProfile.label} expected captureInput true`);
+  }
+  const [binding] = settings.edgeBindings ?? [];
+  if (!binding || settings.edgeBindings.length !== 1) {
+    throw new Error(`${smokeProfile.label} expected one edge binding`);
+  }
+  if (
+    binding.localEdge !== "right" ||
+    binding.peerId !== "linux-laptop" ||
+    binding.remoteEdge !== "left"
+  ) {
+    throw new Error(`${smokeProfile.label} reported unexpected edge binding`);
   }
 }

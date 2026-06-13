@@ -28,6 +28,7 @@ const DAEMON_SERVE_ARG: &str = "--serve";
 const DAEMON_CAPTURE_INPUT_ARG: &str = "--capture-input";
 const DAEMON_EDGE_BINDING_ARG: &str = "--edge-binding";
 const DAEMON_LIFECYCLE_SMOKE_FLAG: &str = "--akraz-smoke-daemon-lifecycle";
+const DAEMON_SETTINGS_START_SMOKE_FLAG: &str = "--akraz-smoke-settings-start";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const DAEMON_START_RETRIES: usize = 50;
 const DAEMON_START_RETRY_DELAY: Duration = Duration::from_millis(40);
@@ -37,7 +38,11 @@ const DAEMON_STOP_RETRY_DELAY: Duration = Duration::from_millis(40);
 type ManagedDaemon = Arc<Mutex<DaemonProcessState>>;
 
 pub fn run() -> Result<(), String> {
-    if should_run_daemon_lifecycle_smoke(std::env::args_os().skip(1)) {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if has_exact_arg(&args, OsStr::new(DAEMON_SETTINGS_START_SMOKE_FLAG)) {
+        return run_daemon_settings_start_smoke();
+    }
+    if has_exact_arg(&args, OsStr::new(DAEMON_LIFECYCLE_SMOKE_FLAG)) {
         return run_daemon_lifecycle_smoke();
     }
 
@@ -61,13 +66,13 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
         ])
 }
 
-fn should_run_daemon_lifecycle_smoke<I>(args: I) -> bool
+fn has_exact_arg<I>(args: I, expected: &OsStr) -> bool
 where
     I: IntoIterator,
     I::Item: AsRef<OsStr>,
 {
     args.into_iter()
-        .any(|argument| argument.as_ref() == OsStr::new(DAEMON_LIFECYCLE_SMOKE_FLAG))
+        .any(|argument| argument.as_ref() == expected)
 }
 
 fn run_daemon_lifecycle_smoke() -> Result<(), String> {
@@ -110,6 +115,86 @@ fn run_daemon_lifecycle_smoke() -> Result<(), String> {
     Ok(())
 }
 
+fn run_daemon_settings_start_smoke() -> Result<(), String> {
+    let managed = Arc::new(Mutex::new(DaemonProcessState::default()));
+    let app = app_builder(Arc::clone(&managed))
+        .build(tauri::generate_context!())
+        .map_err(|error| format!("failed to initialize Akraz settings smoke app: {error}"))?;
+    let handle = app.handle().clone();
+    let initial = refresh_daemon_snapshot(&managed)?;
+    let mut report = DaemonLifecycleSmokeReport::new(initial.clone());
+
+    if initial.phase != DaemonLifecyclePhase::NotRunning {
+        print_smoke_report(&report)?;
+        return Err(format!(
+            "daemon settings smoke requires no existing daemon, but initial phase was {:?}",
+            initial.phase
+        ));
+    }
+
+    let settings_path = temp_settings_smoke_path();
+    let settings = settings_start_smoke_settings();
+    let saved_settings = save_settings_to_path(&settings_path, settings)?;
+    let loaded_settings = load_settings_from_path(&settings_path)?;
+    let _ = fs::remove_file(&settings_path);
+    if loaded_settings != saved_settings {
+        report.settings = Some(loaded_settings);
+        print_smoke_report(&report)?;
+        return Err(
+            "daemon settings smoke loaded settings did not match saved settings.".to_string(),
+        );
+    }
+    report.settings = Some(loaded_settings.clone());
+
+    let started = start_daemon(&handle, &managed, DaemonStartOptions::from(loaded_settings))?;
+    report.started = Some(started.clone());
+    if started.phase != DaemonLifecyclePhase::Running {
+        report.stopped = Some(stop_daemon(&managed)?);
+        print_smoke_report(&report)?;
+        return Err(format!(
+            "daemon settings smoke expected running after configured start, got {:?}",
+            started.phase
+        ));
+    }
+
+    let stopped = stop_daemon(&managed)?;
+    report.stopped = Some(stopped.clone());
+    print_smoke_report(&report)?;
+    if stopped.phase == DaemonLifecyclePhase::Running {
+        return Err(
+            "daemon settings smoke expected daemon to stop, but it is still running.".to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn settings_start_smoke_settings() -> AppSettings {
+    AppSettings {
+        capture_input: true,
+        edge_bindings: vec![DaemonEdgeBindingOption {
+            local_edge: DaemonScreenEdgeOption::Right,
+            peer_id: "linux-laptop".to_string(),
+            remote_edge: DaemonScreenEdgeOption::Left,
+        }],
+    }
+}
+
+fn temp_settings_smoke_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "akraz-settings-start-smoke-{}-{}.json",
+        std::process::id(),
+        monotonic_smoke_suffix()
+    ))
+}
+
+fn monotonic_smoke_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
 fn print_smoke_report(report: &DaemonLifecycleSmokeReport) -> Result<(), String> {
     let line = serde_json::to_string(report)
         .map_err(|error| format!("failed to encode daemon lifecycle smoke report: {error}"))?;
@@ -121,6 +206,8 @@ fn print_smoke_report(report: &DaemonLifecycleSmokeReport) -> Result<(), String>
 #[serde(rename_all = "camelCase")]
 struct DaemonLifecycleSmokeReport {
     initial: DaemonLifecycleSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settings: Option<AppSettings>,
     started: Option<DaemonLifecycleSnapshot>,
     stopped: Option<DaemonLifecycleSnapshot>,
 }
@@ -129,6 +216,7 @@ impl DaemonLifecycleSmokeReport {
     fn new(initial: DaemonLifecycleSnapshot) -> Self {
         Self {
             initial,
+            settings: None,
             started: None,
             stopped: None,
         }
@@ -250,6 +338,15 @@ struct DaemonStartOptions {
     capture_input: Option<bool>,
     #[serde(default)]
     edge_bindings: Vec<DaemonEdgeBindingOption>,
+}
+
+impl From<AppSettings> for DaemonStartOptions {
+    fn from(settings: AppSettings) -> Self {
+        Self {
+            capture_input: Some(settings.capture_input),
+            edge_bindings: settings.edge_bindings,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -807,7 +904,7 @@ fn lock_managed_daemon(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
     use akraz_ipc::{
@@ -817,12 +914,12 @@ mod tests {
 
     use super::{
         AppSettings, DAEMON_CAPTURE_INPUT_ARG, DAEMON_EDGE_BINDING_ARG,
-        DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_SERVE_ARG, DAEMON_SIDECAR_NAME,
-        DaemonEdgeBindingOption, DaemonLifecyclePhase, DaemonScreenEdgeOption, DaemonStartOptions,
-        classify_daemon_call_error, daemon_capture_input_enabled_from, daemon_executable_name,
-        daemon_spawn_args_from, format_edge_binding_arg, load_settings_from_path,
-        parse_daemon_status_response, resolve_env_daemon_executable_from, save_settings_to_path,
-        should_run_daemon_lifecycle_smoke,
+        DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_SERVE_ARG, DAEMON_SETTINGS_START_SMOKE_FLAG,
+        DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase, DaemonScreenEdgeOption,
+        DaemonStartOptions, classify_daemon_call_error, daemon_capture_input_enabled_from,
+        daemon_executable_name, daemon_spawn_args_from, format_edge_binding_arg, has_exact_arg,
+        load_settings_from_path, parse_daemon_status_response, resolve_env_daemon_executable_from,
+        save_settings_to_path, settings_start_smoke_settings,
     };
 
     fn status_fixture() -> DaemonStatus {
@@ -921,20 +1018,26 @@ mod tests {
     }
 
     #[test]
-    fn daemon_lifecycle_smoke_flag_is_explicit_and_hidden() {
-        assert!(should_run_daemon_lifecycle_smoke([OsString::from(
-            DAEMON_LIFECYCLE_SMOKE_FLAG
-        )]));
-        assert!(should_run_daemon_lifecycle_smoke([
-            OsString::from("--ordinary-open-argument"),
-            OsString::from(DAEMON_LIFECYCLE_SMOKE_FLAG)
-        ]));
-        assert!(!should_run_daemon_lifecycle_smoke([OsString::from(
-            "--smoke-daemon-lifecycle"
-        )]));
-        assert!(!should_run_daemon_lifecycle_smoke([OsString::from(
-            "document.akraz"
-        )]));
+    fn daemon_smoke_flags_are_explicit_and_hidden() {
+        assert!(has_exact_arg(
+            [OsString::from(DAEMON_LIFECYCLE_SMOKE_FLAG)],
+            OsStr::new(DAEMON_LIFECYCLE_SMOKE_FLAG)
+        ));
+        assert!(has_exact_arg(
+            [
+                OsString::from("--ordinary-open-argument"),
+                OsString::from(DAEMON_SETTINGS_START_SMOKE_FLAG)
+            ],
+            OsStr::new(DAEMON_SETTINGS_START_SMOKE_FLAG)
+        ));
+        assert!(!has_exact_arg(
+            [OsString::from("--smoke-daemon-lifecycle")],
+            OsStr::new(DAEMON_LIFECYCLE_SMOKE_FLAG)
+        ));
+        assert!(!has_exact_arg(
+            [OsString::from("document.akraz")],
+            OsStr::new(DAEMON_SETTINGS_START_SMOKE_FLAG)
+        ));
     }
 
     #[test]
@@ -1068,6 +1171,21 @@ mod tests {
         assert_eq!(
             save_settings_to_path(&path, settings),
             Err("edge binding peer id cannot contain ':'.".to_string())
+        );
+    }
+
+    #[test]
+    fn settings_start_smoke_settings_become_daemon_start_options() {
+        let options = DaemonStartOptions::from(settings_start_smoke_settings());
+
+        assert_eq!(
+            daemon_spawn_args_from(&options, None),
+            Ok(vec![
+                DAEMON_SERVE_ARG.to_string(),
+                DAEMON_CAPTURE_INPUT_ARG.to_string(),
+                DAEMON_EDGE_BINDING_ARG.to_string(),
+                "right:linux-laptop:left".to_string()
+            ])
         );
     }
 
