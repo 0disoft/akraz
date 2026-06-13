@@ -1,11 +1,12 @@
 //! Platform adapter contract shared by OS-specific akraz crates.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::Mutex;
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -36,8 +37,11 @@ use windows_sys::Win32::System::StationsAndDesktops::{
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT, SendInput, VK_LCONTROL, VK_LMENU,
-    VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VK_LCONTROL,
+    VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -239,7 +243,7 @@ pub trait PlatformAdapter {
 }
 
 /// Runtime platform adapter selected for the current operating system.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum RuntimePlatformAdapter {
     #[cfg(windows)]
     Windows(WindowsPlatformAdapter),
@@ -321,14 +325,16 @@ pub fn runtime_platform_adapter() -> RuntimePlatformAdapter {
 
 /// Windows platform adapter.
 #[cfg(windows)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WindowsPlatformAdapter;
+#[derive(Debug, Clone, Default)]
+pub struct WindowsPlatformAdapter {
+    injected_state: Arc<Mutex<WindowsInjectedInputState>>,
+}
 
 #[cfg(windows)]
 impl WindowsPlatformAdapter {
     /// Create the Windows platform adapter.
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -354,11 +360,11 @@ impl PlatformAdapter for WindowsPlatformAdapter {
     }
 
     fn inject_input(&self, event: &InjectedInputEvent) -> Result<(), PlatformError> {
-        inject_windows_input(event)
+        inject_windows_input(&self.injected_state, event)
     }
 
     fn release_all(&self) -> Result<(), PlatformError> {
-        Ok(())
+        release_all_windows_inputs(&self.injected_state)
     }
 }
 
@@ -393,7 +399,7 @@ fn windows_capabilities_from_probe_results(results: WindowsProbeResults) -> Plat
         can_capture_pointer: results.can_open_input_desktop && results.can_install_mouse_hook,
         can_capture_keyboard: results.can_open_input_desktop && results.can_install_keyboard_hook,
         can_inject_pointer: results.can_send_mouse_input,
-        can_inject_keyboard: false,
+        can_inject_keyboard: results.can_send_mouse_input,
     }
 }
 
@@ -812,18 +818,66 @@ fn can_send_zero_delta_mouse_input() -> bool {
 }
 
 #[cfg(windows)]
-fn inject_windows_input(event: &InjectedInputEvent) -> Result<(), PlatformError> {
+fn inject_windows_input(
+    injected_state: &Mutex<WindowsInjectedInputState>,
+    event: &InjectedInputEvent,
+) -> Result<(), PlatformError> {
     match event {
         InjectedInputEvent::PointerMoved { delta_x, delta_y } => {
             send_windows_mouse_move(*delta_x, *delta_y)
         }
-        InjectedInputEvent::Key { .. } => Err(PlatformError::new(
-            "windows keyboard injection is not implemented yet",
-        )),
-        InjectedInputEvent::MouseButton { .. } => Err(PlatformError::new(
-            "windows mouse button injection is not implemented yet",
-        )),
+        InjectedInputEvent::Key { key, state } => {
+            send_windows_keyboard_input(*key, *state)?;
+            update_windows_injected_state(injected_state, WindowsPressedInput::Key(*key), *state)
+        }
+        InjectedInputEvent::MouseButton { button, state } => {
+            send_windows_mouse_button_input(*button, *state)?;
+            update_windows_injected_state(
+                injected_state,
+                WindowsPressedInput::MouseButton(*button),
+                *state,
+            )
+        }
     }
+}
+
+#[cfg(windows)]
+fn release_all_windows_inputs(
+    injected_state: &Mutex<WindowsInjectedInputState>,
+) -> Result<(), PlatformError> {
+    let mut state = injected_state
+        .lock()
+        .map_err(|_| PlatformError::new("windows injected input state lock was poisoned"))?;
+
+    for input in state.release_sequence() {
+        match input {
+            WindowsPressedInput::Key(key) => send_windows_keyboard_input(key, PressState::Released),
+            WindowsPressedInput::MouseButton(button) => {
+                send_windows_mouse_button_input(button, PressState::Released)
+            }
+        }?;
+        state.mark_released(input);
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn update_windows_injected_state(
+    injected_state: &Mutex<WindowsInjectedInputState>,
+    input: WindowsPressedInput,
+    press_state: PressState,
+) -> Result<(), PlatformError> {
+    let mut state = injected_state
+        .lock()
+        .map_err(|_| PlatformError::new("windows injected input state lock was poisoned"))?;
+
+    match press_state {
+        PressState::Pressed => state.mark_pressed(input),
+        PressState::Released => state.mark_released(input),
+    }
+
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -849,6 +903,176 @@ fn send_windows_mouse_move(delta_x: i32, delta_y: i32) -> Result<(), PlatformErr
         Ok(())
     } else {
         Err(PlatformError::new("failed to send Windows mouse input"))
+    }
+}
+
+#[cfg(windows)]
+fn send_windows_keyboard_input(
+    key: PhysicalKey,
+    press_state: PressState,
+) -> Result<(), PlatformError> {
+    send_windows_input(
+        windows_input_for_keyboard(key, press_state),
+        "failed to send Windows keyboard input",
+    )
+}
+
+#[cfg(windows)]
+fn send_windows_mouse_button_input(
+    button: MouseButton,
+    press_state: PressState,
+) -> Result<(), PlatformError> {
+    send_windows_input(
+        windows_input_for_mouse_button(button, press_state)?,
+        "failed to send Windows mouse button input",
+    )
+}
+
+#[cfg(windows)]
+fn send_windows_input(input: INPUT, failure_message: &'static str) -> Result<(), PlatformError> {
+    // SAFETY: input points to one initialized INPUT value and cbSize matches the INPUT ABI size.
+    let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+
+    if sent == 1 {
+        Ok(())
+    } else {
+        Err(PlatformError::new(failure_message))
+    }
+}
+
+#[cfg(windows)]
+fn windows_input_for_keyboard(key: PhysicalKey, press_state: PressState) -> INPUT {
+    let (scan_code, extended) = windows_scan_code_for_physical_key(key);
+    let mut flags = KEYEVENTF_SCANCODE;
+    if press_state == PressState::Released {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    if extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: 0,
+                wScan: scan_code,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+#[cfg(windows)]
+fn windows_scan_code_for_physical_key(key: PhysicalKey) -> (u16, bool) {
+    match key {
+        PhysicalKey::LeftShift => (0x2a, false),
+        PhysicalKey::RightShift => (0x36, false),
+        PhysicalKey::LeftControl => (0x1d, false),
+        PhysicalKey::RightControl => (0x1d, true),
+        PhysicalKey::LeftAlt => (0x38, false),
+        PhysicalKey::RightAlt => (0x38, true),
+        PhysicalKey::LeftMeta => (0x5b, true),
+        PhysicalKey::RightMeta => (0x5c, true),
+        PhysicalKey::Code(code) => (code, false),
+    }
+}
+
+#[cfg(windows)]
+fn windows_input_for_mouse_button(
+    button: MouseButton,
+    press_state: PressState,
+) -> Result<INPUT, PlatformError> {
+    let (flags, mouse_data) = windows_mouse_button_flags(button, press_state)?;
+
+    Ok(INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: mouse_data,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    })
+}
+
+#[cfg(windows)]
+fn windows_mouse_button_flags(
+    button: MouseButton,
+    press_state: PressState,
+) -> Result<(u32, u32), PlatformError> {
+    let flags = match (button, press_state) {
+        (MouseButton::Left, PressState::Pressed) => MOUSEEVENTF_LEFTDOWN,
+        (MouseButton::Left, PressState::Released) => MOUSEEVENTF_LEFTUP,
+        (MouseButton::Right, PressState::Pressed) => MOUSEEVENTF_RIGHTDOWN,
+        (MouseButton::Right, PressState::Released) => MOUSEEVENTF_RIGHTUP,
+        (MouseButton::Middle, PressState::Pressed) => MOUSEEVENTF_MIDDLEDOWN,
+        (MouseButton::Middle, PressState::Released) => MOUSEEVENTF_MIDDLEUP,
+        (MouseButton::Back | MouseButton::Forward, PressState::Pressed) => MOUSEEVENTF_XDOWN,
+        (MouseButton::Back | MouseButton::Forward, PressState::Released) => MOUSEEVENTF_XUP,
+        (MouseButton::Other(_), _) => {
+            return Err(PlatformError::new(
+                "unsupported Windows mouse button for injection",
+            ));
+        }
+    };
+    let mouse_data = match button {
+        MouseButton::Back => XBUTTON1 as u32,
+        MouseButton::Forward => XBUTTON2 as u32,
+        _ => 0,
+    };
+
+    Ok((flags, mouse_data))
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsPressedInput {
+    Key(PhysicalKey),
+    MouseButton(MouseButton),
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct WindowsInjectedInputState {
+    pressed_keys: BTreeSet<PhysicalKey>,
+    pressed_buttons: BTreeSet<MouseButton>,
+    press_order: Vec<WindowsPressedInput>,
+}
+
+#[cfg(windows)]
+impl WindowsInjectedInputState {
+    fn mark_pressed(&mut self, input: WindowsPressedInput) {
+        let inserted = match input {
+            WindowsPressedInput::Key(key) => self.pressed_keys.insert(key),
+            WindowsPressedInput::MouseButton(button) => self.pressed_buttons.insert(button),
+        };
+
+        if inserted {
+            self.press_order.push(input);
+        }
+    }
+
+    fn mark_released(&mut self, input: WindowsPressedInput) {
+        match input {
+            WindowsPressedInput::Key(key) => {
+                self.pressed_keys.remove(&key);
+            }
+            WindowsPressedInput::MouseButton(button) => {
+                self.pressed_buttons.remove(&button);
+            }
+        }
+        self.press_order.retain(|pressed| *pressed != input);
+    }
+
+    fn release_sequence(&self) -> Vec<WindowsPressedInput> {
+        self.press_order.iter().rev().copied().collect()
     }
 }
 
@@ -1004,7 +1228,7 @@ mod tests {
 
     use akraz_core::{
         CapturedInputEvent, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize,
-        PhysicalKey, PressState,
+        MouseButton, PhysicalKey, PressState,
     };
 
     use super::{
@@ -1013,7 +1237,11 @@ mod tests {
     };
 
     #[cfg(windows)]
-    use super::{WindowsProbeResults, windows_capabilities_from_probe_results};
+    use super::{
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_XUP, WindowsInjectedInputState, WindowsPressedInput,
+        WindowsProbeResults, windows_capabilities_from_probe_results, windows_mouse_button_flags,
+        windows_scan_code_for_physical_key,
+    };
 
     fn count_or_panic(adapter: &FakePlatformAdapter) -> u64 {
         match adapter.release_all_count() {
@@ -1141,6 +1369,61 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_scan_code_mapping_preserves_extended_modifier_keys() {
+        assert_eq!(
+            windows_scan_code_for_physical_key(PhysicalKey::LeftControl),
+            (0x1d, false)
+        );
+        assert_eq!(
+            windows_scan_code_for_physical_key(PhysicalKey::RightControl),
+            (0x1d, true)
+        );
+        assert_eq!(
+            windows_scan_code_for_physical_key(PhysicalKey::Code(44)),
+            (44, false)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mouse_button_flags_cover_primary_and_x_buttons() {
+        assert_eq!(
+            windows_mouse_button_flags(MouseButton::Left, PressState::Pressed),
+            Ok((MOUSEEVENTF_LEFTDOWN, 0))
+        );
+        assert_eq!(
+            windows_mouse_button_flags(MouseButton::Forward, PressState::Released),
+            Ok((MOUSEEVENTF_XUP, super::XBUTTON2 as u32))
+        );
+
+        let error = windows_mouse_button_flags(MouseButton::Other(9), PressState::Pressed)
+            .expect_err("unknown mouse button should not be injected");
+        assert_eq!(
+            error.to_string(),
+            "unsupported Windows mouse button for injection"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_injected_input_state_releases_in_reverse_press_order() {
+        let mut state = WindowsInjectedInputState::default();
+        let shift = WindowsPressedInput::Key(PhysicalKey::LeftShift);
+        let button = WindowsPressedInput::MouseButton(MouseButton::Left);
+
+        state.mark_pressed(shift);
+        state.mark_pressed(button);
+        state.mark_pressed(shift);
+
+        assert_eq!(state.release_sequence(), vec![button, shift]);
+
+        state.mark_released(button);
+
+        assert_eq!(state.release_sequence(), vec![shift]);
+    }
+
     #[test]
     fn runtime_adapter_reports_current_platform() {
         let adapter = runtime_platform_adapter();
@@ -1173,7 +1456,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_capabilities_map_probe_results_without_assuming_keyboard_injection() {
+    fn windows_capabilities_map_send_input_probe_to_injection_surfaces() {
         let capabilities = windows_capabilities_from_probe_results(WindowsProbeResults {
             can_open_input_desktop: true,
             can_install_mouse_hook: true,
@@ -1187,7 +1470,7 @@ mod tests {
                 can_capture_pointer: true,
                 can_capture_keyboard: true,
                 can_inject_pointer: true,
-                can_inject_keyboard: false,
+                can_inject_keyboard: true,
             }
         );
 
@@ -1204,19 +1487,22 @@ mod tests {
                 can_capture_pointer: false,
                 can_capture_keyboard: false,
                 can_inject_pointer: true,
-                can_inject_keyboard: false,
+                can_inject_keyboard: true,
             }
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_adapter_reports_real_probe_profile_without_keyboard_injection() {
+    fn windows_adapter_reports_keyboard_injection_with_send_input_profile() {
         let adapter = runtime_platform_adapter();
 
         let capabilities = adapter.probe_capabilities().expect("capability probe");
 
-        assert!(!capabilities.can_inject_keyboard);
+        assert_eq!(
+            capabilities.can_inject_keyboard,
+            capabilities.can_inject_pointer
+        );
     }
 
     #[cfg(windows)]

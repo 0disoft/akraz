@@ -63,7 +63,7 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
         DaemonIpcRunConfig::serve_forever(endpoint)
     };
     let platform = runtime_platform_adapter();
-    let server = DaemonIpcServer::new(RuntimeInputState::new(), platform);
+    let server = DaemonIpcServer::new(RuntimeInputState::new(), platform.clone());
     let capture_worker = if options.capture_input {
         match start_daemon_input_capture_with_edge_bindings(
             server.shared_state(),
