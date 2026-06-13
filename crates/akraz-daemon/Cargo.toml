@@ -24,6 +24,4 @@ akraz-ipc = { path = "../akraz-ipc" }
 akraz-protocol = { path = "../akraz-protocol" }
 akraz-platform = { path = "../akraz-platform" }
 serde = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }

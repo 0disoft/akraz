@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
     "prepare:sidecar": "bun scripts/prepare-sidecar.mjs",
     "prepare:sidecar:release": "bun scripts/prepare-sidecar.mjs --release",
     "smoke:daemon-lifecycle": "bun scripts/smoke-daemon-lifecycle.mjs",
+    "smoke:loopback-transport": "bun scripts/smoke-loopback-transport.mjs",
     "smoke:settings-start": "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
     "tauri": "tauri"
   },

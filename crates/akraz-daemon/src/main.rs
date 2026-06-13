@@ -2,13 +2,18 @@ use std::env;
 use std::fmt::{Display, Formatter};
 use std::process::ExitCode;
 
-use akraz_core::{PeerId, RuntimeInputState, ScreenEdge, ScreenEdgeBinding};
+use akraz_core::{
+    CoreAction, EdgeCrossing, InjectedInputEvent, LogicalPoint, MouseButton, PeerId, PhysicalKey,
+    PressState, RuntimeInputState, ScreenEdge, ScreenEdgeBinding, SessionId,
+};
 use akraz_daemon::{
-    DaemonInputCaptureConfig, DaemonInputCaptureWorker, DaemonIpcRunConfig, DaemonIpcServer,
+    CoreActionDispatcher, DaemonInputCaptureConfig, DaemonInputCaptureWorker, DaemonIpcRunConfig,
+    DaemonIpcServer, DaemonTransportCommand, LoopbackPeerTransport, TransportCoreActionDispatcher,
     build_daemon_status, serve_daemon_ipc, start_daemon_input_capture_with_edge_bindings,
 };
 use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
 use akraz_platform::runtime_platform_adapter;
+use serde::Serialize;
 
 fn main() -> ExitCode {
     match parse_daemon_command(env::args().skip(1)) {
@@ -20,6 +25,7 @@ fn main() -> ExitCode {
             print_status();
             ExitCode::SUCCESS
         }
+        Ok(DaemonCommand::LoopbackTransportSmoke) => run_loopback_transport_smoke(),
         Ok(DaemonCommand::Serve(options)) => run_daemon(options),
         Err(error) => {
             eprintln!("{error}");
@@ -126,11 +132,220 @@ fn print_status() {
     );
 }
 
+fn run_loopback_transport_smoke() -> ExitCode {
+    match build_loopback_transport_smoke_report() {
+        Ok(report) => match serde_json::to_string(&report) {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("failed to encode loopback transport smoke report: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("loopback transport smoke failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn build_loopback_transport_smoke_report()
+-> Result<LoopbackTransportSmokeReport, akraz_platform::PlatformError> {
+    let transport = LoopbackPeerTransport::new();
+    let dispatcher = TransportCoreActionDispatcher::new(transport.clone());
+
+    dispatcher.dispatch_core_actions(&loopback_transport_smoke_actions())?;
+
+    Ok(LoopbackTransportSmokeReport {
+        daemon_version: env!("CARGO_PKG_VERSION"),
+        commands: transport
+            .snapshot()?
+            .iter()
+            .map(LoopbackTransportSmokeCommand::from)
+            .collect(),
+    })
+}
+
+fn loopback_transport_smoke_actions() -> [CoreAction; 4] {
+    let crossing = EdgeCrossing {
+        peer_id: PeerId::new("loopback-peer"),
+        local_edge: ScreenEdge::Right,
+        remote_edge: ScreenEdge::Left,
+        exit_position: LogicalPoint { x: 1920, y: 540 },
+        edge_offset: 540,
+    };
+
+    [
+        CoreAction::StartRemoteSession {
+            peer_id: PeerId::new("loopback-peer"),
+            crossing: Some(crossing),
+        },
+        CoreAction::ForwardInput {
+            event: InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            },
+        },
+        CoreAction::ReleaseAllInputs,
+        CoreAction::StopRemoteSession {
+            session_id: Some(SessionId::new("loopback-session")),
+        },
+    ]
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct LoopbackTransportSmokeReport {
+    daemon_version: &'static str,
+    commands: Vec<LoopbackTransportSmokeCommand>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum LoopbackTransportSmokeCommand {
+    StartRemoteSession {
+        peer_id: String,
+        crossing: Option<LoopbackTransportSmokeCrossing>,
+    },
+    ForwardInput {
+        event: LoopbackTransportSmokeInputEvent,
+    },
+    ReleaseAllInputs,
+    StopRemoteSession {
+        session_id: Option<String>,
+    },
+}
+
+impl From<&DaemonTransportCommand> for LoopbackTransportSmokeCommand {
+    fn from(command: &DaemonTransportCommand) -> Self {
+        match command {
+            DaemonTransportCommand::StartRemoteSession { peer_id, crossing } => {
+                Self::StartRemoteSession {
+                    peer_id: peer_id.as_str().to_string(),
+                    crossing: crossing.as_ref().map(LoopbackTransportSmokeCrossing::from),
+                }
+            }
+            DaemonTransportCommand::ForwardInput { event } => Self::ForwardInput {
+                event: LoopbackTransportSmokeInputEvent::from(event),
+            },
+            DaemonTransportCommand::ReleaseAllInputs => Self::ReleaseAllInputs,
+            DaemonTransportCommand::StopRemoteSession { session_id } => Self::StopRemoteSession {
+                session_id: session_id
+                    .as_ref()
+                    .map(|session_id| session_id.as_str().to_string()),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct LoopbackTransportSmokeCrossing {
+    peer_id: String,
+    local_edge: &'static str,
+    remote_edge: &'static str,
+    exit_x: i32,
+    exit_y: i32,
+    edge_offset: i32,
+}
+
+impl From<&EdgeCrossing> for LoopbackTransportSmokeCrossing {
+    fn from(crossing: &EdgeCrossing) -> Self {
+        Self {
+            peer_id: crossing.peer_id.as_str().to_string(),
+            local_edge: screen_edge_name(crossing.local_edge),
+            remote_edge: screen_edge_name(crossing.remote_edge),
+            exit_x: crossing.exit_position.x,
+            exit_y: crossing.exit_position.y,
+            edge_offset: crossing.edge_offset,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum LoopbackTransportSmokeInputEvent {
+    Key { key: String, state: &'static str },
+    MouseButton { button: String, state: &'static str },
+    PointerMoved { delta_x: i32, delta_y: i32 },
+}
+
+impl From<&InjectedInputEvent> for LoopbackTransportSmokeInputEvent {
+    fn from(event: &InjectedInputEvent) -> Self {
+        match event {
+            InjectedInputEvent::Key { key, state } => Self::Key {
+                key: physical_key_name(*key),
+                state: press_state_name(*state),
+            },
+            InjectedInputEvent::MouseButton { button, state } => Self::MouseButton {
+                button: mouse_button_name(*button),
+                state: press_state_name(*state),
+            },
+            InjectedInputEvent::PointerMoved { delta_x, delta_y } => Self::PointerMoved {
+                delta_x: *delta_x,
+                delta_y: *delta_y,
+            },
+        }
+    }
+}
+
+fn screen_edge_name(edge: ScreenEdge) -> &'static str {
+    match edge {
+        ScreenEdge::Left => "left",
+        ScreenEdge::Right => "right",
+        ScreenEdge::Top => "top",
+        ScreenEdge::Bottom => "bottom",
+    }
+}
+
+fn press_state_name(state: PressState) -> &'static str {
+    match state {
+        PressState::Pressed => "pressed",
+        PressState::Released => "released",
+    }
+}
+
+fn physical_key_name(key: PhysicalKey) -> String {
+    match key {
+        PhysicalKey::LeftShift => "leftShift".to_string(),
+        PhysicalKey::RightShift => "rightShift".to_string(),
+        PhysicalKey::LeftControl => "leftControl".to_string(),
+        PhysicalKey::RightControl => "rightControl".to_string(),
+        PhysicalKey::LeftAlt => "leftAlt".to_string(),
+        PhysicalKey::RightAlt => "rightAlt".to_string(),
+        PhysicalKey::LeftMeta => "leftMeta".to_string(),
+        PhysicalKey::RightMeta => "rightMeta".to_string(),
+        PhysicalKey::Code(code) => format!("code:{code}"),
+    }
+}
+
+fn mouse_button_name(button: MouseButton) -> String {
+    match button {
+        MouseButton::Left => "left".to_string(),
+        MouseButton::Right => "right".to_string(),
+        MouseButton::Middle => "middle".to_string(),
+        MouseButton::Back => "back".to_string(),
+        MouseButton::Forward => "forward".to_string(),
+        MouseButton::Other(code) => format!("other:{code}"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DaemonCommand {
     Serve(ServeOptions),
     Status,
     Version,
+    LoopbackTransportSmoke,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -153,6 +368,9 @@ where
     match first.as_str() {
         "--version" | "-V" => reject_trailing_args(args, DaemonCommand::Version),
         "--status" => reject_trailing_args(args, DaemonCommand::Status),
+        "--akraz-smoke-loopback-transport" => {
+            reject_trailing_args(args, DaemonCommand::LoopbackTransportSmoke)
+        }
         "--serve" => parse_serve_options(args),
         argument
             if argument.starts_with("--endpoint")
@@ -283,8 +501,9 @@ mod tests {
     use akraz_ipc::{IpcEndpoint, IpcEndpointKind, IpcTransportError};
 
     use super::{
-        DaemonCommand, DaemonUsageError, ServeOptions, format_daemon_ipc_error,
-        parse_daemon_command,
+        DaemonCommand, DaemonUsageError, LoopbackTransportSmokeCommand,
+        LoopbackTransportSmokeInputEvent, ServeOptions, build_loopback_transport_smoke_report,
+        format_daemon_ipc_error, parse_daemon_command,
     };
 
     #[test]
@@ -387,6 +606,53 @@ mod tests {
             parse_daemon_command(["--version"].map(String::from)),
             Ok(DaemonCommand::Version)
         );
+    }
+
+    #[test]
+    fn parses_hidden_loopback_transport_smoke_command() {
+        assert_eq!(
+            parse_daemon_command(["--akraz-smoke-loopback-transport"].map(String::from)),
+            Ok(DaemonCommand::LoopbackTransportSmoke)
+        );
+        assert_eq!(
+            parse_daemon_command(["--akraz-smoke-loopback-transport", "--once"].map(String::from)),
+            Err(DaemonUsageError::UnknownArgument("--once".to_string()))
+        );
+    }
+
+    #[test]
+    fn loopback_transport_smoke_report_covers_transport_commands() {
+        let report =
+            build_loopback_transport_smoke_report().expect("loopback transport smoke report");
+
+        assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(report.commands.len(), 4);
+        assert!(matches!(
+            &report.commands[0],
+            LoopbackTransportSmokeCommand::StartRemoteSession {
+                peer_id,
+                crossing: Some(_),
+            } if peer_id == "loopback-peer"
+        ));
+        assert_eq!(
+            report.commands[1],
+            LoopbackTransportSmokeCommand::ForwardInput {
+                event: LoopbackTransportSmokeInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            }
+        );
+        assert_eq!(
+            report.commands[2],
+            LoopbackTransportSmokeCommand::ReleaseAllInputs
+        );
+        assert!(matches!(
+            &report.commands[3],
+            LoopbackTransportSmokeCommand::StopRemoteSession {
+                session_id: Some(session_id),
+            } if session_id == "loopback-session"
+        ));
     }
 
     #[test]

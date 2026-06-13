@@ -121,6 +121,39 @@ where
     }
 }
 
+/// In-memory transport implementation used for deterministic local smoke tests.
+#[derive(Debug, Default, Clone)]
+pub struct LoopbackPeerTransport {
+    commands: Arc<Mutex<Vec<DaemonTransportCommand>>>,
+}
+
+impl LoopbackPeerTransport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn snapshot(&self) -> Result<Vec<DaemonTransportCommand>, PlatformError> {
+        self.commands
+            .lock()
+            .map_err(|_| PlatformError::new("loopback transport command log is unavailable"))
+            .map(|commands| commands.clone())
+    }
+}
+
+impl DaemonPeerTransport for LoopbackPeerTransport {
+    fn dispatch_transport_command(
+        &self,
+        command: DaemonTransportCommand,
+    ) -> Result<(), PlatformError> {
+        self.commands
+            .lock()
+            .map_err(|_| PlatformError::new("loopback transport command log is unavailable"))?
+            .push(command);
+
+        Ok(())
+    }
+}
+
 /// Configuration used to translate captured pointer deltas into core routing events.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaemonInputRoutingConfig {
@@ -714,9 +747,9 @@ mod tests {
     use super::{
         CapturedInputRouter, CoreActionDispatcher, DAEMON_VERSION, DaemonInputCaptureConfig,
         DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer, DaemonPeerTransport,
-        DaemonTransportCommand, TransportCoreActionDispatcher, apply_routed_capture_event_to_state,
-        build_daemon_status, build_permissions_probe, drain_capture_events,
-        handle_ipc_request_line, serve_daemon_ipc, shared_runtime_state,
+        DaemonTransportCommand, LoopbackPeerTransport, TransportCoreActionDispatcher,
+        apply_routed_capture_event_to_state, build_daemon_status, build_permissions_probe,
+        drain_capture_events, handle_ipc_request_line, serve_daemon_ipc, shared_runtime_state,
         start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
         start_daemon_input_capture_with_routing,
         start_daemon_input_capture_with_routing_and_dispatcher,
@@ -839,31 +872,6 @@ mod tests {
                 .lock()
                 .map_err(|_| PlatformError::new("recorded action lock was poisoned"))?
                 .extend_from_slice(actions);
-
-            Ok(())
-        }
-    }
-
-    #[derive(Debug, Default, Clone)]
-    struct RecordingPeerTransport {
-        commands: std::sync::Arc<std::sync::Mutex<Vec<DaemonTransportCommand>>>,
-    }
-
-    impl RecordingPeerTransport {
-        fn snapshot(&self) -> Vec<DaemonTransportCommand> {
-            self.commands.lock().expect("recorded command lock").clone()
-        }
-    }
-
-    impl DaemonPeerTransport for RecordingPeerTransport {
-        fn dispatch_transport_command(
-            &self,
-            command: DaemonTransportCommand,
-        ) -> Result<(), PlatformError> {
-            self.commands
-                .lock()
-                .map_err(|_| PlatformError::new("recorded command lock was poisoned"))?
-                .push(command);
 
             Ok(())
         }
@@ -1079,7 +1087,7 @@ mod tests {
 
     #[test]
     fn transport_dispatcher_maps_core_actions_in_order() {
-        let transport = RecordingPeerTransport::default();
+        let transport = LoopbackPeerTransport::default();
         let dispatcher = TransportCoreActionDispatcher::new(transport.clone());
         let crossing = EdgeCrossing {
             peer_id: PeerId::new("right-peer"),
@@ -1109,7 +1117,7 @@ mod tests {
             .expect("transport command dispatch");
 
         assert_eq!(
-            transport.snapshot(),
+            transport.snapshot().expect("loopback command snapshot"),
             vec![
                 DaemonTransportCommand::StartRemoteSession {
                     peer_id: PeerId::new("right-peer"),
@@ -1410,7 +1418,7 @@ mod tests {
             },
         ]);
         let state = shared_runtime_state(RuntimeInputState::new());
-        let transport = RecordingPeerTransport::default();
+        let transport = LoopbackPeerTransport::default();
         let dispatcher = TransportCoreActionDispatcher::new(transport.clone());
         let expected_command = DaemonTransportCommand::StartRemoteSession {
             peer_id: PeerId::new("right-peer"),
@@ -1442,7 +1450,11 @@ mod tests {
         .expect("daemon capture worker");
 
         for _ in 0..20 {
-            if transport.snapshot().contains(&expected_command) {
+            if transport
+                .snapshot()
+                .expect("loopback command snapshot")
+                .contains(&expected_command)
+            {
                 worker.stop().expect("stop capture worker");
                 return;
             }
