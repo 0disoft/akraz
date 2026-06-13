@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -17,6 +17,7 @@
     "smoke:daemon-lifecycle": "bun run --cwd apps/akraz smoke:daemon-lifecycle",
     "smoke:loopback-transport": "bun run --cwd apps/akraz smoke:loopback-transport",
     "smoke:settings-start": "bun run --cwd apps/akraz smoke:settings-start",
+    "smoke:tcp-transport": "bun run --cwd apps/akraz smoke:tcp-transport",
     "test": "bun test"
   },
   "devDependencies": {

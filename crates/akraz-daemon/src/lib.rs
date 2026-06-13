@@ -2,6 +2,8 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -10,8 +12,8 @@ use std::time::Duration;
 
 use akraz_core::{
     CapturedInputEvent, ControlMode, CoreAction, CoreTransitionError, EdgeCrossing,
-    InjectedInputEvent, LogicalPoint, PeerId, RuntimeEvent, RuntimeInputState, ScreenEdgeBinding,
-    ScreenLayout, SessionId,
+    InjectedInputEvent, LogicalPoint, MouseButton, PeerId, PhysicalKey, PressState, RuntimeEvent,
+    RuntimeInputState, ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
 };
 use akraz_ipc::{
     DaemonStatus, IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError,
@@ -23,6 +25,7 @@ use akraz_platform::{
     DesktopGeometry, InputCaptureConfig, InputCaptureSession, PlatformAdapter, PlatformError,
 };
 use akraz_protocol::ProtocolVersion;
+use serde::{Deserialize, Serialize};
 
 /// Current daemon package version.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -152,6 +155,431 @@ impl DaemonPeerTransport for LoopbackPeerTransport {
 
         Ok(())
     }
+}
+
+/// TCP peer transport that sends one newline-delimited JSON command per connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpPeerTransport {
+    peer_id: PeerId,
+    address: SocketAddr,
+}
+
+impl TcpPeerTransport {
+    /// Create a TCP peer transport for one configured peer.
+    pub fn new(peer_id: PeerId, address: SocketAddr) -> Self {
+        Self { peer_id, address }
+    }
+
+    /// Return the peer this transport is configured to reach.
+    pub fn peer_id(&self) -> &PeerId {
+        &self.peer_id
+    }
+
+    /// Return the TCP address this transport connects to.
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+impl DaemonPeerTransport for TcpPeerTransport {
+    fn dispatch_transport_command(
+        &self,
+        command: DaemonTransportCommand,
+    ) -> Result<(), PlatformError> {
+        validate_transport_command_peer(&self.peer_id, &command)?;
+
+        let message = PeerTransportMessage::from_command(&command);
+        let line = serde_json::to_string(&message).map_err(|error| {
+            PlatformError::new(format!("failed to encode peer command: {error}"))
+        })?;
+        let mut stream = TcpStream::connect(self.address).map_err(|error| {
+            PlatformError::new(format!(
+                "failed to connect peer transport {} at {}: {error}",
+                self.peer_id.as_str(),
+                self.address
+            ))
+        })?;
+
+        stream
+            .write_all(line.as_bytes())
+            .and_then(|()| stream.write_all(b"\n"))
+            .and_then(|()| stream.flush())
+            .map_err(|error| {
+                PlatformError::new(format!(
+                    "failed to send peer transport command to {} at {}: {error}",
+                    self.peer_id.as_str(),
+                    self.address
+                ))
+            })
+    }
+}
+
+/// Serve a bounded number of TCP peer transport commands and return decoded commands.
+pub fn serve_tcp_peer_transport_commands(
+    listener: &TcpListener,
+    max_commands: usize,
+) -> Result<Vec<DaemonTransportCommand>, PlatformError> {
+    let mut commands = Vec::with_capacity(max_commands);
+
+    for _ in 0..max_commands {
+        let (stream, _) = listener.accept().map_err(|error| {
+            PlatformError::new(format!("failed to accept peer command: {error}"))
+        })?;
+        commands.push(read_tcp_peer_transport_command(stream)?);
+    }
+
+    Ok(commands)
+}
+
+fn read_tcp_peer_transport_command(
+    stream: TcpStream,
+) -> Result<DaemonTransportCommand, PlatformError> {
+    let mut line = String::new();
+    let mut reader = BufReader::new(stream);
+    let read = reader
+        .read_line(&mut line)
+        .map_err(|error| PlatformError::new(format!("failed to read peer command: {error}")))?;
+    if read == 0 {
+        return Err(PlatformError::new(
+            "peer transport connection closed before a command line was received",
+        ));
+    }
+
+    let message: PeerTransportMessage = serde_json::from_str(&line)
+        .map_err(|error| PlatformError::new(format!("failed to decode peer command: {error}")))?;
+
+    message.into_command()
+}
+
+fn validate_transport_command_peer(
+    configured_peer_id: &PeerId,
+    command: &DaemonTransportCommand,
+) -> Result<(), PlatformError> {
+    match command {
+        DaemonTransportCommand::StartRemoteSession { peer_id, .. }
+            if peer_id != configured_peer_id =>
+        {
+            Err(PlatformError::new(format!(
+                "peer transport configured for {}, got start command for {}",
+                configured_peer_id.as_str(),
+                peer_id.as_str()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Wire message exchanged by peer transport adapters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerTransportMessage {
+    pub protocol: PeerTransportProtocolVersion,
+    pub command: PeerTransportCommandPayload,
+}
+
+impl PeerTransportMessage {
+    /// Build a wire message from an internal daemon transport command.
+    pub fn from_command(command: &DaemonTransportCommand) -> Self {
+        Self {
+            protocol: PeerTransportProtocolVersion::current(),
+            command: PeerTransportCommandPayload::from(command),
+        }
+    }
+
+    /// Decode a wire message into an internal daemon transport command.
+    pub fn into_command(self) -> Result<DaemonTransportCommand, PlatformError> {
+        let version = ProtocolVersion {
+            major: self.protocol.major,
+            minor: self.protocol.minor,
+        };
+        if !ProtocolVersion::CURRENT.is_compatible_with(version) {
+            return Err(PlatformError::new(format!(
+                "unsupported peer transport protocol {}.{}",
+                self.protocol.major, self.protocol.minor
+            )));
+        }
+
+        self.command.into_command()
+    }
+}
+
+/// Wire-safe protocol version for peer transport messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerTransportProtocolVersion {
+    pub major: u16,
+    pub minor: u16,
+}
+
+impl PeerTransportProtocolVersion {
+    fn current() -> Self {
+        Self {
+            major: ProtocolVersion::CURRENT.major,
+            minor: ProtocolVersion::CURRENT.minor,
+        }
+    }
+}
+
+/// Wire-safe peer transport command payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PeerTransportCommandPayload {
+    StartRemoteSession {
+        peer_id: String,
+        crossing: Option<PeerTransportCrossing>,
+    },
+    ForwardInput {
+        event: PeerTransportInputEvent,
+    },
+    ReleaseAllInputs,
+    StopRemoteSession {
+        session_id: Option<String>,
+    },
+}
+
+impl From<&DaemonTransportCommand> for PeerTransportCommandPayload {
+    fn from(command: &DaemonTransportCommand) -> Self {
+        match command {
+            DaemonTransportCommand::StartRemoteSession { peer_id, crossing } => {
+                Self::StartRemoteSession {
+                    peer_id: peer_id.as_str().to_string(),
+                    crossing: crossing.as_ref().map(PeerTransportCrossing::from),
+                }
+            }
+            DaemonTransportCommand::ForwardInput { event } => Self::ForwardInput {
+                event: PeerTransportInputEvent::from(event),
+            },
+            DaemonTransportCommand::ReleaseAllInputs => Self::ReleaseAllInputs,
+            DaemonTransportCommand::StopRemoteSession { session_id } => Self::StopRemoteSession {
+                session_id: session_id
+                    .as_ref()
+                    .map(|session_id| session_id.as_str().to_string()),
+            },
+        }
+    }
+}
+
+impl PeerTransportCommandPayload {
+    fn into_command(self) -> Result<DaemonTransportCommand, PlatformError> {
+        match self {
+            Self::StartRemoteSession { peer_id, crossing } => {
+                let crossing = match crossing {
+                    Some(crossing) => Some(crossing.into_crossing()?),
+                    None => None,
+                };
+
+                Ok(DaemonTransportCommand::StartRemoteSession {
+                    peer_id: PeerId::new(peer_id),
+                    crossing,
+                })
+            }
+            Self::ForwardInput { event } => Ok(DaemonTransportCommand::ForwardInput {
+                event: event.into_input_event()?,
+            }),
+            Self::ReleaseAllInputs => Ok(DaemonTransportCommand::ReleaseAllInputs),
+            Self::StopRemoteSession { session_id } => {
+                Ok(DaemonTransportCommand::StopRemoteSession {
+                    session_id: session_id.map(SessionId::new),
+                })
+            }
+        }
+    }
+}
+
+/// Wire-safe edge crossing payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerTransportCrossing {
+    pub peer_id: String,
+    pub local_edge: String,
+    pub remote_edge: String,
+    pub exit_x: i32,
+    pub exit_y: i32,
+    pub edge_offset: i32,
+}
+
+impl From<&EdgeCrossing> for PeerTransportCrossing {
+    fn from(crossing: &EdgeCrossing) -> Self {
+        Self {
+            peer_id: crossing.peer_id.as_str().to_string(),
+            local_edge: screen_edge_name(crossing.local_edge).to_string(),
+            remote_edge: screen_edge_name(crossing.remote_edge).to_string(),
+            exit_x: crossing.exit_position.x,
+            exit_y: crossing.exit_position.y,
+            edge_offset: crossing.edge_offset,
+        }
+    }
+}
+
+impl PeerTransportCrossing {
+    fn into_crossing(self) -> Result<EdgeCrossing, PlatformError> {
+        Ok(EdgeCrossing {
+            peer_id: PeerId::new(self.peer_id),
+            local_edge: parse_screen_edge_name(&self.local_edge)?,
+            remote_edge: parse_screen_edge_name(&self.remote_edge)?,
+            exit_position: LogicalPoint {
+                x: self.exit_x,
+                y: self.exit_y,
+            },
+            edge_offset: self.edge_offset,
+        })
+    }
+}
+
+/// Wire-safe input event payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PeerTransportInputEvent {
+    Key { key: String, state: String },
+    MouseButton { button: String, state: String },
+    PointerMoved { delta_x: i32, delta_y: i32 },
+}
+
+impl From<&InjectedInputEvent> for PeerTransportInputEvent {
+    fn from(event: &InjectedInputEvent) -> Self {
+        match event {
+            InjectedInputEvent::Key { key, state } => Self::Key {
+                key: physical_key_name(*key),
+                state: press_state_name(*state).to_string(),
+            },
+            InjectedInputEvent::MouseButton { button, state } => Self::MouseButton {
+                button: mouse_button_name(*button),
+                state: press_state_name(*state).to_string(),
+            },
+            InjectedInputEvent::PointerMoved { delta_x, delta_y } => Self::PointerMoved {
+                delta_x: *delta_x,
+                delta_y: *delta_y,
+            },
+        }
+    }
+}
+
+impl PeerTransportInputEvent {
+    fn into_input_event(self) -> Result<InjectedInputEvent, PlatformError> {
+        match self {
+            Self::Key { key, state } => Ok(InjectedInputEvent::Key {
+                key: parse_physical_key_name(&key)?,
+                state: parse_press_state_name(&state)?,
+            }),
+            Self::MouseButton { button, state } => Ok(InjectedInputEvent::MouseButton {
+                button: parse_mouse_button_name(&button)?,
+                state: parse_press_state_name(&state)?,
+            }),
+            Self::PointerMoved { delta_x, delta_y } => {
+                Ok(InjectedInputEvent::PointerMoved { delta_x, delta_y })
+            }
+        }
+    }
+}
+
+fn screen_edge_name(edge: ScreenEdge) -> &'static str {
+    match edge {
+        ScreenEdge::Left => "left",
+        ScreenEdge::Right => "right",
+        ScreenEdge::Top => "top",
+        ScreenEdge::Bottom => "bottom",
+    }
+}
+
+fn parse_screen_edge_name(value: &str) -> Result<ScreenEdge, PlatformError> {
+    match value {
+        "left" => Ok(ScreenEdge::Left),
+        "right" => Ok(ScreenEdge::Right),
+        "top" => Ok(ScreenEdge::Top),
+        "bottom" => Ok(ScreenEdge::Bottom),
+        _ => Err(PlatformError::new(format!(
+            "unsupported peer transport screen edge: {value}"
+        ))),
+    }
+}
+
+fn press_state_name(state: PressState) -> &'static str {
+    match state {
+        PressState::Pressed => "pressed",
+        PressState::Released => "released",
+    }
+}
+
+fn parse_press_state_name(value: &str) -> Result<PressState, PlatformError> {
+    match value {
+        "pressed" => Ok(PressState::Pressed),
+        "released" => Ok(PressState::Released),
+        _ => Err(PlatformError::new(format!(
+            "unsupported peer transport press state: {value}"
+        ))),
+    }
+}
+
+fn physical_key_name(key: PhysicalKey) -> String {
+    match key {
+        PhysicalKey::LeftShift => "leftShift".to_string(),
+        PhysicalKey::RightShift => "rightShift".to_string(),
+        PhysicalKey::LeftControl => "leftControl".to_string(),
+        PhysicalKey::RightControl => "rightControl".to_string(),
+        PhysicalKey::LeftAlt => "leftAlt".to_string(),
+        PhysicalKey::RightAlt => "rightAlt".to_string(),
+        PhysicalKey::LeftMeta => "leftMeta".to_string(),
+        PhysicalKey::RightMeta => "rightMeta".to_string(),
+        PhysicalKey::Code(code) => format!("code:{code}"),
+    }
+}
+
+fn parse_physical_key_name(value: &str) -> Result<PhysicalKey, PlatformError> {
+    match value {
+        "leftShift" => Ok(PhysicalKey::LeftShift),
+        "rightShift" => Ok(PhysicalKey::RightShift),
+        "leftControl" => Ok(PhysicalKey::LeftControl),
+        "rightControl" => Ok(PhysicalKey::RightControl),
+        "leftAlt" => Ok(PhysicalKey::LeftAlt),
+        "rightAlt" => Ok(PhysicalKey::RightAlt),
+        "leftMeta" => Ok(PhysicalKey::LeftMeta),
+        "rightMeta" => Ok(PhysicalKey::RightMeta),
+        value => parse_prefixed_u16(value, "code:").map(PhysicalKey::Code),
+    }
+}
+
+fn mouse_button_name(button: MouseButton) -> String {
+    match button {
+        MouseButton::Left => "left".to_string(),
+        MouseButton::Right => "right".to_string(),
+        MouseButton::Middle => "middle".to_string(),
+        MouseButton::Back => "back".to_string(),
+        MouseButton::Forward => "forward".to_string(),
+        MouseButton::Other(code) => format!("other:{code}"),
+    }
+}
+
+fn parse_mouse_button_name(value: &str) -> Result<MouseButton, PlatformError> {
+    match value {
+        "left" => Ok(MouseButton::Left),
+        "right" => Ok(MouseButton::Right),
+        "middle" => Ok(MouseButton::Middle),
+        "back" => Ok(MouseButton::Back),
+        "forward" => Ok(MouseButton::Forward),
+        value => parse_prefixed_u16(value, "other:").map(MouseButton::Other),
+    }
+}
+
+fn parse_prefixed_u16(value: &str, prefix: &str) -> Result<u16, PlatformError> {
+    let Some(raw_code) = value.strip_prefix(prefix) else {
+        return Err(PlatformError::new(format!(
+            "unsupported peer transport value: {value}"
+        )));
+    };
+
+    raw_code.parse::<u16>().map_err(|error| {
+        PlatformError::new(format!(
+            "invalid peer transport numeric code {raw_code}: {error}"
+        ))
+    })
 }
 
 /// Configuration used to translate captured pointer deltas into core routing events.
@@ -730,8 +1158,8 @@ fn push_missing_capability_issue(
 mod tests {
     use akraz_core::{
         CapturedInputEvent, ControlMode, CoreAction, EdgeCrossing, InjectedInputEvent,
-        LogicalPoint, LogicalRect, LogicalSize, PeerId, PhysicalKey, PressState, RuntimeEvent,
-        RuntimeInputState, ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
+        LogicalPoint, LogicalRect, LogicalSize, MouseButton, PeerId, PhysicalKey, PressState,
+        RuntimeEvent, RuntimeInputState, ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
     };
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, DaemonStatusParams, IpcEndpoint,
@@ -747,11 +1175,11 @@ mod tests {
     use super::{
         CapturedInputRouter, CoreActionDispatcher, DAEMON_VERSION, DaemonInputCaptureConfig,
         DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer, DaemonPeerTransport,
-        DaemonTransportCommand, LoopbackPeerTransport, TransportCoreActionDispatcher,
-        apply_routed_capture_event_to_state, build_daemon_status, build_permissions_probe,
-        drain_capture_events, handle_ipc_request_line, serve_daemon_ipc, shared_runtime_state,
-        start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
-        start_daemon_input_capture_with_routing,
+        DaemonTransportCommand, LoopbackPeerTransport, PeerTransportMessage, TcpPeerTransport,
+        TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
+        build_permissions_probe, drain_capture_events, handle_ipc_request_line, serve_daemon_ipc,
+        serve_tcp_peer_transport_commands, shared_runtime_state, start_daemon_input_capture,
+        start_daemon_input_capture_with_edge_bindings, start_daemon_input_capture_with_routing,
         start_daemon_input_capture_with_routing_and_dispatcher,
     };
 
@@ -1134,6 +1562,150 @@ mod tests {
                     session_id: Some(SessionId::new("session-1")),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn peer_transport_message_round_trips_transport_commands() {
+        let commands = vec![
+            DaemonTransportCommand::StartRemoteSession {
+                peer_id: PeerId::new("right-peer"),
+                crossing: Some(EdgeCrossing {
+                    peer_id: PeerId::new("right-peer"),
+                    local_edge: ScreenEdge::Right,
+                    remote_edge: ScreenEdge::Left,
+                    exit_position: LogicalPoint { x: 1920, y: 540 },
+                    edge_offset: 540,
+                }),
+            },
+            DaemonTransportCommand::ForwardInput {
+                event: InjectedInputEvent::Key {
+                    key: PhysicalKey::Code(44),
+                    state: PressState::Pressed,
+                },
+            },
+            DaemonTransportCommand::ForwardInput {
+                event: InjectedInputEvent::MouseButton {
+                    button: MouseButton::Other(9),
+                    state: PressState::Released,
+                },
+            },
+            DaemonTransportCommand::ReleaseAllInputs,
+            DaemonTransportCommand::StopRemoteSession {
+                session_id: Some(SessionId::new("session-1")),
+            },
+        ];
+
+        for command in commands {
+            let message = PeerTransportMessage::from_command(&command);
+
+            assert_eq!(
+                message.into_command().expect("peer command round trip"),
+                command
+            );
+        }
+    }
+
+    #[test]
+    fn peer_transport_message_rejects_unknown_wire_values() {
+        let message = PeerTransportMessage {
+            protocol: super::PeerTransportProtocolVersion { major: 1, minor: 0 },
+            command: super::PeerTransportCommandPayload::ForwardInput {
+                event: super::PeerTransportInputEvent::Key {
+                    key: "notARealKey".to_string(),
+                    state: "pressed".to_string(),
+                },
+            },
+        };
+
+        let error = message
+            .into_command()
+            .expect_err("unknown key should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported peer transport value: notARealKey"
+        );
+    }
+
+    #[test]
+    fn tcp_peer_transport_sends_commands_over_loopback() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread =
+            std::thread::spawn(move || serve_tcp_peer_transport_commands(&listener, 4));
+        let transport = TcpPeerTransport::new(PeerId::new("right-peer"), address);
+        let dispatcher = TransportCoreActionDispatcher::new(transport);
+        let crossing = EdgeCrossing {
+            peer_id: PeerId::new("right-peer"),
+            local_edge: ScreenEdge::Right,
+            remote_edge: ScreenEdge::Left,
+            exit_position: LogicalPoint { x: 1920, y: 540 },
+            edge_offset: 540,
+        };
+
+        dispatcher
+            .dispatch_core_actions(&[
+                CoreAction::StartRemoteSession {
+                    peer_id: PeerId::new("right-peer"),
+                    crossing: Some(crossing.clone()),
+                },
+                CoreAction::ForwardInput {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 8,
+                        delta_y: 2,
+                    },
+                },
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-1")),
+                },
+            ])
+            .expect("TCP peer transport dispatch");
+        let commands = server_thread
+            .join()
+            .expect("TCP peer transport server thread")
+            .expect("TCP peer transport commands");
+
+        assert_eq!(
+            commands,
+            vec![
+                DaemonTransportCommand::StartRemoteSession {
+                    peer_id: PeerId::new("right-peer"),
+                    crossing: Some(crossing),
+                },
+                DaemonTransportCommand::ForwardInput {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 8,
+                        delta_y: 2,
+                    },
+                },
+                DaemonTransportCommand::ReleaseAllInputs,
+                DaemonTransportCommand::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-1")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tcp_peer_transport_rejects_start_commands_for_other_peers() {
+        let transport = TcpPeerTransport::new(
+            PeerId::new("right-peer"),
+            "127.0.0.1:9".parse().expect("discard address"),
+        );
+
+        let error = transport
+            .dispatch_transport_command(DaemonTransportCommand::StartRemoteSession {
+                peer_id: PeerId::new("left-peer"),
+                crossing: None,
+            })
+            .expect_err("peer mismatch should be rejected before connect");
+
+        assert_eq!(
+            error.to_string(),
+            "peer transport configured for right-peer, got start command for left-peer"
         );
     }
 

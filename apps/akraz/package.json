@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "smoke:daemon-lifecycle": "bun scripts/smoke-daemon-lifecycle.mjs",
     "smoke:loopback-transport": "bun scripts/smoke-loopback-transport.mjs",
     "smoke:settings-start": "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
+    "smoke:tcp-transport": "bun scripts/smoke-tcp-transport.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

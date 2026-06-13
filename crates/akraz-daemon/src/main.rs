@@ -1,6 +1,8 @@
 use std::env;
 use std::fmt::{Display, Formatter};
+use std::net::TcpListener;
 use std::process::ExitCode;
+use std::thread;
 
 use akraz_core::{
     CoreAction, EdgeCrossing, InjectedInputEvent, LogicalPoint, MouseButton, PeerId, PhysicalKey,
@@ -8,8 +10,9 @@ use akraz_core::{
 };
 use akraz_daemon::{
     CoreActionDispatcher, DaemonInputCaptureConfig, DaemonInputCaptureWorker, DaemonIpcRunConfig,
-    DaemonIpcServer, DaemonTransportCommand, LoopbackPeerTransport, TransportCoreActionDispatcher,
-    build_daemon_status, serve_daemon_ipc, start_daemon_input_capture_with_edge_bindings,
+    DaemonIpcServer, DaemonTransportCommand, LoopbackPeerTransport, TcpPeerTransport,
+    TransportCoreActionDispatcher, build_daemon_status, serve_daemon_ipc,
+    serve_tcp_peer_transport_commands, start_daemon_input_capture_with_edge_bindings,
 };
 use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
 use akraz_platform::runtime_platform_adapter;
@@ -26,6 +29,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(DaemonCommand::LoopbackTransportSmoke) => run_loopback_transport_smoke(),
+        Ok(DaemonCommand::TcpTransportSmoke) => run_tcp_transport_smoke(),
         Ok(DaemonCommand::Serve(options)) => run_daemon(options),
         Err(error) => {
             eprintln!("{error}");
@@ -151,6 +155,25 @@ fn run_loopback_transport_smoke() -> ExitCode {
     }
 }
 
+fn run_tcp_transport_smoke() -> ExitCode {
+    match build_tcp_transport_smoke_report() {
+        Ok(report) => match serde_json::to_string(&report) {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("failed to encode TCP transport smoke report: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("TCP transport smoke failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn build_loopback_transport_smoke_report()
 -> Result<LoopbackTransportSmokeReport, akraz_platform::PlatformError> {
     let transport = LoopbackPeerTransport::new();
@@ -162,6 +185,39 @@ fn build_loopback_transport_smoke_report()
         daemon_version: env!("CARGO_PKG_VERSION"),
         commands: transport
             .snapshot()?
+            .iter()
+            .map(LoopbackTransportSmokeCommand::from)
+            .collect(),
+    })
+}
+
+fn build_tcp_transport_smoke_report()
+-> Result<LoopbackTransportSmokeReport, akraz_platform::PlatformError> {
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| {
+        akraz_platform::PlatformError::new(format!(
+            "failed to bind TCP transport smoke listener: {error}"
+        ))
+    })?;
+    let address = listener.local_addr().map_err(|error| {
+        akraz_platform::PlatformError::new(format!(
+            "failed to read TCP transport smoke listener address: {error}"
+        ))
+    })?;
+    let server_thread = thread::spawn(move || {
+        serve_tcp_peer_transport_commands(&listener, loopback_transport_smoke_actions().len())
+    });
+    let transport = TcpPeerTransport::new(PeerId::new("loopback-peer"), address);
+    let dispatcher = TransportCoreActionDispatcher::new(transport);
+
+    dispatcher.dispatch_core_actions(&loopback_transport_smoke_actions())?;
+
+    let commands = server_thread
+        .join()
+        .map_err(|_| akraz_platform::PlatformError::new("TCP transport smoke server panicked"))??;
+
+    Ok(LoopbackTransportSmokeReport {
+        daemon_version: env!("CARGO_PKG_VERSION"),
+        commands: commands
             .iter()
             .map(LoopbackTransportSmokeCommand::from)
             .collect(),
@@ -346,6 +402,7 @@ enum DaemonCommand {
     Status,
     Version,
     LoopbackTransportSmoke,
+    TcpTransportSmoke,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -370,6 +427,9 @@ where
         "--status" => reject_trailing_args(args, DaemonCommand::Status),
         "--akraz-smoke-loopback-transport" => {
             reject_trailing_args(args, DaemonCommand::LoopbackTransportSmoke)
+        }
+        "--akraz-smoke-tcp-transport" => {
+            reject_trailing_args(args, DaemonCommand::TcpTransportSmoke)
         }
         "--serve" => parse_serve_options(args),
         argument
@@ -503,7 +563,7 @@ mod tests {
     use super::{
         DaemonCommand, DaemonUsageError, LoopbackTransportSmokeCommand,
         LoopbackTransportSmokeInputEvent, ServeOptions, build_loopback_transport_smoke_report,
-        format_daemon_ipc_error, parse_daemon_command,
+        build_tcp_transport_smoke_report, format_daemon_ipc_error, parse_daemon_command,
     };
 
     #[test]
@@ -621,9 +681,55 @@ mod tests {
     }
 
     #[test]
+    fn parses_hidden_tcp_transport_smoke_command() {
+        assert_eq!(
+            parse_daemon_command(["--akraz-smoke-tcp-transport"].map(String::from)),
+            Ok(DaemonCommand::TcpTransportSmoke)
+        );
+        assert_eq!(
+            parse_daemon_command(["--akraz-smoke-tcp-transport", "--once"].map(String::from)),
+            Err(DaemonUsageError::UnknownArgument("--once".to_string()))
+        );
+    }
+
+    #[test]
     fn loopback_transport_smoke_report_covers_transport_commands() {
         let report =
             build_loopback_transport_smoke_report().expect("loopback transport smoke report");
+
+        assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(report.commands.len(), 4);
+        assert!(matches!(
+            &report.commands[0],
+            LoopbackTransportSmokeCommand::StartRemoteSession {
+                peer_id,
+                crossing: Some(_),
+            } if peer_id == "loopback-peer"
+        ));
+        assert_eq!(
+            report.commands[1],
+            LoopbackTransportSmokeCommand::ForwardInput {
+                event: LoopbackTransportSmokeInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            }
+        );
+        assert_eq!(
+            report.commands[2],
+            LoopbackTransportSmokeCommand::ReleaseAllInputs
+        );
+        assert!(matches!(
+            &report.commands[3],
+            LoopbackTransportSmokeCommand::StopRemoteSession {
+                session_id: Some(session_id),
+            } if session_id == "loopback-session"
+        ));
+    }
+
+    #[test]
+    fn tcp_transport_smoke_report_covers_network_transport_commands() {
+        let report = build_tcp_transport_smoke_report().expect("TCP transport smoke report");
 
         assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(report.commands.len(), 4);
