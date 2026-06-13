@@ -9,8 +9,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use akraz_core::{
-    CapturedInputEvent, ControlMode, CoreAction, CoreTransitionError, LogicalPoint, RuntimeEvent,
-    RuntimeInputState, ScreenEdgeBinding, ScreenLayout,
+    CapturedInputEvent, ControlMode, CoreAction, CoreTransitionError, EdgeCrossing,
+    InjectedInputEvent, LogicalPoint, PeerId, RuntimeEvent, RuntimeInputState, ScreenEdgeBinding,
+    ScreenLayout, SessionId,
 };
 use akraz_ipc::{
     DaemonStatus, IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError,
@@ -44,6 +45,78 @@ pub struct NoopCoreActionDispatcher;
 
 impl CoreActionDispatcher for NoopCoreActionDispatcher {
     fn dispatch_core_actions(&self, _actions: &[CoreAction]) -> Result<(), PlatformError> {
+        Ok(())
+    }
+}
+
+/// Transport-facing command derived from a core side-effect action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonTransportCommand {
+    StartRemoteSession {
+        peer_id: PeerId,
+        crossing: Option<EdgeCrossing>,
+    },
+    ForwardInput {
+        event: InjectedInputEvent,
+    },
+    ReleaseAllInputs,
+    StopRemoteSession {
+        session_id: Option<SessionId>,
+    },
+}
+
+impl From<&CoreAction> for DaemonTransportCommand {
+    fn from(action: &CoreAction) -> Self {
+        match action {
+            CoreAction::StartRemoteSession { peer_id, crossing } => Self::StartRemoteSession {
+                peer_id: peer_id.clone(),
+                crossing: crossing.clone(),
+            },
+            CoreAction::ForwardInput { event } => Self::ForwardInput {
+                event: event.clone(),
+            },
+            CoreAction::ReleaseAllInputs => Self::ReleaseAllInputs,
+            CoreAction::StopRemoteSession { session_id } => Self::StopRemoteSession {
+                session_id: session_id.clone(),
+            },
+        }
+    }
+}
+
+/// Peer transport boundary used by the daemon imperative shell.
+pub trait DaemonPeerTransport: Send + Sync + 'static {
+    fn dispatch_transport_command(
+        &self,
+        command: DaemonTransportCommand,
+    ) -> Result<(), PlatformError>;
+}
+
+/// Core action dispatcher that maps core effects into peer transport commands.
+#[derive(Debug, Clone)]
+pub struct TransportCoreActionDispatcher<T> {
+    transport: T,
+}
+
+impl<T> TransportCoreActionDispatcher<T> {
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+}
+
+impl<T> CoreActionDispatcher for TransportCoreActionDispatcher<T>
+where
+    T: DaemonPeerTransport,
+{
+    fn dispatch_core_actions(&self, actions: &[CoreAction]) -> Result<(), PlatformError> {
+        for action in actions {
+            self.transport
+                .dispatch_transport_command(DaemonTransportCommand::from(action))?;
+        }
+
         Ok(())
     }
 }
@@ -640,9 +713,10 @@ mod tests {
 
     use super::{
         CapturedInputRouter, CoreActionDispatcher, DAEMON_VERSION, DaemonInputCaptureConfig,
-        DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer,
-        apply_routed_capture_event_to_state, build_daemon_status, build_permissions_probe,
-        drain_capture_events, handle_ipc_request_line, serve_daemon_ipc, shared_runtime_state,
+        DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer, DaemonPeerTransport,
+        DaemonTransportCommand, TransportCoreActionDispatcher, apply_routed_capture_event_to_state,
+        build_daemon_status, build_permissions_probe, drain_capture_events,
+        handle_ipc_request_line, serve_daemon_ipc, shared_runtime_state,
         start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
         start_daemon_input_capture_with_routing,
         start_daemon_input_capture_with_routing_and_dispatcher,
@@ -767,6 +841,45 @@ mod tests {
                 .extend_from_slice(actions);
 
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Default, Clone)]
+    struct RecordingPeerTransport {
+        commands: std::sync::Arc<std::sync::Mutex<Vec<DaemonTransportCommand>>>,
+    }
+
+    impl RecordingPeerTransport {
+        fn snapshot(&self) -> Vec<DaemonTransportCommand> {
+            self.commands.lock().expect("recorded command lock").clone()
+        }
+    }
+
+    impl DaemonPeerTransport for RecordingPeerTransport {
+        fn dispatch_transport_command(
+            &self,
+            command: DaemonTransportCommand,
+        ) -> Result<(), PlatformError> {
+            self.commands
+                .lock()
+                .map_err(|_| PlatformError::new("recorded command lock was poisoned"))?
+                .push(command);
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FailingPeerTransport {
+        message: &'static str,
+    }
+
+    impl DaemonPeerTransport for FailingPeerTransport {
+        fn dispatch_transport_command(
+            &self,
+            _command: DaemonTransportCommand,
+        ) -> Result<(), PlatformError> {
+            Err(PlatformError::new(self.message))
         }
     }
 
@@ -962,6 +1075,74 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn transport_dispatcher_maps_core_actions_in_order() {
+        let transport = RecordingPeerTransport::default();
+        let dispatcher = TransportCoreActionDispatcher::new(transport.clone());
+        let crossing = EdgeCrossing {
+            peer_id: PeerId::new("right-peer"),
+            local_edge: ScreenEdge::Right,
+            remote_edge: ScreenEdge::Left,
+            exit_position: LogicalPoint { x: 1920, y: 540 },
+            edge_offset: 540,
+        };
+
+        dispatcher
+            .dispatch_core_actions(&[
+                CoreAction::StartRemoteSession {
+                    peer_id: PeerId::new("right-peer"),
+                    crossing: Some(crossing.clone()),
+                },
+                CoreAction::ForwardInput {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 8,
+                        delta_y: 2,
+                    },
+                },
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-1")),
+                },
+            ])
+            .expect("transport command dispatch");
+
+        assert_eq!(
+            transport.snapshot(),
+            vec![
+                DaemonTransportCommand::StartRemoteSession {
+                    peer_id: PeerId::new("right-peer"),
+                    crossing: Some(crossing),
+                },
+                DaemonTransportCommand::ForwardInput {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 8,
+                        delta_y: 2,
+                    },
+                },
+                DaemonTransportCommand::ReleaseAllInputs,
+                DaemonTransportCommand::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-1")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transport_dispatcher_returns_transport_failure() {
+        let dispatcher = TransportCoreActionDispatcher::new(FailingPeerTransport {
+            message: "peer transport unavailable",
+        });
+
+        let error = dispatcher
+            .dispatch_core_actions(&[CoreAction::StartRemoteSession {
+                peer_id: PeerId::new("right-peer"),
+                crossing: None,
+            }])
+            .expect_err("transport error should be returned");
+
+        assert_eq!(error.to_string(), "peer transport unavailable");
     }
 
     #[test]
@@ -1218,6 +1399,58 @@ mod tests {
 
         worker.stop().expect("stop capture worker");
         panic!("expected capture worker to dispatch edge crossing action");
+    }
+
+    #[test]
+    fn daemon_input_capture_worker_dispatches_edge_crossing_transport_command() {
+        let platform = FakePlatformAdapter::default().with_captured_events(vec![
+            CapturedInputEvent::PointerMoved {
+                delta_x: 1,
+                delta_y: 0,
+            },
+        ]);
+        let state = shared_runtime_state(RuntimeInputState::new());
+        let transport = RecordingPeerTransport::default();
+        let dispatcher = TransportCoreActionDispatcher::new(transport.clone());
+        let expected_command = DaemonTransportCommand::StartRemoteSession {
+            peer_id: PeerId::new("right-peer"),
+            crossing: Some(EdgeCrossing {
+                peer_id: PeerId::new("right-peer"),
+                local_edge: ScreenEdge::Right,
+                remote_edge: ScreenEdge::Left,
+                exit_position: LogicalPoint { x: 1920, y: 540 },
+                edge_offset: 540,
+            }),
+        };
+
+        let worker = start_daemon_input_capture_with_routing_and_dispatcher(
+            state,
+            &platform,
+            DaemonInputCaptureConfig {
+                input_capture: InputCaptureConfig {
+                    event_buffer_capacity: 8,
+                },
+                drain_batch_size: 8,
+                idle_poll_interval: std::time::Duration::from_millis(1),
+            },
+            DaemonInputRoutingConfig {
+                screen_layout: right_edge_layout(),
+                initial_pointer: LogicalPoint { x: 1919, y: 540 },
+            },
+            dispatcher,
+        )
+        .expect("daemon capture worker");
+
+        for _ in 0..20 {
+            if transport.snapshot().contains(&expected_command) {
+                worker.stop().expect("stop capture worker");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        worker.stop().expect("stop capture worker");
+        panic!("expected capture worker to dispatch edge crossing transport command");
     }
 
     #[test]
