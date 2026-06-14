@@ -1,5 +1,6 @@
 use std::env;
 use std::fmt::{Display, Formatter};
+use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use akraz_ipc::{
@@ -20,6 +21,13 @@ fn main() -> ExitCode {
         }
         Some("status") => match parse_endpoint_options(args) {
             Ok(options) => print_status(options),
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::from(2)
+            }
+        },
+        Some("daemon-args") => match parse_daemon_args_options(args) {
+            Ok(options) => print_daemon_args(options),
             Err(error) => {
                 eprintln!("{error}");
                 ExitCode::from(2)
@@ -47,7 +55,7 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
         None => {
-            eprintln!("usage: akrazctl <status|permissions probe|--version>");
+            eprintln!("usage: akrazctl <status|permissions probe|daemon-args|--version>");
             ExitCode::from(2)
         }
     }
@@ -75,6 +83,11 @@ fn print_permissions_probe(options: EndpointOptions) -> ExitCode {
     );
 
     print_local_daemon_response(options.endpoint, &request)
+}
+
+fn print_daemon_args(options: DaemonArgsOptions) -> ExitCode {
+    println!("{}", format_daemon_command_line(&options));
+    ExitCode::SUCCESS
 }
 
 fn print_local_daemon_response<P>(
@@ -144,6 +157,15 @@ struct EndpointOptions {
     endpoint: Option<IpcEndpoint>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonArgsOptions {
+    capture_input: bool,
+    edge_bindings: Vec<String>,
+    peer_listen: Option<String>,
+    peer_session: Option<String>,
+    local_device_id: Option<String>,
+}
+
 fn parse_endpoint_options<I>(args: I) -> Result<EndpointOptions, CliUsageError>
 where
     I: IntoIterator<Item = String>,
@@ -165,11 +187,251 @@ where
     Ok(EndpointOptions { endpoint })
 }
 
+fn parse_daemon_args_options<I>(args: I) -> Result<DaemonArgsOptions, CliUsageError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut options = DaemonArgsOptions {
+        capture_input: false,
+        edge_bindings: Vec::new(),
+        peer_listen: None,
+        peer_session: None,
+        local_device_id: None,
+    };
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        if argument == "--capture-input" {
+            options.capture_input = true;
+        } else if let Some(value) = argument.strip_prefix("--edge-binding=") {
+            options
+                .edge_bindings
+                .push(normalize_edge_binding_arg(value)?);
+        } else if argument == "--edge-binding" {
+            let value = args
+                .next()
+                .ok_or(CliUsageError::MissingDaemonOptionValue("--edge-binding"))?;
+            options
+                .edge_bindings
+                .push(normalize_edge_binding_arg(&value)?);
+        } else if let Some(value) = argument.strip_prefix("--peer-listen=") {
+            set_once_daemon_option(
+                "--peer-listen",
+                &mut options.peer_listen,
+                normalize_socket_addr_arg("--peer-listen", value)?,
+            )?;
+        } else if argument == "--peer-listen" {
+            let value = args
+                .next()
+                .ok_or(CliUsageError::MissingDaemonOptionValue("--peer-listen"))?;
+            let value = normalize_socket_addr_arg("--peer-listen", &value)?;
+            set_once_daemon_option("--peer-listen", &mut options.peer_listen, value)?;
+        } else if let Some(value) = argument.strip_prefix("--peer-session=") {
+            set_once_daemon_option(
+                "--peer-session",
+                &mut options.peer_session,
+                normalize_peer_session_arg(value)?,
+            )?;
+        } else if argument == "--peer-session" {
+            let value = args
+                .next()
+                .ok_or(CliUsageError::MissingDaemonOptionValue("--peer-session"))?;
+            let value = normalize_peer_session_arg(&value)?;
+            set_once_daemon_option("--peer-session", &mut options.peer_session, value)?;
+        } else if let Some(value) = argument.strip_prefix("--local-device-id=") {
+            set_once_daemon_option(
+                "--local-device-id",
+                &mut options.local_device_id,
+                normalize_local_device_id_arg(value)?,
+            )?;
+        } else if argument == "--local-device-id" {
+            let value = args
+                .next()
+                .ok_or(CliUsageError::MissingDaemonOptionValue("--local-device-id"))?;
+            let value = normalize_local_device_id_arg(&value)?;
+            set_once_daemon_option("--local-device-id", &mut options.local_device_id, value)?;
+        } else {
+            return Err(CliUsageError::UnknownDaemonArgsOption(argument));
+        }
+    }
+
+    if options.peer_session.is_some() && options.local_device_id.is_none() {
+        return Err(CliUsageError::PeerSessionRequiresLocalDeviceId);
+    }
+
+    Ok(options)
+}
+
+fn set_once_daemon_option(
+    option_name: &'static str,
+    target: &mut Option<String>,
+    value: String,
+) -> Result<(), CliUsageError> {
+    if target.is_some() {
+        return Err(CliUsageError::DuplicateDaemonOption(option_name));
+    }
+
+    *target = Some(value);
+    Ok(())
+}
+
+fn normalize_edge_binding_arg(value: &str) -> Result<String, CliUsageError> {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(CliUsageError::InvalidDaemonOptionValue {
+            option: "--edge-binding",
+            value: value.to_string(),
+            reason: "expected <local-edge>:<peer-id>:<remote-edge>".to_string(),
+        });
+    }
+
+    let local_edge = normalize_screen_edge("--edge-binding", parts[0])?;
+    let peer_id = normalize_peer_id("--edge-binding", parts[1])?;
+    let remote_edge = normalize_screen_edge("--edge-binding", parts[2])?;
+
+    Ok(format!("{local_edge}:{peer_id}:{remote_edge}"))
+}
+
+fn normalize_screen_edge(option_name: &'static str, value: &str) -> Result<String, CliUsageError> {
+    let value = normalize_shell_safe_arg(option_name, value)?;
+    match value.to_ascii_lowercase().as_str() {
+        "left" => Ok("left".to_string()),
+        "right" => Ok("right".to_string()),
+        "top" => Ok("top".to_string()),
+        "bottom" => Ok("bottom".to_string()),
+        _ => Err(CliUsageError::InvalidDaemonOptionValue {
+            option: option_name,
+            value,
+            reason: "edge must be one of left, right, top, bottom".to_string(),
+        }),
+    }
+}
+
+fn normalize_peer_id(option_name: &'static str, value: &str) -> Result<String, CliUsageError> {
+    let value = normalize_shell_safe_arg(option_name, value)?;
+    if value.contains(':') || value.contains('@') {
+        return Err(CliUsageError::InvalidDaemonOptionValue {
+            option: option_name,
+            value,
+            reason: "peer id must not contain ':' or '@'".to_string(),
+        });
+    }
+
+    Ok(value)
+}
+
+fn normalize_socket_addr_arg(
+    option_name: &'static str,
+    value: &str,
+) -> Result<String, CliUsageError> {
+    let value = normalize_shell_safe_arg(option_name, value)?;
+    if value.parse::<SocketAddr>().is_err() {
+        return Err(CliUsageError::InvalidDaemonOptionValue {
+            option: option_name,
+            value,
+            reason: "expected <ip>:<port> socket address".to_string(),
+        });
+    }
+
+    Ok(value)
+}
+
+fn normalize_peer_session_arg(value: &str) -> Result<String, CliUsageError> {
+    let value = normalize_shell_safe_arg("--peer-session", value)?;
+    let (peer_id, address) =
+        value
+            .split_once('@')
+            .ok_or_else(|| CliUsageError::InvalidDaemonOptionValue {
+                option: "--peer-session",
+                value: value.clone(),
+                reason: "expected <peer-id>@<ip>:<port>".to_string(),
+            })?;
+    if address.contains('@') {
+        return Err(CliUsageError::InvalidDaemonOptionValue {
+            option: "--peer-session",
+            value,
+            reason: "expected exactly one '@' separator".to_string(),
+        });
+    }
+
+    let peer_id = normalize_peer_id("--peer-session", peer_id)?;
+    let address = normalize_socket_addr_arg("--peer-session", address)?;
+
+    Ok(format!("{peer_id}@{address}"))
+}
+
+fn normalize_local_device_id_arg(value: &str) -> Result<String, CliUsageError> {
+    normalize_shell_safe_arg("--local-device-id", value)
+}
+
+fn normalize_shell_safe_arg(
+    option_name: &'static str,
+    value: &str,
+) -> Result<String, CliUsageError> {
+    if value.is_empty() {
+        return Err(CliUsageError::InvalidDaemonOptionValue {
+            option: option_name,
+            value: value.to_string(),
+            reason: "value must not be empty".to_string(),
+        });
+    }
+    if value.trim() != value {
+        return Err(CliUsageError::InvalidDaemonOptionValue {
+            option: option_name,
+            value: value.to_string(),
+            reason: "value must not start or end with whitespace".to_string(),
+        });
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(CliUsageError::InvalidDaemonOptionValue {
+            option: option_name,
+            value: value.to_string(),
+            reason: "value must not contain whitespace".to_string(),
+        });
+    }
+
+    Ok(value.to_string())
+}
+
+fn format_daemon_command_line(options: &DaemonArgsOptions) -> String {
+    let mut command = vec!["akraz-daemon".to_string(), "--serve".to_string()];
+    if options.capture_input {
+        command.push("--capture-input".to_string());
+    }
+    for edge_binding in &options.edge_bindings {
+        command.push("--edge-binding".to_string());
+        command.push(edge_binding.clone());
+    }
+    if let Some(peer_listen) = &options.peer_listen {
+        command.push("--peer-listen".to_string());
+        command.push(peer_listen.clone());
+    }
+    if let Some(local_device_id) = &options.local_device_id {
+        command.push("--local-device-id".to_string());
+        command.push(local_device_id.clone());
+    }
+    if let Some(peer_session) = &options.peer_session {
+        command.push("--peer-session".to_string());
+        command.push(peer_session.clone());
+    }
+
+    command.join(" ")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliUsageError {
     MissingEndpointValue,
+    MissingDaemonOptionValue(&'static str),
+    DuplicateDaemonOption(&'static str),
+    PeerSessionRequiresLocalDeviceId,
     InvalidEndpoint(String),
+    InvalidDaemonOptionValue {
+        option: &'static str,
+        value: String,
+        reason: String,
+    },
     UnknownStatusOption(String),
+    UnknownDaemonArgsOption(String),
 }
 
 impl From<akraz_ipc::IpcEndpointError> for CliUsageError {
@@ -182,9 +444,28 @@ impl Display for CliUsageError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingEndpointValue => formatter.write_str("missing value for --endpoint"),
+            Self::MissingDaemonOptionValue(option) => {
+                write!(formatter, "missing value for {option}")
+            }
+            Self::DuplicateDaemonOption(option) => {
+                write!(formatter, "{option} can only be provided once")
+            }
+            Self::PeerSessionRequiresLocalDeviceId => {
+                formatter.write_str("--peer-session requires --local-device-id")
+            }
             Self::InvalidEndpoint(error) => write!(formatter, "invalid endpoint: {error}"),
+            Self::InvalidDaemonOptionValue {
+                option,
+                value,
+                reason,
+            } => {
+                write!(formatter, "invalid value for {option}: {value} ({reason})")
+            }
             Self::UnknownStatusOption(argument) => {
                 write!(formatter, "unknown status option: {argument}")
+            }
+            Self::UnknownDaemonArgsOption(argument) => {
+                write!(formatter, "unknown daemon-args option: {argument}")
             }
         }
     }
@@ -217,8 +498,9 @@ mod tests {
     };
 
     use super::{
-        CliRuntimeError, CliUsageError, EndpointOptions, LOCAL_REQUEST_ID, METHOD_DAEMON_STATUS,
-        build_daemon_client_with_resolver, format_daemon_call_error, parse_endpoint_options,
+        CliRuntimeError, CliUsageError, DaemonArgsOptions, EndpointOptions, LOCAL_REQUEST_ID,
+        METHOD_DAEMON_STATUS, build_daemon_client_with_resolver, format_daemon_call_error,
+        format_daemon_command_line, parse_daemon_args_options, parse_endpoint_options,
     };
 
     #[test]
@@ -252,6 +534,126 @@ mod tests {
         assert_eq!(
             parse_endpoint_options(["--bad"].map(String::from)),
             Err(CliUsageError::UnknownStatusOption("--bad".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_manual_source_daemon_args() {
+        let options = parse_daemon_args_options(
+            [
+                "--capture-input",
+                "--edge-binding",
+                "RIGHT:linux-laptop:LEFT",
+                "--local-device-id",
+                "windows-desktop",
+                "--peer-session",
+                "linux-laptop@127.0.0.1:24888",
+            ]
+            .map(String::from),
+        );
+
+        assert_eq!(
+            options,
+            Ok(DaemonArgsOptions {
+                capture_input: true,
+                edge_bindings: vec!["right:linux-laptop:left".to_string()],
+                peer_listen: None,
+                peer_session: Some("linux-laptop@127.0.0.1:24888".to_string()),
+                local_device_id: Some("windows-desktop".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_manual_target_daemon_args() {
+        let options = parse_daemon_args_options(["--peer-listen=0.0.0.0:24888"].map(String::from));
+
+        assert_eq!(
+            options,
+            Ok(DaemonArgsOptions {
+                capture_input: false,
+                edge_bindings: Vec::new(),
+                peer_listen: Some("0.0.0.0:24888".to_string()),
+                peer_session: None,
+                local_device_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn formats_manual_daemon_command_line() {
+        let options = DaemonArgsOptions {
+            capture_input: true,
+            edge_bindings: vec!["right:linux-laptop:left".to_string()],
+            peer_listen: Some("127.0.0.1:24887".to_string()),
+            peer_session: Some("linux-laptop@127.0.0.1:24888".to_string()),
+            local_device_id: Some("windows-desktop".to_string()),
+        };
+
+        assert_eq!(
+            format_daemon_command_line(&options),
+            "akraz-daemon --serve --capture-input --edge-binding right:linux-laptop:left --peer-listen 127.0.0.1:24887 --local-device-id windows-desktop --peer-session linux-laptop@127.0.0.1:24888"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_manual_daemon_args() {
+        assert_eq!(
+            parse_daemon_args_options(["--edge-binding"].map(String::from)),
+            Err(CliUsageError::MissingDaemonOptionValue("--edge-binding"))
+        );
+        assert_eq!(
+            parse_daemon_args_options(["--peer-listen", "not-an-address"].map(String::from)),
+            Err(CliUsageError::InvalidDaemonOptionValue {
+                option: "--peer-listen",
+                value: "not-an-address".to_string(),
+                reason: "expected <ip>:<port> socket address".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_daemon_args_options(
+                ["--peer-session", "linux-laptop@127.0.0.1:24888"].map(String::from)
+            ),
+            Err(CliUsageError::PeerSessionRequiresLocalDeviceId)
+        );
+        assert_eq!(
+            parse_daemon_args_options(
+                [
+                    "--local-device-id",
+                    "windows-desktop",
+                    "--peer-session",
+                    "linux-laptop@bad-address",
+                ]
+                .map(String::from)
+            ),
+            Err(CliUsageError::InvalidDaemonOptionValue {
+                option: "--peer-session",
+                value: "bad-address".to_string(),
+                reason: "expected <ip>:<port> socket address".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_daemon_args_options(["--edge-binding", "east:peer:left"].map(String::from)),
+            Err(CliUsageError::InvalidDaemonOptionValue {
+                option: "--edge-binding",
+                value: "east".to_string(),
+                reason: "edge must be one of left, right, top, bottom".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_daemon_args_options(
+                [
+                    "--peer-listen",
+                    "127.0.0.1:24887",
+                    "--peer-listen=127.0.0.1:24888"
+                ]
+                .map(String::from)
+            ),
+            Err(CliUsageError::DuplicateDaemonOption("--peer-listen"))
+        );
+        assert_eq!(
+            parse_daemon_args_options(["--bad"].map(String::from)),
+            Err(CliUsageError::UnknownDaemonArgsOption("--bad".to_string()))
         );
     }
 
