@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-import type { DaemonLifecycleSnapshot, DaemonStartOptions } from "./types";
+import type { DaemonLifecycleSnapshot, DaemonStartOptions, SessionConnectParams } from "./types";
 
 export const daemonClient = {
   status(): Promise<DaemonLifecycleSnapshot> {
@@ -13,5 +13,13 @@ export const daemonClient = {
 
   stop(): Promise<DaemonLifecycleSnapshot> {
     return invoke<DaemonLifecycleSnapshot>("daemon_stop");
+  },
+
+  connectSession(params: SessionConnectParams): Promise<DaemonLifecycleSnapshot> {
+    return invoke<DaemonLifecycleSnapshot>("session_connect", { params });
+  },
+
+  disconnectSession(): Promise<DaemonLifecycleSnapshot> {
+    return invoke<DaemonLifecycleSnapshot>("session_disconnect");
   },
 };

@@ -10,7 +10,9 @@ use std::time::Duration;
 use akraz_ipc::{
     DaemonStatus, DaemonStatusParams, IpcCallError, IpcEndpoint, IpcTransportError,
     JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient,
-    METHOD_DAEMON_STATUS, OsLocalIpcClient, call_json_rpc, resolve_current_default_endpoint,
+    METHOD_DAEMON_STATUS, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
+    SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult, call_json_rpc,
+    resolve_current_default_endpoint,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -61,6 +63,8 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
             daemon_status,
             daemon_start,
             daemon_stop,
+            session_connect,
+            session_disconnect,
             settings_load,
             settings_save
         ])
@@ -257,6 +261,20 @@ async fn daemon_stop(
 }
 
 #[tauri::command]
+async fn session_connect(params: SessionConnectOptions) -> Result<DaemonLifecycleSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || connect_daemon_session(params))
+        .await
+        .map_err(|error| format!("session connect task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn session_disconnect() -> Result<DaemonLifecycleSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(disconnect_daemon_session)
+        .await
+        .map_err(|error| format!("session disconnect task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn settings_load(app: tauri::AppHandle) -> Result<AppSettings, String> {
     tauri::async_runtime::spawn_blocking(move || load_app_settings(&app))
         .await
@@ -340,6 +358,14 @@ struct DaemonStartOptions {
     edge_bindings: Vec<DaemonEdgeBindingOption>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionConnectOptions {
+    peer_id: String,
+    local_device_id: String,
+    address: String,
+}
+
 impl From<AppSettings> for DaemonStartOptions {
     fn from(settings: AppSettings) -> Self {
         Self {
@@ -406,6 +432,10 @@ impl DaemonLifecycleSnapshot {
         }
     }
 
+    fn running_without_managed_pid(status: DaemonStatus) -> Self {
+        Self::running(status, None)
+    }
+
     fn not_running(detail: impl Into<String>) -> Self {
         Self::without_status(DaemonLifecyclePhase::NotRunning, detail)
     }
@@ -444,6 +474,31 @@ impl DaemonLifecycleSnapshot {
     fn with_managed_pid(mut self, managed_pid: Option<u32>) -> Self {
         self.managed_pid = managed_pid;
         self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonCallFailure {
+    NotRunning(String),
+    Unreachable(String),
+    Failed(String),
+}
+
+impl DaemonCallFailure {
+    fn into_snapshot(self) -> DaemonLifecycleSnapshot {
+        match self {
+            Self::NotRunning(detail) => DaemonLifecycleSnapshot::not_running(detail),
+            Self::Unreachable(detail) => DaemonLifecycleSnapshot::unreachable(detail),
+            Self::Failed(detail) => DaemonLifecycleSnapshot::failed(detail),
+        }
+    }
+
+    fn to_user_message(&self) -> String {
+        match self {
+            Self::NotRunning(detail) | Self::Unreachable(detail) | Self::Failed(detail) => {
+                detail.clone()
+            }
+        }
     }
 }
 
@@ -542,11 +597,11 @@ fn wait_for_stopped_daemon_snapshot() -> DaemonLifecycleSnapshot {
 }
 
 fn call_daemon_status() -> Result<DaemonStatus, DaemonLifecycleSnapshot> {
-    let endpoint = match resolve_current_default_endpoint() {
-        Ok(endpoint) => endpoint,
-        Err(error) => return Err(DaemonLifecycleSnapshot::failed(error.to_string())),
-    };
-    let client = OsLocalIpcClient::new(endpoint);
+    call_daemon_status_result().map_err(|error| error.into_snapshot())
+}
+
+fn call_daemon_status_result() -> Result<DaemonStatus, DaemonCallFailure> {
+    let client = build_default_daemon_client()?;
     let request = JsonRpcRequest::new(
         LOCAL_REQUEST_ID,
         METHOD_DAEMON_STATUS,
@@ -555,7 +610,55 @@ fn call_daemon_status() -> Result<DaemonStatus, DaemonLifecycleSnapshot> {
     let response_line = call_json_rpc(&client, &request)
         .map_err(|error| classify_daemon_call_error(&error, client.endpoint()))?;
 
-    parse_daemon_status_response(&response_line).map_err(DaemonLifecycleSnapshot::failed)
+    parse_json_rpc_response::<DaemonStatus>(&response_line, "status")
+        .map_err(DaemonCallFailure::Failed)
+}
+
+fn connect_daemon_session(
+    params: SessionConnectOptions,
+) -> Result<DaemonLifecycleSnapshot, String> {
+    let params = normalize_session_connect_options(params)?;
+    call_daemon_session_connect(params)?;
+    call_daemon_status_result()
+        .map(DaemonLifecycleSnapshot::running_without_managed_pid)
+        .map_err(|error| error.to_user_message())
+}
+
+fn call_daemon_session_connect(params: SessionConnectOptions) -> Result<(), String> {
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    let request = JsonRpcRequest::new(LOCAL_REQUEST_ID, METHOD_SESSION_CONNECT, params);
+    let response_line = call_json_rpc(&client, &request)
+        .map_err(|error| classify_daemon_call_error(&error, client.endpoint()).to_user_message())?;
+
+    parse_json_rpc_response::<SessionConnectResult>(&response_line, "session connect").map(|_| ())
+}
+
+fn disconnect_daemon_session() -> Result<DaemonLifecycleSnapshot, String> {
+    call_daemon_session_disconnect()?;
+    call_daemon_status_result()
+        .map(DaemonLifecycleSnapshot::running_without_managed_pid)
+        .map_err(|error| error.to_user_message())
+}
+
+fn call_daemon_session_disconnect() -> Result<(), String> {
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    let request = JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_SESSION_DISCONNECT,
+        SessionDisconnectParams::default(),
+    );
+    let response_line = call_json_rpc(&client, &request)
+        .map_err(|error| classify_daemon_call_error(&error, client.endpoint()).to_user_message())?;
+
+    parse_json_rpc_response::<SessionDisconnectResult>(&response_line, "session disconnect")
+        .map(|_| ())
+}
+
+fn build_default_daemon_client() -> Result<OsLocalIpcClient, DaemonCallFailure> {
+    let endpoint = resolve_current_default_endpoint()
+        .map_err(|error| DaemonCallFailure::Failed(error.to_string()))?;
+
+    Ok(OsLocalIpcClient::new(endpoint))
 }
 
 fn load_app_settings(app: &tauri::AppHandle) -> Result<AppSettings, String> {
@@ -621,7 +724,59 @@ fn normalize_edge_binding(
     Ok(binding)
 }
 
+fn normalize_session_connect_options(
+    mut options: SessionConnectOptions,
+) -> Result<SessionConnectOptions, String> {
+    options.peer_id = normalize_session_peer_id(&options.peer_id)?.to_string();
+    options.local_device_id =
+        normalize_required_session_value("local device id", &options.local_device_id)?.to_string();
+    options.address = normalize_session_address(&options.address)?.to_string();
+
+    Ok(options)
+}
+
+fn normalize_session_peer_id(peer_id: &str) -> Result<&str, String> {
+    let peer_id = normalize_required_session_value("peer id", peer_id)?;
+    if peer_id.contains(':') || peer_id.contains('@') {
+        return Err("peer id cannot contain ':' or '@'.".to_string());
+    }
+
+    Ok(peer_id)
+}
+
+fn normalize_session_address(address: &str) -> Result<&str, String> {
+    let address = normalize_required_session_value("address", address)?;
+    address
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| "address must be an IP address and port.".to_string())?;
+
+    Ok(address)
+}
+
+fn normalize_required_session_value<'a>(
+    field: &'static str,
+    value: &'a str,
+) -> Result<&'a str, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{field} is required."));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(format!("{field} cannot contain whitespace."));
+    }
+
+    Ok(value)
+}
+
+#[cfg(test)]
 fn parse_daemon_status_response(response_line: &str) -> Result<DaemonStatus, String> {
+    parse_json_rpc_response(response_line, "status")
+}
+
+fn parse_json_rpc_response<T>(response_line: &str, label: &str) -> Result<T, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let value: serde_json::Value = serde_json::from_str(response_line.trim_end())
         .map_err(|error| format!("daemon returned invalid JSON: {error}"))?;
 
@@ -631,8 +786,8 @@ fn parse_daemon_status_response(response_line: &str) -> Result<DaemonStatus, Str
         return Err(failure.error.message);
     }
 
-    let success: JsonRpcSuccess<DaemonStatus> = serde_json::from_value(value)
-        .map_err(|error| format!("daemon returned an invalid status response: {error}"))?;
+    let success: JsonRpcSuccess<T> = serde_json::from_value(value)
+        .map_err(|error| format!("daemon returned an invalid {label} response: {error}"))?;
     if success.jsonrpc != JSONRPC_VERSION {
         return Err(format!(
             "daemon returned unsupported JSON-RPC version: {}",
@@ -652,21 +807,21 @@ fn parse_daemon_status_response(response_line: &str) -> Result<DaemonStatus, Str
 fn classify_daemon_call_error(
     error: &IpcCallError,
     fallback_endpoint: &IpcEndpoint,
-) -> DaemonLifecycleSnapshot {
+) -> DaemonCallFailure {
     match error {
         IpcCallError::Transport {
             source: IpcTransportError::EndpointUnavailable { endpoint, message },
-        } => DaemonLifecycleSnapshot::not_running(format!(
+        } => DaemonCallFailure::NotRunning(format!(
             "akraz-daemon is not running at {endpoint}. Details: {message}"
         )),
         IpcCallError::Transport {
             source: IpcTransportError::RequestFailed { message },
-        } => DaemonLifecycleSnapshot::unreachable(format!(
+        } => DaemonCallFailure::Unreachable(format!(
             "akraz-daemon accepted a connection at {fallback_endpoint}, but did not answer correctly. Details: {message}"
         )),
-        IpcCallError::Encode { source } => DaemonLifecycleSnapshot::failed(format!(
-            "failed to encode daemon IPC request: {source}"
-        )),
+        IpcCallError::Encode { source } => {
+            DaemonCallFailure::Failed(format!("failed to encode daemon IPC request: {source}"))
+        }
     }
 }
 
@@ -909,7 +1064,8 @@ mod tests {
 
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, IpcEndpoint, IpcPlatformCapabilities, IpcTransportError,
-        JsonRpcError, JsonRpcFailure, JsonRpcSuccess, ProtocolVersionSnapshot, to_json_line,
+        JsonRpcError, JsonRpcFailure, JsonRpcSuccess, ProtocolVersionSnapshot,
+        SessionConnectResult, SessionStatus, to_json_line,
     };
 
     use super::{
@@ -918,8 +1074,9 @@ mod tests {
         DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase, DaemonScreenEdgeOption,
         DaemonStartOptions, classify_daemon_call_error, daemon_capture_input_enabled_from,
         daemon_executable_name, daemon_spawn_args_from, format_edge_binding_arg, has_exact_arg,
-        load_settings_from_path, parse_daemon_status_response, resolve_env_daemon_executable_from,
-        save_settings_to_path, settings_start_smoke_settings,
+        load_settings_from_path, normalize_session_connect_options, parse_daemon_status_response,
+        parse_json_rpc_response, resolve_env_daemon_executable_from, save_settings_to_path,
+        settings_start_smoke_settings,
     };
 
     fn status_fixture() -> DaemonStatus {
@@ -972,7 +1129,7 @@ mod tests {
         let error = akraz_ipc::IpcCallError::Transport {
             source: IpcTransportError::endpoint_unavailable(endpoint.clone(), "not found"),
         };
-        let snapshot = classify_daemon_call_error(&error, &endpoint);
+        let snapshot = classify_daemon_call_error(&error, &endpoint).into_snapshot();
 
         assert_eq!(snapshot.phase, DaemonLifecyclePhase::NotRunning);
         assert_eq!(snapshot.status, None);
@@ -991,7 +1148,7 @@ mod tests {
         let error = akraz_ipc::IpcCallError::Transport {
             source: IpcTransportError::request_failed("pipe closed"),
         };
-        let snapshot = classify_daemon_call_error(&error, &endpoint);
+        let snapshot = classify_daemon_call_error(&error, &endpoint).into_snapshot();
 
         assert_eq!(snapshot.phase, DaemonLifecyclePhase::Unreachable);
         assert_eq!(
@@ -1171,6 +1328,74 @@ mod tests {
         assert_eq!(
             save_settings_to_path(&path, settings),
             Err("edge binding peer id cannot contain ':'.".to_string())
+        );
+    }
+
+    #[test]
+    fn session_connect_options_are_trimmed_before_ipc() {
+        let options = super::SessionConnectOptions {
+            peer_id: " linux-laptop ".to_string(),
+            local_device_id: " windows-desktop ".to_string(),
+            address: " 127.0.0.1:4455 ".to_string(),
+        };
+
+        assert_eq!(
+            normalize_session_connect_options(options),
+            Ok(super::SessionConnectOptions {
+                peer_id: "linux-laptop".to_string(),
+                local_device_id: "windows-desktop".to_string(),
+                address: "127.0.0.1:4455".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn session_connect_options_reject_invalid_values() {
+        assert_eq!(
+            normalize_session_connect_options(super::SessionConnectOptions {
+                peer_id: "linux:laptop".to_string(),
+                local_device_id: "windows-desktop".to_string(),
+                address: "127.0.0.1:4455".to_string(),
+            }),
+            Err("peer id cannot contain ':' or '@'.".to_string())
+        );
+        assert_eq!(
+            normalize_session_connect_options(super::SessionConnectOptions {
+                peer_id: "linux-laptop".to_string(),
+                local_device_id: " ".to_string(),
+                address: "127.0.0.1:4455".to_string(),
+            }),
+            Err("local device id is required.".to_string())
+        );
+        assert_eq!(
+            normalize_session_connect_options(super::SessionConnectOptions {
+                peer_id: "linux-laptop".to_string(),
+                local_device_id: "windows-desktop".to_string(),
+                address: "localhost:4455".to_string(),
+            }),
+            Err("address must be an IP address and port.".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_session_connect_success_response() {
+        let result = SessionConnectResult {
+            connected: true,
+            session: SessionStatus {
+                peer_id: "linux-laptop".to_string(),
+                local_device_id: "windows-desktop".to_string(),
+                address: "127.0.0.1:4455".to_string(),
+                connected: true,
+            },
+        };
+        let line = match to_json_line(&JsonRpcSuccess::new("tauri", result.clone())) {
+            Ok(line) => line,
+            Err(error) => panic!("expected session connect JSON: {error}"),
+        };
+
+        assert_eq!(
+            parse_json_rpc_response::<SessionConnectResult>(&line, "session connect"),
+            Ok(result)
         );
     }
 

@@ -1,7 +1,12 @@
 import { daemonClient } from "../api/daemonClient";
-import type { DaemonLifecycleSnapshot, DaemonStartOptions, DaemonStatus } from "../api/types";
+import type {
+  DaemonLifecycleSnapshot,
+  DaemonStartOptions,
+  DaemonStatus,
+  SessionConnectParams,
+} from "../api/types";
 
-type DaemonOperation = "refresh" | "start" | "stop";
+type DaemonOperation = "refresh" | "start" | "stop" | "connectSession" | "disconnectSession";
 
 export class DaemonState {
   snapshot = $state<DaemonLifecycleSnapshot | null>(null);
@@ -26,6 +31,14 @@ export class DaemonState {
 
   async stop() {
     await this.run("stop", () => daemonClient.stop());
+  }
+
+  async connectSession(params: SessionConnectParams) {
+    await this.run("connectSession", () => daemonClient.connectSession(params));
+  }
+
+  async disconnectSession() {
+    await this.run("disconnectSession", () => daemonClient.disconnectSession());
   }
 
   private async run(operation: DaemonOperation, action: () => Promise<DaemonLifecycleSnapshot>) {

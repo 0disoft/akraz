@@ -53,6 +53,30 @@ export interface DaemonStartOptions {
   edgeBindings?: ScreenEdgeBinding[];
 }
 
+export interface SessionConnectParams {
+  peerId: string;
+  localDeviceId: string;
+  address: string;
+}
+
+export interface SessionStatus {
+  peerId: string;
+  localDeviceId: string;
+  address: string;
+  connected: boolean;
+}
+
+export interface SessionConnectResult {
+  connected: boolean;
+  session: SessionStatus;
+}
+
+export interface SessionDisconnectResult {
+  disconnected: boolean;
+  session: SessionStatus | null;
+  mode: ControlMode;
+}
+
 export interface AppSettings {
   captureInput: boolean;
   edgeBindings: ScreenEdgeBinding[];

@@ -3,7 +3,13 @@
 
   import { daemonState } from './lib/state/daemonState.svelte';
   import { settingsState } from './lib/state/settingsState.svelte';
-  import type { ControlMode, DaemonLifecyclePhase, PlatformCapabilities, ScreenEdge } from './lib/api/types';
+  import type {
+    ControlMode,
+    DaemonLifecyclePhase,
+    PlatformCapabilities,
+    ScreenEdge,
+    SessionConnectParams,
+  } from './lib/api/types';
 
   const modeLabels: Record<ControlMode, string> = {
     Local: '로컬',
@@ -37,6 +43,10 @@
 
   const edgeOptions: ScreenEdge[] = ['left', 'right', 'top', 'bottom'];
 
+  let sessionPeerId = $state('');
+  let sessionLocalDeviceId = $state('');
+  let sessionAddress = $state('');
+
   onMount(() => {
     void daemonState.refresh();
     void settingsState.load();
@@ -67,6 +77,62 @@
       return '저장됨';
     }
     return '저장 전';
+  }
+
+  function connectedPeerCount() {
+    return daemonState.status?.peers.filter((peer) => peer.connected).length ?? 0;
+  }
+
+  function hasConnectedPeer() {
+    return connectedPeerCount() > 0;
+  }
+
+  function sessionFieldsAreReady() {
+    return (
+      sessionPeerId.trim().length > 0 &&
+      sessionLocalDeviceId.trim().length > 0 &&
+      sessionAddress.trim().length > 0
+    );
+  }
+
+  function canConnectSession() {
+    return daemonState.status !== null && !daemonState.isBusy && !hasConnectedPeer() && sessionFieldsAreReady();
+  }
+
+  function canDisconnectSession() {
+    return daemonState.status !== null && !daemonState.isBusy && hasConnectedPeer();
+  }
+
+  function sessionMessage() {
+    if (daemonState.operation === 'connectSession') {
+      return '연결 중';
+    }
+    if (daemonState.operation === 'disconnectSession') {
+      return '해제 중';
+    }
+    if (daemonState.lastError) {
+      return daemonState.lastError;
+    }
+    if (!daemonState.status) {
+      return '데몬 대기';
+    }
+
+    const count = connectedPeerCount();
+    if (count > 0) {
+      return `${count}대 연결됨`;
+    }
+
+    return '대기 중';
+  }
+
+  async function connectSession() {
+    const params: SessionConnectParams = {
+      peerId: sessionPeerId.trim(),
+      localDeviceId: sessionLocalDeviceId.trim(),
+      address: sessionAddress.trim(),
+    };
+
+    await daemonState.connectSession(params);
   }
 </script>
 
@@ -159,6 +225,62 @@
         </div>
       </div>
     {/if}
+
+    <section class="section-block session-block" aria-labelledby="session-title">
+      <div class="section-heading-row">
+        <h2 id="session-title">기기 연결</h2>
+        <span class:error-text={daemonState.lastError}>{sessionMessage()}</span>
+      </div>
+
+      <div class="session-row">
+        <label>
+          <span>기기 ID</span>
+          <input
+            type="text"
+            bind:value={sessionPeerId}
+            placeholder="linux-laptop"
+            spellcheck="false"
+            disabled={daemonState.isBusy || hasConnectedPeer()}
+          />
+        </label>
+
+        <label>
+          <span>내 기기 ID</span>
+          <input
+            type="text"
+            bind:value={sessionLocalDeviceId}
+            placeholder="windows-desktop"
+            spellcheck="false"
+            disabled={daemonState.isBusy || hasConnectedPeer()}
+          />
+        </label>
+
+        <label>
+          <span>주소</span>
+          <input
+            type="text"
+            bind:value={sessionAddress}
+            placeholder="127.0.0.1:4455"
+            spellcheck="false"
+            disabled={daemonState.isBusy || hasConnectedPeer()}
+          />
+        </label>
+      </div>
+
+      <div class="settings-actions">
+        <button type="button" class="control-button" disabled={!canConnectSession()} onclick={connectSession}>
+          {daemonState.operation === 'connectSession' ? '연결 중' : '연결'}
+        </button>
+        <button
+          type="button"
+          class="control-button secondary"
+          disabled={!canDisconnectSession()}
+          onclick={() => daemonState.disconnectSession()}
+        >
+          {daemonState.operation === 'disconnectSession' ? '해제 중' : '해제'}
+        </button>
+      </div>
+    </section>
 
     <section class="section-block settings-block" aria-labelledby="settings-title">
       <div class="section-heading-row">
