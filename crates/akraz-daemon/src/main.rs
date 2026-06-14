@@ -1,8 +1,12 @@
 use std::env;
 use std::fmt::{Display, Formatter};
-use std::net::TcpListener;
+use std::io::ErrorKind;
+use std::net::{SocketAddr, TcpListener};
 use std::process::ExitCode;
-use std::thread;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use akraz_core::{
     CoreAction, DeviceId, EdgeCrossing, InjectedInputEvent, LogicalPoint, MouseButton, PeerId,
@@ -13,14 +17,19 @@ use akraz_daemon::{
     DaemonIpcServer, DaemonTransportCommand, LocalPlatformCoreActionDispatcher,
     LoopbackPeerTransport, NoopCoreActionDispatcher, PeerTransportCommandExecution,
     PeerTransportSession, PeerTransportSessionExecution, TcpPeerSessionTransport, TcpPeerTransport,
-    TransportCoreActionDispatcher, build_daemon_status, serve_daemon_ipc,
+    TransportCoreActionDispatcher, build_daemon_status,
+    execute_peer_transport_session_stream_until_closed, serve_daemon_ipc,
     serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
     serve_tcp_peer_transport_session_and_execute,
     start_daemon_input_capture_with_edge_bindings_and_dispatcher,
 };
 use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
-use akraz_platform::{FakePlatformAdapter, PlatformError, runtime_platform_adapter};
+use akraz_platform::{
+    FakePlatformAdapter, PlatformAdapter, PlatformError, runtime_platform_adapter,
+};
 use serde::Serialize;
+
+const PEER_LISTENER_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 fn main() -> ExitCode {
     match parse_daemon_command(env::args().skip(1)) {
@@ -49,7 +58,7 @@ fn print_version() {
 }
 
 fn run_daemon(options: ServeOptions) -> ExitCode {
-    let endpoint = match options.endpoint {
+    let endpoint = match options.endpoint.clone() {
         Some(endpoint) => endpoint,
         None => match resolve_current_default_endpoint() {
             Ok(endpoint) => endpoint,
@@ -66,24 +75,25 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
     };
     let platform = runtime_platform_adapter();
     let server = DaemonIpcServer::new(RuntimeInputState::new(), platform.clone());
-    let capture_worker = if options.capture_input {
-        let dispatcher =
-            LocalPlatformCoreActionDispatcher::new(platform.clone(), NoopCoreActionDispatcher);
-        match start_daemon_input_capture_with_edge_bindings_and_dispatcher(
-            server.shared_state(),
-            &platform,
-            DaemonInputCaptureConfig::default(),
-            options.edge_bindings.clone(),
-            dispatcher,
-        ) {
+    let peer_listener_worker = match options.peer_listen {
+        Some(address) => match start_peer_session_listener(address, platform.clone()) {
             Ok(worker) => Some(worker),
             Err(error) => {
-                eprintln!("failed to start daemon input capture: {error}");
+                eprintln!("failed to start peer session listener: {error}");
                 return ExitCode::FAILURE;
             }
+        },
+        None => None,
+    };
+    let capture_worker = match start_configured_input_capture(&server, &platform, &options) {
+        Ok(worker) => worker,
+        Err(error) => {
+            eprintln!("failed to start daemon input capture: {error}");
+            if stop_peer_session_listener(peer_listener_worker).is_err() {
+                eprintln!("failed to stop peer session listener after startup error");
+            }
+            return ExitCode::FAILURE;
         }
-    } else {
-        None
     };
 
     eprintln!("akraz-daemon listening at {}", config.endpoint());
@@ -95,9 +105,153 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
         }
     };
 
-    match stop_capture_worker(capture_worker) {
-        Ok(()) if result.is_ok() => ExitCode::SUCCESS,
-        Ok(()) | Err(()) => ExitCode::FAILURE,
+    let capture_result = stop_capture_worker(capture_worker);
+    let peer_listener_result = stop_peer_session_listener(peer_listener_worker);
+
+    match (capture_result, peer_listener_result, result) {
+        (Ok(()), Ok(()), Ok(())) => ExitCode::SUCCESS,
+        _ => ExitCode::FAILURE,
+    }
+}
+
+fn start_configured_input_capture<P>(
+    server: &DaemonIpcServer<P>,
+    platform: &P,
+    options: &ServeOptions,
+) -> Result<Option<DaemonInputCaptureWorker>, PlatformError>
+where
+    P: PlatformAdapter + Clone + Send + Sync + 'static,
+{
+    if !options.capture_input {
+        return Ok(None);
+    }
+
+    let worker = match &options.peer_session {
+        Some(peer_session) => {
+            let local_device_id = options.local_device_id.clone().ok_or_else(|| {
+                PlatformError::new("peer session transport requires --local-device-id")
+            })?;
+            let transport = TcpPeerSessionTransport::connect(
+                peer_session.peer_id.clone(),
+                local_device_id,
+                peer_session.address,
+            )?;
+            let dispatcher = LocalPlatformCoreActionDispatcher::new(
+                platform.clone(),
+                TransportCoreActionDispatcher::new(transport),
+            );
+
+            start_daemon_input_capture_with_edge_bindings_and_dispatcher(
+                server.shared_state(),
+                platform,
+                DaemonInputCaptureConfig::default(),
+                options.edge_bindings.clone(),
+                dispatcher,
+            )?
+        }
+        None => {
+            let dispatcher =
+                LocalPlatformCoreActionDispatcher::new(platform.clone(), NoopCoreActionDispatcher);
+
+            start_daemon_input_capture_with_edge_bindings_and_dispatcher(
+                server.shared_state(),
+                platform,
+                DaemonInputCaptureConfig::default(),
+                options.edge_bindings.clone(),
+                dispatcher,
+            )?
+        }
+    };
+
+    Ok(Some(worker))
+}
+
+#[derive(Debug)]
+struct PeerSessionListenerWorker {
+    running: Arc<AtomicBool>,
+    handle: JoinHandle<Result<(), PlatformError>>,
+}
+
+fn start_peer_session_listener<P>(
+    address: SocketAddr,
+    platform: P,
+) -> Result<PeerSessionListenerWorker, PlatformError>
+where
+    P: PlatformAdapter + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind(address).map_err(|error| {
+        PlatformError::new(format!(
+            "failed to bind peer session listener at {address}: {error}"
+        ))
+    })?;
+    listener.set_nonblocking(true).map_err(|error| {
+        PlatformError::new(format!(
+            "failed to configure peer session listener at {address}: {error}"
+        ))
+    })?;
+    let address = listener.local_addr().map_err(|error| {
+        PlatformError::new(format!(
+            "failed to read peer session listener address for {address}: {error}"
+        ))
+    })?;
+    let running = Arc::new(AtomicBool::new(true));
+    let worker_running = Arc::clone(&running);
+    let handle =
+        thread::spawn(move || run_peer_session_listener(listener, platform, worker_running));
+
+    eprintln!("akraz-daemon peer session listener at {address}");
+    Ok(PeerSessionListenerWorker { running, handle })
+}
+
+fn run_peer_session_listener<P>(
+    listener: TcpListener,
+    platform: P,
+    running: Arc<AtomicBool>,
+) -> Result<(), PlatformError>
+where
+    P: PlatformAdapter,
+{
+    while running.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let mut reader = std::io::BufReader::new(stream);
+                if let Err(error) =
+                    execute_peer_transport_session_stream_until_closed(&mut reader, &platform)
+                {
+                    eprintln!("peer session ended with error: {error}");
+                    platform.release_all()?;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(PEER_LISTENER_IDLE_POLL_INTERVAL);
+            }
+            Err(error) => {
+                return Err(PlatformError::new(format!(
+                    "failed to accept peer session: {error}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn stop_peer_session_listener(worker: Option<PeerSessionListenerWorker>) -> Result<(), ()> {
+    let Some(worker) = worker else {
+        return Ok(());
+    };
+
+    worker.running.store(false, Ordering::Release);
+    match worker.handle.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            eprintln!("failed to stop peer session listener: {error}");
+            Err(())
+        }
+        Err(_) => {
+            eprintln!("peer session listener thread panicked");
+            Err(())
+        }
     }
 }
 
@@ -659,6 +813,15 @@ struct ServeOptions {
     once: bool,
     capture_input: bool,
     edge_bindings: Vec<ScreenEdgeBinding>,
+    peer_listen: Option<SocketAddr>,
+    peer_session: Option<ServePeerSessionOptions>,
+    local_device_id: Option<DeviceId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServePeerSessionOptions {
+    peer_id: PeerId,
+    address: SocketAddr,
 }
 
 fn parse_daemon_command<I>(args: I) -> Result<DaemonCommand, DaemonUsageError>
@@ -688,7 +851,10 @@ where
             if argument.starts_with("--endpoint")
                 || argument == "--once"
                 || argument == "--capture-input"
-                || argument.starts_with("--edge-binding") =>
+                || argument.starts_with("--edge-binding")
+                || argument.starts_with("--peer-listen")
+                || argument.starts_with("--peer-session")
+                || argument.starts_with("--local-device-id") =>
         {
             parse_serve_options(std::iter::once(first).chain(args))
         }
@@ -735,12 +901,91 @@ where
         } else if argument == "--endpoint" {
             let value = args.next().ok_or(DaemonUsageError::MissingEndpointValue)?;
             options.endpoint = Some(IpcEndpoint::manual(value).map_err(DaemonUsageError::from)?);
+        } else if let Some(value) = argument.strip_prefix("--peer-listen=") {
+            set_peer_listen(&mut options, value)?;
+        } else if argument == "--peer-listen" {
+            let value = args
+                .next()
+                .ok_or(DaemonUsageError::MissingPeerListenValue)?;
+            set_peer_listen(&mut options, &value)?;
+        } else if let Some(value) = argument.strip_prefix("--peer-session=") {
+            set_peer_session(&mut options, value)?;
+        } else if argument == "--peer-session" {
+            let value = args
+                .next()
+                .ok_or(DaemonUsageError::MissingPeerSessionValue)?;
+            set_peer_session(&mut options, &value)?;
+        } else if let Some(value) = argument.strip_prefix("--local-device-id=") {
+            options.local_device_id = Some(parse_device_id(value)?);
+        } else if argument == "--local-device-id" {
+            let value = args
+                .next()
+                .ok_or(DaemonUsageError::MissingLocalDeviceIdValue)?;
+            options.local_device_id = Some(parse_device_id(&value)?);
         } else {
             return Err(DaemonUsageError::UnknownArgument(argument));
         }
     }
+    if options.peer_session.is_some() && options.local_device_id.is_none() {
+        return Err(DaemonUsageError::MissingLocalDeviceIdForPeerSession);
+    }
 
     Ok(DaemonCommand::Serve(options))
+}
+
+fn set_peer_listen(options: &mut ServeOptions, value: &str) -> Result<(), DaemonUsageError> {
+    if options.peer_listen.is_some() {
+        return Err(DaemonUsageError::DuplicatePeerListen);
+    }
+
+    options.peer_listen = Some(parse_socket_address(
+        value,
+        DaemonUsageError::InvalidPeerListen,
+    )?);
+    Ok(())
+}
+
+fn set_peer_session(options: &mut ServeOptions, value: &str) -> Result<(), DaemonUsageError> {
+    if options.peer_session.is_some() {
+        return Err(DaemonUsageError::DuplicatePeerSession);
+    }
+
+    options.peer_session = Some(parse_peer_session(value)?);
+    Ok(())
+}
+
+fn parse_peer_session(value: &str) -> Result<ServePeerSessionOptions, DaemonUsageError> {
+    let Some((peer_id, address)) = value.rsplit_once('@') else {
+        return Err(DaemonUsageError::InvalidPeerSession(value.to_string()));
+    };
+    let peer_id = peer_id.trim();
+    if peer_id.is_empty() || peer_id.contains('@') {
+        return Err(DaemonUsageError::InvalidPeerSession(value.to_string()));
+    }
+
+    Ok(ServePeerSessionOptions {
+        peer_id: PeerId::new(peer_id),
+        address: parse_socket_address(address, DaemonUsageError::InvalidPeerSession)?,
+    })
+}
+
+fn parse_socket_address(
+    value: &str,
+    invalid: impl FnOnce(String) -> DaemonUsageError,
+) -> Result<SocketAddr, DaemonUsageError> {
+    value
+        .trim()
+        .parse::<SocketAddr>()
+        .map_err(|_| invalid(value.to_string()))
+}
+
+fn parse_device_id(value: &str) -> Result<DeviceId, DaemonUsageError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DaemonUsageError::InvalidLocalDeviceId(value.to_string()));
+    }
+
+    Ok(DeviceId::new(value))
 }
 
 fn parse_edge_binding(value: &str) -> Result<ScreenEdgeBinding, DaemonUsageError> {
@@ -779,8 +1024,17 @@ fn parse_screen_edge(value: &str) -> Result<ScreenEdge, DaemonUsageError> {
 enum DaemonUsageError {
     MissingEndpointValue,
     MissingEdgeBindingValue,
+    MissingPeerListenValue,
+    MissingPeerSessionValue,
+    MissingLocalDeviceIdValue,
+    MissingLocalDeviceIdForPeerSession,
+    DuplicatePeerListen,
+    DuplicatePeerSession,
     InvalidEndpoint(String),
     InvalidEdgeBinding(String),
+    InvalidPeerListen(String),
+    InvalidPeerSession(String),
+    InvalidLocalDeviceId(String),
     UnknownArgument(String),
 }
 
@@ -797,11 +1051,38 @@ impl Display for DaemonUsageError {
             Self::MissingEdgeBindingValue => {
                 formatter.write_str("missing value for --edge-binding")
             }
+            Self::MissingPeerListenValue => formatter.write_str("missing value for --peer-listen"),
+            Self::MissingPeerSessionValue => {
+                formatter.write_str("missing value for --peer-session")
+            }
+            Self::MissingLocalDeviceIdValue => {
+                formatter.write_str("missing value for --local-device-id")
+            }
+            Self::MissingLocalDeviceIdForPeerSession => {
+                formatter.write_str("--peer-session requires --local-device-id")
+            }
+            Self::DuplicatePeerListen => {
+                formatter.write_str("--peer-listen can only be provided once")
+            }
+            Self::DuplicatePeerSession => {
+                formatter.write_str("--peer-session can only be provided once")
+            }
             Self::InvalidEndpoint(error) => write!(formatter, "invalid endpoint: {error}"),
             Self::InvalidEdgeBinding(value) => write!(
                 formatter,
                 "invalid edge binding: {value}. Expected <local-edge>:<peer-id>:<remote-edge>"
             ),
+            Self::InvalidPeerListen(value) => write!(
+                formatter,
+                "invalid peer listener address: {value}. Expected <ip>:<port> or [<ipv6>]:<port>"
+            ),
+            Self::InvalidPeerSession(value) => write!(
+                formatter,
+                "invalid peer session: {value}. Expected <peer-id>@<ip>:<port>"
+            ),
+            Self::InvalidLocalDeviceId(value) => {
+                write!(formatter, "invalid local device id: {value}")
+            }
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument: {argument}"),
         }
     }
@@ -809,14 +1090,17 @@ impl Display for DaemonUsageError {
 
 #[cfg(test)]
 mod tests {
-    use akraz_core::{PeerId, ScreenEdge, ScreenEdgeBinding};
+    use std::net::SocketAddr;
+
+    use akraz_core::{DeviceId, PeerId, ScreenEdge, ScreenEdgeBinding};
     use akraz_ipc::{IpcEndpoint, IpcEndpointKind, IpcTransportError};
 
     use super::{
         DaemonCommand, DaemonUsageError, LoopbackTransportSmokeCommand,
-        LoopbackTransportSmokeInputEvent, ServeOptions, build_loopback_transport_smoke_report,
-        build_peer_session_executor_smoke_report, build_peer_session_smoke_report,
-        build_tcp_transport_smoke_report, format_daemon_ipc_error, parse_daemon_command,
+        LoopbackTransportSmokeInputEvent, ServeOptions, ServePeerSessionOptions,
+        build_loopback_transport_smoke_report, build_peer_session_executor_smoke_report,
+        build_peer_session_smoke_report, build_tcp_transport_smoke_report, format_daemon_ipc_error,
+        parse_daemon_command,
     };
 
     #[test]
@@ -828,6 +1112,9 @@ mod tests {
                 once: false,
                 capture_input: false,
                 edge_bindings: Vec::new(),
+                peer_listen: None,
+                peer_session: None,
+                local_device_id: None,
             }))
         );
     }
@@ -853,6 +1140,9 @@ mod tests {
                 once: true,
                 capture_input: true,
                 edge_bindings: Vec::new(),
+                peer_listen: None,
+                peer_session: None,
+                local_device_id: None,
             }))
         );
         assert_eq!(
@@ -867,6 +1157,9 @@ mod tests {
                 once: true,
                 capture_input: true,
                 edge_bindings: Vec::new(),
+                peer_listen: None,
+                peer_session: None,
+                local_device_id: None,
             }))
         );
     }
@@ -894,6 +1187,9 @@ mod tests {
                 once: false,
                 capture_input: true,
                 edge_bindings: vec![binding.clone()],
+                peer_listen: None,
+                peer_session: None,
+                local_device_id: None,
             }))
         );
         assert_eq!(
@@ -905,6 +1201,74 @@ mod tests {
                 once: false,
                 capture_input: true,
                 edge_bindings: vec![binding],
+                peer_listen: None,
+                peer_session: None,
+                local_device_id: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_manual_peer_session_serve_options() {
+        assert_eq!(
+            parse_daemon_command(
+                [
+                    "--serve",
+                    "--peer-listen",
+                    "127.0.0.1:24887",
+                    "--local-device-id",
+                    "windows-desktop",
+                    "--peer-session",
+                    "linux-laptop@127.0.0.1:24888",
+                ]
+                .map(String::from)
+            ),
+            Ok(DaemonCommand::Serve(ServeOptions {
+                endpoint: None,
+                once: false,
+                capture_input: false,
+                edge_bindings: Vec::new(),
+                peer_listen: Some(
+                    "127.0.0.1:24887"
+                        .parse::<SocketAddr>()
+                        .expect("peer listen address")
+                ),
+                peer_session: Some(ServePeerSessionOptions {
+                    peer_id: PeerId::new("linux-laptop"),
+                    address: "127.0.0.1:24888"
+                        .parse::<SocketAddr>()
+                        .expect("peer session address"),
+                }),
+                local_device_id: Some(DeviceId::new("windows-desktop")),
+            }))
+        );
+
+        assert_eq!(
+            parse_daemon_command(
+                [
+                    "--peer-listen=127.0.0.1:24887",
+                    "--local-device-id=windows-desktop",
+                    "--peer-session=linux-laptop@127.0.0.1:24888",
+                ]
+                .map(String::from)
+            ),
+            Ok(DaemonCommand::Serve(ServeOptions {
+                endpoint: None,
+                once: false,
+                capture_input: false,
+                edge_bindings: Vec::new(),
+                peer_listen: Some(
+                    "127.0.0.1:24887"
+                        .parse::<SocketAddr>()
+                        .expect("peer listen address")
+                ),
+                peer_session: Some(ServePeerSessionOptions {
+                    peer_id: PeerId::new("linux-laptop"),
+                    address: "127.0.0.1:24888"
+                        .parse::<SocketAddr>()
+                        .expect("peer session address"),
+                }),
+                local_device_id: Some(DeviceId::new("windows-desktop")),
             }))
         );
     }
@@ -1109,6 +1473,70 @@ mod tests {
         assert_eq!(
             parse_daemon_command(["--edge-binding"].map(String::from)),
             Err(DaemonUsageError::MissingEdgeBindingValue)
+        );
+        assert_eq!(
+            parse_daemon_command(["--peer-listen"].map(String::from)),
+            Err(DaemonUsageError::MissingPeerListenValue)
+        );
+        assert_eq!(
+            parse_daemon_command(["--peer-session"].map(String::from)),
+            Err(DaemonUsageError::MissingPeerSessionValue)
+        );
+        assert_eq!(
+            parse_daemon_command(["--local-device-id"].map(String::from)),
+            Err(DaemonUsageError::MissingLocalDeviceIdValue)
+        );
+        assert_eq!(
+            parse_daemon_command(["--peer-listen", "not-an-address"].map(String::from)),
+            Err(DaemonUsageError::InvalidPeerListen(
+                "not-an-address".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_daemon_command(
+                [
+                    "--local-device-id",
+                    "windows-desktop",
+                    "--peer-session",
+                    "missing-address"
+                ]
+                .map(String::from)
+            ),
+            Err(DaemonUsageError::InvalidPeerSession(
+                "missing-address".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_daemon_command(
+                ["--peer-session", "linux-laptop@127.0.0.1:24888"].map(String::from)
+            ),
+            Err(DaemonUsageError::MissingLocalDeviceIdForPeerSession)
+        );
+        assert_eq!(
+            parse_daemon_command(
+                [
+                    "--peer-listen",
+                    "127.0.0.1:24887",
+                    "--peer-listen",
+                    "127.0.0.1:24888"
+                ]
+                .map(String::from)
+            ),
+            Err(DaemonUsageError::DuplicatePeerListen)
+        );
+        assert_eq!(
+            parse_daemon_command(
+                [
+                    "--local-device-id",
+                    "windows-desktop",
+                    "--peer-session",
+                    "linux-laptop@127.0.0.1:24888",
+                    "--peer-session",
+                    "other-laptop@127.0.0.1:24889"
+                ]
+                .map(String::from)
+            ),
+            Err(DaemonUsageError::DuplicatePeerSession)
         );
         assert_eq!(
             parse_daemon_command(["--edge-binding", "right::left"].map(String::from)),

@@ -451,6 +451,50 @@ where
     Ok(PeerTransportSessionExecution { hello, outcomes })
 }
 
+/// Serve one persistent TCP peer session and execute commands until the peer closes the session.
+pub fn serve_tcp_peer_transport_session_and_execute_until_closed<P>(
+    listener: &TcpListener,
+    platform: &P,
+) -> Result<PeerTransportSessionExecution, PlatformError>
+where
+    P: PlatformAdapter,
+{
+    let (stream, _) = listener
+        .accept()
+        .map_err(|error| PlatformError::new(format!("failed to accept peer session: {error}")))?;
+    let mut reader = BufReader::new(stream);
+
+    execute_peer_transport_session_stream_until_closed(&mut reader, platform)
+}
+
+/// Execute a decoded peer transport session from any buffered stream until EOF.
+pub fn execute_peer_transport_session_stream_until_closed<R, P>(
+    reader: &mut R,
+    platform: &P,
+) -> Result<PeerTransportSessionExecution, PlatformError>
+where
+    R: BufRead,
+    P: PlatformAdapter,
+{
+    let hello = read_peer_transport_session_hello(reader)?;
+    let mut outcomes = Vec::new();
+
+    loop {
+        match read_optional_peer_transport_session_frame(reader)? {
+            Some(PeerTransportSessionFrame::Command { command }) => {
+                let command = command.into_command()?;
+                outcomes.push(execute_peer_transport_command(platform, &command)?);
+            }
+            Some(PeerTransportSessionFrame::Hello { .. }) => {
+                return Err(PlatformError::new(
+                    "peer session received duplicate hello frame after session start",
+                ));
+            }
+            None => return Ok(PeerTransportSessionExecution { hello, outcomes }),
+        }
+    }
+}
+
 /// Execute one decoded peer transport command against the local platform boundary.
 pub fn execute_peer_transport_command<P>(
     platform: &P,
@@ -544,19 +588,29 @@ fn read_peer_transport_session_frame<R>(
 where
     R: BufRead,
 {
+    read_optional_peer_transport_session_frame(reader)?
+        .ok_or_else(|| PlatformError::new("peer session closed before the next frame was received"))
+}
+
+fn read_optional_peer_transport_session_frame<R>(
+    reader: &mut R,
+) -> Result<Option<PeerTransportSessionFrame>, PlatformError>
+where
+    R: BufRead,
+{
     let mut line = String::new();
     let read = reader.read_line(&mut line).map_err(|error| {
         PlatformError::new(format!("failed to read peer session frame: {error}"))
     })?;
     if read == 0 {
-        return Err(PlatformError::new(
-            "peer session closed before the next frame was received",
-        ));
+        return Ok(None);
     }
 
-    serde_json::from_str(&line).map_err(|error| {
-        PlatformError::new(format!("failed to decode peer session frame: {error}"))
-    })
+    serde_json::from_str(&line)
+        .map_err(|error| {
+            PlatformError::new(format!("failed to decode peer session frame: {error}"))
+        })
+        .map(Some)
 }
 
 fn protocol_version_from_wire(
@@ -1555,8 +1609,9 @@ mod tests {
         drain_capture_events, execute_peer_transport_command, handle_ipc_request_line,
         input_capture_policy_for_control_mode, serve_daemon_ipc, serve_tcp_peer_transport_commands,
         serve_tcp_peer_transport_session, serve_tcp_peer_transport_session_and_execute,
-        shared_runtime_state, start_daemon_input_capture,
-        start_daemon_input_capture_with_edge_bindings, start_daemon_input_capture_with_routing,
+        serve_tcp_peer_transport_session_and_execute_until_closed, shared_runtime_state,
+        start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
+        start_daemon_input_capture_with_routing,
         start_daemon_input_capture_with_routing_and_dispatcher, sync_capture_policy_with_state,
     };
 
@@ -2365,6 +2420,75 @@ mod tests {
                 PeerTransportCommandExecution::RemoteSessionStopped {
                     session_id: Some(SessionId::new("session-1")),
                 },
+            ]
+        );
+        assert_eq!(
+            injected_events,
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }]
+        );
+        assert_eq!(release_all_count, 1);
+    }
+
+    #[test]
+    fn tcp_peer_session_executor_runs_until_peer_closes() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread = std::thread::spawn(move || {
+            let platform = FakePlatformAdapter::default();
+            let execution =
+                serve_tcp_peer_transport_session_and_execute_until_closed(&listener, &platform)?;
+            let injected_events = platform.injected_events()?;
+            let release_all_count = platform.release_all_count()?;
+
+            Ok::<_, PlatformError>((execution, injected_events, release_all_count))
+        });
+        let transport = TcpPeerSessionTransport::connect(
+            PeerId::new("right-peer"),
+            DeviceId::new("windows-desktop"),
+            address,
+        )
+        .expect("connect TCP peer session");
+        let dispatcher = TransportCoreActionDispatcher::new(transport.clone());
+
+        dispatcher
+            .dispatch_core_actions(&[
+                CoreAction::ForwardInput {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 8,
+                        delta_y: 2,
+                    },
+                },
+                CoreAction::ReleaseAllInputs,
+            ])
+            .expect("TCP peer session dispatch");
+        drop(dispatcher);
+        drop(transport);
+
+        let (execution, injected_events, release_all_count) = server_thread
+            .join()
+            .expect("TCP peer session executor thread")
+            .expect("TCP peer session execution");
+
+        assert_eq!(
+            execution.hello.protocol,
+            akraz_protocol::ProtocolVersion::CURRENT
+        );
+        assert_eq!(execution.hello.device_id, DeviceId::new("windows-desktop"));
+        assert_eq!(execution.hello.peer_id, PeerId::new("right-peer"));
+        assert_eq!(
+            execution.outcomes,
+            vec![
+                PeerTransportCommandExecution::InputForwarded {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 8,
+                        delta_y: 2,
+                    },
+                },
+                PeerTransportCommandExecution::InputsReleased,
             ]
         );
         assert_eq!(
