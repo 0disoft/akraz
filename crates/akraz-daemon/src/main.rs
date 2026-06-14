@@ -16,11 +16,11 @@ use akraz_daemon::{
     CoreActionDispatcher, DaemonInputCaptureConfig, DaemonInputCaptureWorker, DaemonIpcRunConfig,
     DaemonIpcServer, DaemonTransportCommand, LocalPlatformCoreActionDispatcher,
     LoopbackPeerTransport, NoopCoreActionDispatcher, PeerTransportCommandExecution,
-    PeerTransportSession, PeerTransportSessionExecution, TcpPeerSessionTransport, TcpPeerTransport,
-    TransportCoreActionDispatcher, build_daemon_status,
+    PeerTransportSession, PeerTransportSessionExecution, SharedCoreActionDispatcher,
+    TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher, build_daemon_status,
     execute_peer_transport_session_stream_until_closed, serve_daemon_ipc,
     serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
-    serve_tcp_peer_transport_session_and_execute,
+    serve_tcp_peer_transport_session_and_execute, shared_runtime_state,
     start_daemon_input_capture_with_edge_bindings_and_dispatcher,
 };
 use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
@@ -74,7 +74,18 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
         DaemonIpcRunConfig::serve_forever(endpoint)
     };
     let platform = runtime_platform_adapter();
-    let server = DaemonIpcServer::new(RuntimeInputState::new(), platform.clone());
+    let dispatcher = match build_configured_core_action_dispatcher(platform.clone(), &options) {
+        Ok(dispatcher) => dispatcher,
+        Err(error) => {
+            eprintln!("failed to configure daemon recovery dispatcher: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let server = DaemonIpcServer::from_shared_state_and_dispatcher(
+        shared_runtime_state(RuntimeInputState::new()),
+        platform.clone(),
+        dispatcher.clone(),
+    );
     let peer_listener_worker = match options.peer_listen {
         Some(address) => match start_peer_session_listener(address, platform.clone()) {
             Ok(worker) => Some(worker),
@@ -85,16 +96,17 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
         },
         None => None,
     };
-    let capture_worker = match start_configured_input_capture(&server, &platform, &options) {
-        Ok(worker) => worker,
-        Err(error) => {
-            eprintln!("failed to start daemon input capture: {error}");
-            if stop_peer_session_listener(peer_listener_worker).is_err() {
-                eprintln!("failed to stop peer session listener after startup error");
+    let capture_worker =
+        match start_configured_input_capture(&server, &platform, &options, dispatcher) {
+            Ok(worker) => worker,
+            Err(error) => {
+                eprintln!("failed to start daemon input capture: {error}");
+                if stop_peer_session_listener(peer_listener_worker).is_err() {
+                    eprintln!("failed to stop peer session listener after startup error");
+                }
+                return ExitCode::FAILURE;
             }
-            return ExitCode::FAILURE;
-        }
-    };
+        };
 
     eprintln!("akraz-daemon listening at {}", config.endpoint());
     let result = match serve_daemon_ipc(&config, &server) {
@@ -114,19 +126,14 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
     }
 }
 
-fn start_configured_input_capture<P>(
-    server: &DaemonIpcServer<P>,
-    platform: &P,
+fn build_configured_core_action_dispatcher<P>(
+    platform: P,
     options: &ServeOptions,
-) -> Result<Option<DaemonInputCaptureWorker>, PlatformError>
+) -> Result<SharedCoreActionDispatcher, PlatformError>
 where
     P: PlatformAdapter + Clone + Send + Sync + 'static,
 {
-    if !options.capture_input {
-        return Ok(None);
-    }
-
-    let worker = match &options.peer_session {
+    let dispatcher: SharedCoreActionDispatcher = match &options.peer_session {
         Some(peer_session) => {
             let local_device_id = options.local_device_id.clone().ok_or_else(|| {
                 PlatformError::new("peer session transport requires --local-device-id")
@@ -136,32 +143,41 @@ where
                 local_device_id,
                 peer_session.address,
             )?;
-            let dispatcher = LocalPlatformCoreActionDispatcher::new(
-                platform.clone(),
+
+            Arc::new(LocalPlatformCoreActionDispatcher::new(
+                platform,
                 TransportCoreActionDispatcher::new(transport),
-            );
-
-            start_daemon_input_capture_with_edge_bindings_and_dispatcher(
-                server.shared_state(),
-                platform,
-                DaemonInputCaptureConfig::default(),
-                options.edge_bindings.clone(),
-                dispatcher,
-            )?
+            ))
         }
-        None => {
-            let dispatcher =
-                LocalPlatformCoreActionDispatcher::new(platform.clone(), NoopCoreActionDispatcher);
-
-            start_daemon_input_capture_with_edge_bindings_and_dispatcher(
-                server.shared_state(),
-                platform,
-                DaemonInputCaptureConfig::default(),
-                options.edge_bindings.clone(),
-                dispatcher,
-            )?
-        }
+        None => Arc::new(LocalPlatformCoreActionDispatcher::new(
+            platform,
+            NoopCoreActionDispatcher,
+        )),
     };
+
+    Ok(dispatcher)
+}
+
+fn start_configured_input_capture<P>(
+    server: &DaemonIpcServer<P>,
+    platform: &P,
+    options: &ServeOptions,
+    dispatcher: SharedCoreActionDispatcher,
+) -> Result<Option<DaemonInputCaptureWorker>, PlatformError>
+where
+    P: PlatformAdapter,
+{
+    if !options.capture_input {
+        return Ok(None);
+    }
+
+    let worker = start_daemon_input_capture_with_edge_bindings_and_dispatcher(
+        server.shared_state(),
+        platform,
+        DaemonInputCaptureConfig::default(),
+        options.edge_bindings.clone(),
+        dispatcher,
+    )?;
 
     Ok(Some(worker))
 }

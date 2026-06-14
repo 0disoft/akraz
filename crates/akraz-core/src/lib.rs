@@ -407,6 +407,7 @@ pub enum RuntimeEvent {
     },
     RemoteLeaveRequested,
     LocalControlConfirmed,
+    EmergencyRecoveryRequested,
     TransportLost,
     RecoveryCompleted,
 }
@@ -526,6 +527,7 @@ impl RuntimeInputState {
             }
             RuntimeEvent::RemoteLeaveRequested => self.request_remote_leave(),
             RuntimeEvent::LocalControlConfirmed => self.confirm_local_control(),
+            RuntimeEvent::EmergencyRecoveryRequested => Ok(self.handle_panic_hotkey()),
             RuntimeEvent::TransportLost => Ok(self.handle_transport_lost()),
             RuntimeEvent::RecoveryCompleted => self.complete_recovery(),
         }
@@ -1033,6 +1035,41 @@ mod tests {
                 CoreAction::ReleaseAllInputs,
                 CoreAction::StopRemoteSession {
                     session_id: Some(SessionId::new("session-panic")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn emergency_recovery_request_uses_panic_recovery_path() {
+        let mut state = RuntimeInputState::new();
+
+        apply_ok(
+            &mut state,
+            RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            },
+        );
+        apply_ok(
+            &mut state,
+            RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-cli"),
+            },
+        );
+
+        let actions = apply_ok(&mut state, RuntimeEvent::EmergencyRecoveryRequested);
+
+        assert_eq!(state.mode(), ControlMode::Local);
+        assert!(state.pending_peer_id().is_none());
+        assert!(state.active_peer_id().is_none());
+        assert!(state.active_session_id().is_none());
+        assert_eq!(
+            actions,
+            vec![
+                CoreAction::ReleaseLocalInputs,
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-cli")),
                 },
             ]
         );

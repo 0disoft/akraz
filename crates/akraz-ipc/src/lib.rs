@@ -49,6 +49,9 @@ pub const METHOD_DAEMON_STATUS: &str = "daemon.status";
 /// JSON-RPC method for platform permission probing.
 pub const METHOD_PERMISSIONS_PROBE: &str = "permissions.probe";
 
+/// JSON-RPC method for emergency input release and local-control recovery.
+pub const METHOD_INPUT_RELEASE_ALL: &str = "input.releaseAll";
+
 /// JSON-RPC parse error code.
 pub const JSONRPC_ERROR_PARSE: i32 = -32700;
 
@@ -739,6 +742,7 @@ impl<P> JsonRpcRequest<P> {
 pub enum IpcRequest {
     DaemonStatus(JsonRpcRequest<DaemonStatusParams>),
     PermissionsProbe(JsonRpcRequest<PermissionsProbeParams>),
+    InputReleaseAll(JsonRpcRequest<InputReleaseAllParams>),
 }
 
 impl IpcRequest {
@@ -747,6 +751,7 @@ impl IpcRequest {
         match self {
             Self::DaemonStatus(request) => &request.id,
             Self::PermissionsProbe(request) => &request.id,
+            Self::InputReleaseAll(request) => &request.id,
         }
     }
 
@@ -755,6 +760,7 @@ impl IpcRequest {
         match self {
             Self::DaemonStatus(request) => &request.method,
             Self::PermissionsProbe(request) => &request.method,
+            Self::InputReleaseAll(request) => &request.method,
         }
     }
 }
@@ -840,6 +846,11 @@ pub struct DaemonStatusParams {}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionsProbeParams {}
+
+/// Empty params for `input.releaseAll`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputReleaseAllParams {}
 
 /// Wire-safe snapshot of the core control mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -928,6 +939,14 @@ pub struct PermissionsProbe {
     pub adapter_name: String,
     pub capabilities: IpcPlatformCapabilities,
     pub issues: Vec<PermissionIssue>,
+}
+
+/// `input.releaseAll` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputReleaseAllResult {
+    pub released: bool,
+    pub mode: ControlModeSnapshot,
 }
 
 /// Platform permission issue returned by `permissions.probe`.
@@ -1051,6 +1070,7 @@ pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
     match raw.method.as_str() {
         METHOD_DAEMON_STATUS => parse_typed_request(raw).map(IpcRequest::DaemonStatus),
         METHOD_PERMISSIONS_PROBE => parse_typed_request(raw).map(IpcRequest::PermissionsProbe),
+        METHOD_INPUT_RELEASE_ALL => parse_typed_request(raw).map(IpcRequest::InputReleaseAll),
         _ => Err(JsonRpcFailure::new(
             Some(raw.id),
             JsonRpcError::new(
@@ -1100,9 +1120,9 @@ mod tests {
         IpcEndpointEnvironment, IpcEndpointError, IpcEndpointKind, IpcOperatingSystem,
         IpcPlatformCapabilities, IpcRequest, IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS,
         JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess,
-        LocalIpcClient, LocalIpcServer, METHOD_DAEMON_STATUS, OsLocalIpcClient,
-        ProtocolVersionSnapshot, call_json_rpc, parse_request_line, resolve_default_endpoint,
-        serve_os_local_ipc_once, to_json_line,
+        LocalIpcClient, LocalIpcServer, METHOD_DAEMON_STATUS, METHOD_INPUT_RELEASE_ALL,
+        OsLocalIpcClient, ProtocolVersionSnapshot, call_json_rpc, parse_request_line,
+        resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
     };
     use serde_json::json;
 
@@ -1346,6 +1366,24 @@ mod tests {
         assert_eq!(
             parse_request_line(&line),
             Ok(IpcRequest::DaemonStatus(request))
+        );
+    }
+
+    #[test]
+    fn parses_input_release_all_request_line() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_INPUT_RELEASE_ALL,
+            super::InputReleaseAllParams::default(),
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(IpcRequest::InputReleaseAll(request))
         );
     }
 

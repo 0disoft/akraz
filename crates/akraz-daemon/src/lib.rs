@@ -16,10 +16,10 @@ use akraz_core::{
     RuntimeInputState, ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
 };
 use akraz_ipc::{
-    DaemonStatus, IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError,
-    JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PermissionIssue,
-    PermissionsProbe, ProtocolVersionSnapshot, parse_request_line, serve_os_local_ipc_once,
-    to_json_line,
+    ControlModeSnapshot, DaemonStatus, InputReleaseAllResult, IpcCodecError,
+    IpcPlatformCapabilities, IpcRequest, IpcTransportError, JsonRpcError, JsonRpcFailure,
+    JsonRpcSuccess, LocalIpcServer, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
+    parse_request_line, serve_os_local_ipc_once, to_json_line,
 };
 use akraz_platform::{
     DesktopGeometry, InputCaptureConfig, InputCapturePolicy, InputCaptureSession, PlatformAdapter,
@@ -41,6 +41,15 @@ pub type SharedRuntimeInputState = Arc<Mutex<RuntimeInputState>>;
 /// Dispatches side effects requested by the core input state machine.
 pub trait CoreActionDispatcher: Send + Sync + 'static {
     fn dispatch_core_actions(&self, actions: &[CoreAction]) -> Result<(), PlatformError>;
+}
+
+/// Thread-safe shared dispatcher used by IPC and capture workers.
+pub type SharedCoreActionDispatcher = Arc<dyn CoreActionDispatcher>;
+
+impl CoreActionDispatcher for SharedCoreActionDispatcher {
+    fn dispatch_core_actions(&self, actions: &[CoreAction]) -> Result<(), PlatformError> {
+        self.as_ref().dispatch_core_actions(actions)
+    }
 }
 
 /// No-op dispatcher used until a real peer transport is attached.
@@ -1045,13 +1054,16 @@ impl DaemonIpcRunConfig {
 }
 
 /// In-process local IPC server backed by daemon runtime state.
-#[derive(Debug)]
 pub struct DaemonIpcServer<P> {
     state: SharedRuntimeInputState,
     platform: P,
+    dispatcher: SharedCoreActionDispatcher,
 }
 
-impl<P> DaemonIpcServer<P> {
+impl<P> DaemonIpcServer<P>
+where
+    P: PlatformAdapter + Clone + Send + Sync + 'static,
+{
     /// Create an in-process daemon IPC server.
     pub fn new(state: RuntimeInputState, platform: P) -> Self {
         Self::from_shared_state(shared_runtime_state(state), platform)
@@ -1059,7 +1071,27 @@ impl<P> DaemonIpcServer<P> {
 
     /// Create an in-process daemon IPC server from shared runtime state.
     pub fn from_shared_state(state: SharedRuntimeInputState, platform: P) -> Self {
-        Self { state, platform }
+        let dispatcher = Arc::new(LocalPlatformCoreActionDispatcher::new(
+            platform.clone(),
+            NoopCoreActionDispatcher,
+        ));
+
+        Self::from_shared_state_and_dispatcher(state, platform, dispatcher)
+    }
+}
+
+impl<P> DaemonIpcServer<P> {
+    /// Create an in-process daemon IPC server from shared runtime state and dispatcher.
+    pub fn from_shared_state_and_dispatcher(
+        state: SharedRuntimeInputState,
+        platform: P,
+        dispatcher: SharedCoreActionDispatcher,
+    ) -> Self {
+        Self {
+            state,
+            platform,
+            dispatcher,
+        }
     }
 
     /// Return the runtime state shared by daemon background workers.
@@ -1073,11 +1105,11 @@ where
     P: PlatformAdapter,
 {
     fn handle_request_line(&self, request_line: &str) -> Result<String, IpcTransportError> {
-        let state = self.state.lock().map_err(|_| {
+        let mut state = self.state.lock().map_err(|_| {
             IpcTransportError::request_failed("daemon runtime state is unavailable")
         })?;
 
-        handle_ipc_request_line(&state, &self.platform, request_line)
+        handle_ipc_request_line(&mut state, &self.platform, &self.dispatcher, request_line)
             .map_err(|error| IpcTransportError::request_failed(error.to_string()))
     }
 }
@@ -1482,19 +1514,21 @@ pub fn build_daemon_status(
 
 /// Handle one local IPC JSON-RPC request line.
 pub fn handle_ipc_request_line(
-    state: &RuntimeInputState,
+    state: &mut RuntimeInputState,
     platform: &impl PlatformAdapter,
+    dispatcher: &impl CoreActionDispatcher,
     line: &str,
 ) -> Result<String, DaemonIpcError> {
     match parse_request_line(line) {
-        Ok(request) => handle_ipc_request(state, platform, request),
+        Ok(request) => handle_ipc_request(state, platform, dispatcher, request),
         Err(failure) => encode_response(&failure),
     }
 }
 
 fn handle_ipc_request(
-    state: &RuntimeInputState,
+    state: &mut RuntimeInputState,
     platform: &impl PlatformAdapter,
+    dispatcher: &impl CoreActionDispatcher,
     request: IpcRequest,
 ) -> Result<String, DaemonIpcError> {
     match request {
@@ -1506,7 +1540,33 @@ fn handle_ipc_request(
             Ok(probe) => encode_response(&JsonRpcSuccess::new(request.id, probe)),
             Err(error) => encode_platform_error(request.id, "permissions probe unavailable", error),
         },
+        IpcRequest::InputReleaseAll(request) => {
+            match recover_local_control_and_release_inputs(state, dispatcher) {
+                Ok(result) => encode_response(&JsonRpcSuccess::new(request.id, result)),
+                Err(error) => encode_platform_error(request.id, "input release unavailable", error),
+            }
+        }
     }
+}
+
+/// Recover local control and release inputs through the configured action dispatcher.
+pub fn recover_local_control_and_release_inputs(
+    state: &mut RuntimeInputState,
+    dispatcher: &impl CoreActionDispatcher,
+) -> Result<InputReleaseAllResult, PlatformError> {
+    let actions = state
+        .apply_event(RuntimeEvent::EmergencyRecoveryRequested)
+        .map_err(recovery_transition_error)?;
+    dispatch_core_action_batch(dispatcher, actions)?;
+
+    Ok(InputReleaseAllResult {
+        released: true,
+        mode: ControlModeSnapshot::from(state.mode()),
+    })
+}
+
+fn recovery_transition_error(error: CoreTransitionError) -> PlatformError {
+    PlatformError::new(format!("failed to recover local control: {error}"))
 }
 
 fn encode_platform_error(
@@ -1589,9 +1649,10 @@ mod tests {
         ScreenEdgeBinding, ScreenLayout, SessionId,
     };
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonStatus, DaemonStatusParams, IpcEndpoint,
-        IpcPlatformCapabilities, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer,
-        METHOD_DAEMON_STATUS, OsLocalIpcClient, call_json_rpc, to_json_line,
+        ControlModeSnapshot, DaemonStatus, DaemonStatusParams, InputReleaseAllParams,
+        InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities, JsonRpcFailure,
+        JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_STATUS,
+        METHOD_INPUT_RELEASE_ALL, OsLocalIpcClient, call_json_rpc, to_json_line,
     };
     use akraz_platform::{
         DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, InputCapturePolicy,
@@ -1603,12 +1664,14 @@ mod tests {
         CapturedInputRouter, CoreActionDispatcher, DAEMON_VERSION, DaemonInputCaptureConfig,
         DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer, DaemonPeerTransport,
         DaemonTransportCommand, LocalPlatformCoreActionDispatcher, LoopbackPeerTransport,
-        PeerTransportCommandExecution, PeerTransportMessage, PeerTransportSessionFrame,
-        TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher,
-        apply_routed_capture_event_to_state, build_daemon_status, build_permissions_probe,
-        drain_capture_events, execute_peer_transport_command, handle_ipc_request_line,
-        input_capture_policy_for_control_mode, serve_daemon_ipc, serve_tcp_peer_transport_commands,
-        serve_tcp_peer_transport_session, serve_tcp_peer_transport_session_and_execute,
+        NoopCoreActionDispatcher, PeerTransportCommandExecution, PeerTransportMessage,
+        PeerTransportSessionFrame, TcpPeerSessionTransport, TcpPeerTransport,
+        TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
+        build_permissions_probe, drain_capture_events, execute_peer_transport_command,
+        handle_ipc_request_line, input_capture_policy_for_control_mode,
+        recover_local_control_and_release_inputs, serve_daemon_ipc,
+        serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
+        serve_tcp_peer_transport_session_and_execute,
         serve_tcp_peer_transport_session_and_execute_until_closed, shared_runtime_state,
         start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
         start_daemon_input_capture_with_routing,
@@ -2566,8 +2629,10 @@ mod tests {
 
     #[test]
     fn ipc_dispatch_handles_daemon_status_request() {
-        let state = RuntimeInputState::new();
+        let mut state = RuntimeInputState::new();
         let platform = FakePlatformAdapter::default();
+        let dispatcher =
+            LocalPlatformCoreActionDispatcher::new(platform.clone(), NoopCoreActionDispatcher);
         let request =
             JsonRpcRequest::new("req_1", METHOD_DAEMON_STATUS, DaemonStatusParams::default());
         let request_line = match to_json_line(&request) {
@@ -2575,10 +2640,11 @@ mod tests {
             Err(error) => panic!("expected request serialization: {error}"),
         };
 
-        let response_line = match handle_ipc_request_line(&state, &platform, &request_line) {
-            Ok(line) => line,
-            Err(error) => panic!("expected daemon IPC response: {error}"),
-        };
+        let response_line =
+            match handle_ipc_request_line(&mut state, &platform, &dispatcher, &request_line) {
+                Ok(line) => line,
+                Err(error) => panic!("expected daemon IPC response: {error}"),
+            };
         let response: JsonRpcSuccess<DaemonStatus> = match serde_json::from_str(&response_line) {
             Ok(response) => response,
             Err(error) => panic!("expected daemon status response JSON: {error}"),
@@ -2587,6 +2653,106 @@ mod tests {
         assert_eq!(response.id, "req_1");
         assert_eq!(response.result.daemon_version, DAEMON_VERSION);
         assert_eq!(response.result.mode, ControlModeSnapshot::Local);
+    }
+
+    #[test]
+    fn release_all_command_recovers_local_control_and_dispatches_release_actions() {
+        let mut state = RuntimeInputState::new();
+        state
+            .apply_event(RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            })
+            .expect("remote entry request");
+        state
+            .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-cli"),
+            })
+            .expect("remote entry confirmed");
+        let dispatcher = RecordingCoreActionDispatcher::default();
+
+        let result = recover_local_control_and_release_inputs(&mut state, &dispatcher)
+            .expect("release all command");
+
+        assert_eq!(
+            result,
+            InputReleaseAllResult {
+                released: true,
+                mode: ControlModeSnapshot::Local,
+            }
+        );
+        assert_eq!(state.mode(), ControlMode::Local);
+        assert_eq!(
+            dispatcher.snapshot(),
+            vec![
+                CoreAction::ReleaseLocalInputs,
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-cli")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn daemon_ipc_server_handles_input_release_all_request() {
+        let mut initial_state = RuntimeInputState::new();
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            })
+            .expect("remote entry request");
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-ipc"),
+            })
+            .expect("remote entry confirmed");
+        let state = shared_runtime_state(initial_state);
+        let platform = FakePlatformAdapter::default();
+        let dispatcher = RecordingCoreActionDispatcher::default();
+        let server = DaemonIpcServer::from_shared_state_and_dispatcher(
+            state.clone(),
+            platform,
+            std::sync::Arc::new(dispatcher.clone()),
+        );
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_INPUT_RELEASE_ALL,
+            InputReleaseAllParams::default(),
+        );
+        let request_line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        let response_line = match server.handle_request_line(&request_line) {
+            Ok(line) => line,
+            Err(error) => panic!("expected daemon release-all response: {error}"),
+        };
+        let response: JsonRpcSuccess<InputReleaseAllResult> =
+            match serde_json::from_str(&response_line) {
+                Ok(response) => response,
+                Err(error) => panic!("expected release-all response JSON: {error}"),
+            };
+
+        assert_eq!(response.id, "req_1");
+        assert_eq!(
+            response.result,
+            InputReleaseAllResult {
+                released: true,
+                mode: ControlModeSnapshot::Local,
+            }
+        );
+        assert_eq!(state.lock().expect("state lock").mode(), ControlMode::Local);
+        assert_eq!(
+            dispatcher.snapshot(),
+            vec![
+                CoreAction::ReleaseLocalInputs,
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-ipc")),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -3113,14 +3279,17 @@ mod tests {
 
     #[test]
     fn ipc_dispatch_handles_unknown_method_failure() {
-        let state = RuntimeInputState::new();
+        let mut state = RuntimeInputState::new();
         let platform = FakePlatformAdapter::default();
+        let dispatcher =
+            LocalPlatformCoreActionDispatcher::new(platform.clone(), NoopCoreActionDispatcher);
         let request_line = r#"{"jsonrpc":"2.0","id":"req_1","method":"daemon.nope","params":{}}"#;
 
-        let response_line = match handle_ipc_request_line(&state, &platform, request_line) {
-            Ok(line) => line,
-            Err(error) => panic!("expected daemon IPC failure response: {error}"),
-        };
+        let response_line =
+            match handle_ipc_request_line(&mut state, &platform, &dispatcher, request_line) {
+                Ok(line) => line,
+                Err(error) => panic!("expected daemon IPC failure response: {error}"),
+            };
         let response: JsonRpcFailure = match serde_json::from_str(&response_line) {
             Ok(response) => response,
             Err(error) => panic!("expected JSON-RPC failure response: {error}"),
@@ -3136,13 +3305,16 @@ mod tests {
 
     #[test]
     fn ipc_dispatch_handles_malformed_request_failure() {
-        let state = RuntimeInputState::new();
+        let mut state = RuntimeInputState::new();
         let platform = FakePlatformAdapter::default();
+        let dispatcher =
+            LocalPlatformCoreActionDispatcher::new(platform.clone(), NoopCoreActionDispatcher);
 
-        let response_line = match handle_ipc_request_line(&state, &platform, "{not json") {
-            Ok(line) => line,
-            Err(error) => panic!("expected daemon IPC parse failure response: {error}"),
-        };
+        let response_line =
+            match handle_ipc_request_line(&mut state, &platform, &dispatcher, "{not json") {
+                Ok(line) => line,
+                Err(error) => panic!("expected daemon IPC parse failure response: {error}"),
+            };
         let value: serde_json::Value = match serde_json::from_str(&response_line) {
             Ok(value) => value,
             Err(error) => panic!("expected JSON-RPC failure response: {error}"),

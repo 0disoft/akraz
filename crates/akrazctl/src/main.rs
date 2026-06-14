@@ -4,9 +4,10 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use akraz_ipc::{
-    DaemonStatusParams, IpcCallError, IpcEndpoint, IpcEndpointError, IpcTransportError,
-    JsonRpcRequest, METHOD_DAEMON_STATUS, METHOD_PERMISSIONS_PROBE, OsLocalIpcClient,
-    PermissionsProbeParams, call_json_rpc, resolve_current_default_endpoint,
+    DaemonStatusParams, InputReleaseAllParams, IpcCallError, IpcEndpoint, IpcEndpointError,
+    IpcTransportError, JsonRpcRequest, METHOD_DAEMON_STATUS, METHOD_INPUT_RELEASE_ALL,
+    METHOD_PERMISSIONS_PROBE, OsLocalIpcClient, PermissionsProbeParams, call_json_rpc,
+    resolve_current_default_endpoint,
 };
 
 const LOCAL_REQUEST_ID: &str = "local";
@@ -50,12 +51,31 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("input") => match args.next().as_deref() {
+            Some("release-all") => match parse_endpoint_options(args) {
+                Ok(options) => print_input_release_all(options),
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            },
+            Some(argument) => {
+                eprintln!("unknown input command: {argument}");
+                ExitCode::from(2)
+            }
+            None => {
+                eprintln!("missing input command");
+                ExitCode::from(2)
+            }
+        },
         Some(argument) => {
             eprintln!("unknown command: {argument}");
             ExitCode::from(2)
         }
         None => {
-            eprintln!("usage: akrazctl <status|permissions probe|daemon-args|--version>");
+            eprintln!(
+                "usage: akrazctl <status|permissions probe|input release-all|daemon-args|--version>"
+            );
             ExitCode::from(2)
         }
     }
@@ -80,6 +100,16 @@ fn print_permissions_probe(options: EndpointOptions) -> ExitCode {
         LOCAL_REQUEST_ID,
         METHOD_PERMISSIONS_PROBE,
         PermissionsProbeParams::default(),
+    );
+
+    print_local_daemon_response(options.endpoint, &request)
+}
+
+fn print_input_release_all(options: EndpointOptions) -> ExitCode {
+    let request = JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_INPUT_RELEASE_ALL,
+        InputReleaseAllParams::default(),
     );
 
     print_local_daemon_response(options.endpoint, &request)
@@ -502,6 +532,7 @@ mod tests {
         METHOD_DAEMON_STATUS, build_daemon_client_with_resolver, format_daemon_call_error,
         format_daemon_command_line, parse_daemon_args_options, parse_endpoint_options,
     };
+    use akraz_ipc::METHOD_INPUT_RELEASE_ALL;
 
     #[test]
     fn parses_endpoint_option() {
@@ -667,6 +698,18 @@ mod tests {
 
         assert_eq!(request.id, LOCAL_REQUEST_ID);
         assert_eq!(request.method, METHOD_DAEMON_STATUS);
+    }
+
+    #[test]
+    fn release_all_request_uses_input_release_all_ipc_method() {
+        let request = JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_INPUT_RELEASE_ALL,
+            akraz_ipc::InputReleaseAllParams::default(),
+        );
+
+        assert_eq!(request.id, LOCAL_REQUEST_ID);
+        assert_eq!(request.method, METHOD_INPUT_RELEASE_ALL);
     }
 
     #[test]
