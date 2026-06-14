@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.4.17",
+  "version": "0.4.18",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,6 +13,7 @@
     "smoke:loopback-transport": "bun scripts/smoke-loopback-transport.mjs",
     "smoke:peer-session": "bun scripts/smoke-peer-session.mjs",
     "smoke:peer-session-executor": "bun scripts/smoke-peer-session-executor.mjs",
+    "smoke:session-connect-lifecycle": "bun scripts/smoke-session-connect-lifecycle.mjs",
     "smoke:settings-start": "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
     "smoke:tcp-transport": "bun scripts/smoke-tcp-transport.mjs",
     "tauri": "tauri"
