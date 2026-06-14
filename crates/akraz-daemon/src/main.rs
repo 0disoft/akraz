@@ -15,7 +15,7 @@ use akraz_core::{
 use akraz_daemon::{
     CoreActionDispatcher, DaemonInputCaptureConfig, DaemonInputCaptureWorker, DaemonIpcRunConfig,
     DaemonIpcServer, DaemonTransportCommand, LocalPlatformCoreActionDispatcher,
-    LoopbackPeerTransport, NoopCoreActionDispatcher, PeerTransportCommandExecution,
+    LoopbackPeerTransport, ManagedPeerSessionTransport, PeerTransportCommandExecution,
     PeerTransportSession, PeerTransportSessionExecution, SharedCoreActionDispatcher,
     TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher, build_daemon_status,
     execute_peer_transport_session_stream_until_closed, serve_daemon_ipc,
@@ -74,13 +74,14 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
         DaemonIpcRunConfig::serve_forever(endpoint)
     };
     let platform = runtime_platform_adapter();
-    let dispatcher = match build_configured_core_action_dispatcher(platform.clone(), &options) {
-        Ok(dispatcher) => dispatcher,
-        Err(error) => {
-            eprintln!("failed to configure daemon recovery dispatcher: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let (dispatcher, _peer_sessions) =
+        match build_configured_core_action_dispatcher(platform.clone(), &options) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => {
+                eprintln!("failed to configure daemon recovery dispatcher: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
     let server = DaemonIpcServer::from_shared_state_and_dispatcher(
         shared_runtime_state(RuntimeInputState::new()),
         platform.clone(),
@@ -129,33 +130,28 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
 fn build_configured_core_action_dispatcher<P>(
     platform: P,
     options: &ServeOptions,
-) -> Result<SharedCoreActionDispatcher, PlatformError>
+) -> Result<(SharedCoreActionDispatcher, ManagedPeerSessionTransport), PlatformError>
 where
     P: PlatformAdapter + Clone + Send + Sync + 'static,
 {
-    let dispatcher: SharedCoreActionDispatcher = match &options.peer_session {
-        Some(peer_session) => {
-            let local_device_id = options.local_device_id.clone().ok_or_else(|| {
-                PlatformError::new("peer session transport requires --local-device-id")
-            })?;
-            let transport = TcpPeerSessionTransport::connect(
-                peer_session.peer_id.clone(),
-                local_device_id,
-                peer_session.address,
-            )?;
+    let peer_sessions = ManagedPeerSessionTransport::new();
+    if let Some(peer_session) = &options.peer_session {
+        let local_device_id = options.local_device_id.clone().ok_or_else(|| {
+            PlatformError::new("peer session transport requires --local-device-id")
+        })?;
+        let transport = TcpPeerSessionTransport::connect(
+            peer_session.peer_id.clone(),
+            local_device_id,
+            peer_session.address,
+        )?;
+        peer_sessions.attach_session(transport)?;
+    }
+    let dispatcher: SharedCoreActionDispatcher = Arc::new(LocalPlatformCoreActionDispatcher::new(
+        platform,
+        TransportCoreActionDispatcher::new(peer_sessions.clone()),
+    ));
 
-            Arc::new(LocalPlatformCoreActionDispatcher::new(
-                platform,
-                TransportCoreActionDispatcher::new(transport),
-            ))
-        }
-        None => Arc::new(LocalPlatformCoreActionDispatcher::new(
-            platform,
-            NoopCoreActionDispatcher,
-        )),
-    };
-
-    Ok(dispatcher)
+    Ok((dispatcher, peer_sessions))
 }
 
 fn start_configured_input_capture<P>(

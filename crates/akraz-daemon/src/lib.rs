@@ -342,6 +342,102 @@ impl DaemonPeerTransport for TcpPeerSessionTransport {
     }
 }
 
+/// Runtime-managed peer session transport used by daemon control commands.
+#[derive(Debug, Default, Clone)]
+pub struct ManagedPeerSessionTransport {
+    active_session: Arc<Mutex<Option<TcpPeerSessionTransport>>>,
+}
+
+impl ManagedPeerSessionTransport {
+    /// Create an empty managed peer session transport.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return whether a peer session is currently active.
+    pub fn is_connected(&self) -> Result<bool, PlatformError> {
+        self.active_session
+            .lock()
+            .map_err(|_| PlatformError::new("managed peer session is unavailable"))
+            .map(|session| session.is_some())
+    }
+
+    /// Return a snapshot of the active peer session, if one exists.
+    pub fn active_session(&self) -> Result<Option<ManagedPeerSessionSnapshot>, PlatformError> {
+        self.active_session
+            .lock()
+            .map_err(|_| PlatformError::new("managed peer session is unavailable"))
+            .map(|session| session.as_ref().map(ManagedPeerSessionSnapshot::from))
+    }
+
+    /// Attach an already connected TCP peer session.
+    pub fn attach_session(&self, session: TcpPeerSessionTransport) -> Result<(), PlatformError> {
+        let mut active_session = self
+            .active_session
+            .lock()
+            .map_err(|_| PlatformError::new("managed peer session is unavailable"))?;
+        if active_session.is_some() {
+            return Err(PlatformError::new(
+                "managed peer session already has an active peer",
+            ));
+        }
+
+        *active_session = Some(session);
+        Ok(())
+    }
+
+    /// Disconnect the active peer session and return the detached session snapshot.
+    pub fn disconnect_session(&self) -> Result<Option<ManagedPeerSessionSnapshot>, PlatformError> {
+        let mut active_session = self
+            .active_session
+            .lock()
+            .map_err(|_| PlatformError::new("managed peer session is unavailable"))?;
+
+        Ok(active_session
+            .take()
+            .as_ref()
+            .map(ManagedPeerSessionSnapshot::from))
+    }
+
+    fn active_transport(&self) -> Result<Option<TcpPeerSessionTransport>, PlatformError> {
+        self.active_session
+            .lock()
+            .map_err(|_| PlatformError::new("managed peer session is unavailable"))
+            .map(|session| session.clone())
+    }
+}
+
+impl DaemonPeerTransport for ManagedPeerSessionTransport {
+    fn dispatch_transport_command(
+        &self,
+        command: DaemonTransportCommand,
+    ) -> Result<(), PlatformError> {
+        if let Some(transport) = self.active_transport()? {
+            transport.dispatch_transport_command(command)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Observable active-session facts kept out of the raw TCP stream wrapper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedPeerSessionSnapshot {
+    pub peer_id: PeerId,
+    pub local_device_id: DeviceId,
+    pub address: SocketAddr,
+}
+
+impl From<&TcpPeerSessionTransport> for ManagedPeerSessionSnapshot {
+    fn from(transport: &TcpPeerSessionTransport) -> Self {
+        Self {
+            peer_id: transport.peer_id().clone(),
+            local_device_id: transport.local_device_id().clone(),
+            address: transport.address(),
+        }
+    }
+}
+
 /// Decoded persistent TCP peer session captured by a bounded smoke server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerTransportSession {
@@ -1664,13 +1760,13 @@ mod tests {
         CapturedInputRouter, CoreActionDispatcher, DAEMON_VERSION, DaemonInputCaptureConfig,
         DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer, DaemonPeerTransport,
         DaemonTransportCommand, LocalPlatformCoreActionDispatcher, LoopbackPeerTransport,
-        NoopCoreActionDispatcher, PeerTransportCommandExecution, PeerTransportMessage,
-        PeerTransportSessionFrame, TcpPeerSessionTransport, TcpPeerTransport,
-        TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
-        build_permissions_probe, drain_capture_events, execute_peer_transport_command,
-        handle_ipc_request_line, input_capture_policy_for_control_mode,
-        recover_local_control_and_release_inputs, serve_daemon_ipc,
-        serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
+        ManagedPeerSessionSnapshot, ManagedPeerSessionTransport, NoopCoreActionDispatcher,
+        PeerTransportCommandExecution, PeerTransportMessage, PeerTransportSessionFrame,
+        TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher,
+        apply_routed_capture_event_to_state, build_daemon_status, build_permissions_probe,
+        drain_capture_events, execute_peer_transport_command, handle_ipc_request_line,
+        input_capture_policy_for_control_mode, recover_local_control_and_release_inputs,
+        serve_daemon_ipc, serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
         serve_tcp_peer_transport_session_and_execute,
         serve_tcp_peer_transport_session_and_execute_until_closed, shared_runtime_state,
         start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
@@ -2364,6 +2460,114 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn managed_peer_session_transport_ignores_dispatch_without_active_session() {
+        let transport = ManagedPeerSessionTransport::new();
+
+        transport
+            .dispatch_transport_command(DaemonTransportCommand::ReleaseAllInputs)
+            .expect("missing active session should be a no-op");
+
+        assert_eq!(transport.is_connected(), Ok(false));
+        assert_eq!(transport.active_session(), Ok(None));
+    }
+
+    #[test]
+    fn managed_peer_session_transport_attaches_dispatches_and_disconnects_session() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread =
+            std::thread::spawn(move || serve_tcp_peer_transport_session(&listener, 1));
+        let managed = ManagedPeerSessionTransport::new();
+        let session = TcpPeerSessionTransport::connect(
+            PeerId::new("right-peer"),
+            DeviceId::new("windows-desktop"),
+            address,
+        )
+        .expect("connect TCP peer session");
+
+        managed
+            .attach_session(session)
+            .expect("attach active session");
+        assert_eq!(managed.is_connected(), Ok(true));
+        assert_eq!(
+            managed.active_session(),
+            Ok(Some(ManagedPeerSessionSnapshot {
+                peer_id: PeerId::new("right-peer"),
+                local_device_id: DeviceId::new("windows-desktop"),
+                address,
+            }))
+        );
+        managed
+            .dispatch_transport_command(DaemonTransportCommand::ReleaseAllInputs)
+            .expect("managed dispatch");
+        assert_eq!(
+            managed.disconnect_session(),
+            Ok(Some(ManagedPeerSessionSnapshot {
+                peer_id: PeerId::new("right-peer"),
+                local_device_id: DeviceId::new("windows-desktop"),
+                address,
+            }))
+        );
+        assert_eq!(managed.is_connected(), Ok(false));
+
+        let session = server_thread
+            .join()
+            .expect("TCP peer session server thread")
+            .expect("TCP peer session");
+        assert_eq!(session.hello.device_id, DeviceId::new("windows-desktop"));
+        assert_eq!(session.hello.peer_id, PeerId::new("right-peer"));
+        assert_eq!(
+            session.commands,
+            vec![DaemonTransportCommand::ReleaseAllInputs]
+        );
+    }
+
+    #[test]
+    fn managed_peer_session_transport_rejects_second_active_session() {
+        let first_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind first loopback listener");
+        let first_address = first_listener.local_addr().expect("first listener address");
+        let first_server_thread =
+            std::thread::spawn(move || serve_tcp_peer_transport_session(&first_listener, 0));
+        let second_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind second loopback listener");
+        let second_address = second_listener
+            .local_addr()
+            .expect("second listener address");
+        let second_server_thread =
+            std::thread::spawn(move || serve_tcp_peer_transport_session(&second_listener, 0));
+        let managed = ManagedPeerSessionTransport::new();
+        let first_session = TcpPeerSessionTransport::connect(
+            PeerId::new("right-peer"),
+            DeviceId::new("windows-desktop"),
+            first_address,
+        )
+        .expect("connect first TCP peer session");
+        let second_session = TcpPeerSessionTransport::connect(
+            PeerId::new("left-peer"),
+            DeviceId::new("windows-desktop"),
+            second_address,
+        )
+        .expect("connect second TCP peer session");
+
+        managed
+            .attach_session(first_session)
+            .expect("attach first session");
+        let error = managed
+            .attach_session(second_session)
+            .expect_err("second session should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "managed peer session already has an active peer"
+        );
+        drop(managed);
+        assert!(first_server_thread.join().expect("first server").is_ok());
+        assert!(second_server_thread.join().expect("second server").is_ok());
     }
 
     #[test]
