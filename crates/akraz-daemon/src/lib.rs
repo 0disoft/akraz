@@ -18,8 +18,9 @@ use akraz_core::{
 use akraz_ipc::{
     ControlModeSnapshot, DaemonStatus, InputReleaseAllResult, IpcCodecError,
     IpcPlatformCapabilities, IpcRequest, IpcTransportError, JsonRpcError, JsonRpcFailure,
-    JsonRpcSuccess, LocalIpcServer, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
-    parse_request_line, serve_os_local_ipc_once, to_json_line,
+    JsonRpcSuccess, LocalIpcServer, PeerStatus, PermissionIssue, PermissionsProbe,
+    ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult, SessionDisconnectResult,
+    SessionStatus, parse_request_line, serve_os_local_ipc_once, to_json_line,
 };
 use akraz_platform::{
     DesktopGeometry, InputCaptureConfig, InputCapturePolicy, InputCaptureSession, PlatformAdapter,
@@ -1154,6 +1155,7 @@ pub struct DaemonIpcServer<P> {
     state: SharedRuntimeInputState,
     platform: P,
     dispatcher: SharedCoreActionDispatcher,
+    peer_sessions: ManagedPeerSessionTransport,
 }
 
 impl<P> DaemonIpcServer<P>
@@ -1183,10 +1185,26 @@ impl<P> DaemonIpcServer<P> {
         platform: P,
         dispatcher: SharedCoreActionDispatcher,
     ) -> Self {
+        Self::from_shared_state_dispatcher_and_peer_sessions(
+            state,
+            platform,
+            dispatcher,
+            ManagedPeerSessionTransport::new(),
+        )
+    }
+
+    /// Create an in-process daemon IPC server from shared runtime state, dispatcher, and sessions.
+    pub fn from_shared_state_dispatcher_and_peer_sessions(
+        state: SharedRuntimeInputState,
+        platform: P,
+        dispatcher: SharedCoreActionDispatcher,
+        peer_sessions: ManagedPeerSessionTransport,
+    ) -> Self {
         Self {
             state,
             platform,
             dispatcher,
+            peer_sessions,
         }
     }
 
@@ -1205,8 +1223,14 @@ where
             IpcTransportError::request_failed("daemon runtime state is unavailable")
         })?;
 
-        handle_ipc_request_line(&mut state, &self.platform, &self.dispatcher, request_line)
-            .map_err(|error| IpcTransportError::request_failed(error.to_string()))
+        handle_ipc_request_line_with_peer_sessions(
+            &mut state,
+            &self.platform,
+            &self.dispatcher,
+            &self.peer_sessions,
+            request_line,
+        )
+        .map_err(|error| IpcTransportError::request_failed(error.to_string()))
     }
 }
 
@@ -1597,13 +1621,22 @@ pub fn build_daemon_status(
     state: &RuntimeInputState,
     platform: &impl PlatformAdapter,
 ) -> Result<DaemonStatus, PlatformError> {
+    build_daemon_status_with_peer_sessions(state, platform, &ManagedPeerSessionTransport::new())
+}
+
+/// Build a `daemon.status` result including the managed peer-session snapshot.
+pub fn build_daemon_status_with_peer_sessions(
+    state: &RuntimeInputState,
+    platform: &impl PlatformAdapter,
+    peer_sessions: &ManagedPeerSessionTransport,
+) -> Result<DaemonStatus, PlatformError> {
     let capabilities = platform.probe_capabilities()?;
 
     Ok(DaemonStatus {
         daemon_version: DAEMON_VERSION.to_string(),
         mode: state.mode().into(),
         protocol: ProtocolVersionSnapshot::from(ProtocolVersion::CURRENT),
-        peers: Vec::new(),
+        peers: active_peer_statuses(peer_sessions)?,
         capabilities: IpcPlatformCapabilities::from(capabilities),
     })
 }
@@ -1615,8 +1648,25 @@ pub fn handle_ipc_request_line(
     dispatcher: &impl CoreActionDispatcher,
     line: &str,
 ) -> Result<String, DaemonIpcError> {
+    handle_ipc_request_line_with_peer_sessions(
+        state,
+        platform,
+        dispatcher,
+        &ManagedPeerSessionTransport::new(),
+        line,
+    )
+}
+
+/// Handle one local IPC JSON-RPC request line with a managed peer-session transport.
+pub fn handle_ipc_request_line_with_peer_sessions(
+    state: &mut RuntimeInputState,
+    platform: &impl PlatformAdapter,
+    dispatcher: &impl CoreActionDispatcher,
+    peer_sessions: &ManagedPeerSessionTransport,
+    line: &str,
+) -> Result<String, DaemonIpcError> {
     match parse_request_line(line) {
-        Ok(request) => handle_ipc_request(state, platform, dispatcher, request),
+        Ok(request) => handle_ipc_request(state, platform, dispatcher, peer_sessions, request),
         Err(failure) => encode_response(&failure),
     }
 }
@@ -1625,13 +1675,16 @@ fn handle_ipc_request(
     state: &mut RuntimeInputState,
     platform: &impl PlatformAdapter,
     dispatcher: &impl CoreActionDispatcher,
+    peer_sessions: &ManagedPeerSessionTransport,
     request: IpcRequest,
 ) -> Result<String, DaemonIpcError> {
     match request {
-        IpcRequest::DaemonStatus(request) => match build_daemon_status(state, platform) {
-            Ok(status) => encode_response(&JsonRpcSuccess::new(request.id, status)),
-            Err(error) => encode_platform_error(request.id, "daemon status unavailable", error),
-        },
+        IpcRequest::DaemonStatus(request) => {
+            match build_daemon_status_with_peer_sessions(state, platform, peer_sessions) {
+                Ok(status) => encode_response(&JsonRpcSuccess::new(request.id, status)),
+                Err(error) => encode_platform_error(request.id, "daemon status unavailable", error),
+            }
+        }
         IpcRequest::PermissionsProbe(request) => match build_permissions_probe(platform) {
             Ok(probe) => encode_response(&JsonRpcSuccess::new(request.id, probe)),
             Err(error) => encode_platform_error(request.id, "permissions probe unavailable", error),
@@ -1642,6 +1695,125 @@ fn handle_ipc_request(
                 Err(error) => encode_platform_error(request.id, "input release unavailable", error),
             }
         }
+        IpcRequest::SessionConnect(request) => {
+            match connect_peer_session(&request.params, peer_sessions) {
+                Ok(result) => encode_response(&JsonRpcSuccess::new(request.id, result)),
+                Err(error) => {
+                    encode_platform_error(request.id, "session connect unavailable", error)
+                }
+            }
+        }
+        IpcRequest::SessionDisconnect(request) => {
+            match disconnect_peer_session(state, dispatcher, peer_sessions) {
+                Ok(result) => encode_response(&JsonRpcSuccess::new(request.id, result)),
+                Err(error) => {
+                    encode_platform_error(request.id, "session disconnect unavailable", error)
+                }
+            }
+        }
+    }
+}
+
+/// Connect the managed peer-session transport to a remote peer.
+pub fn connect_peer_session(
+    params: &SessionConnectParams,
+    peer_sessions: &ManagedPeerSessionTransport,
+) -> Result<SessionConnectResult, PlatformError> {
+    if peer_sessions.is_connected()? {
+        return Err(PlatformError::new(
+            "managed peer session already has an active peer",
+        ));
+    }
+
+    let peer_id = parse_non_empty_peer_id(&params.peer_id)?;
+    let local_device_id = parse_non_empty_device_id(&params.local_device_id)?;
+    let address = parse_peer_session_address(&params.address)?;
+    let session = TcpPeerSessionTransport::connect(peer_id, local_device_id, address)?;
+
+    peer_sessions.attach_session(session)?;
+
+    let snapshot = peer_sessions
+        .active_session()?
+        .ok_or_else(|| PlatformError::new("managed peer session was not attached"))?;
+
+    Ok(SessionConnectResult {
+        connected: true,
+        session: session_status_from_snapshot(&snapshot, true),
+    })
+}
+
+/// Disconnect the managed peer session after recovering local input control.
+pub fn disconnect_peer_session(
+    state: &mut RuntimeInputState,
+    dispatcher: &impl CoreActionDispatcher,
+    peer_sessions: &ManagedPeerSessionTransport,
+) -> Result<SessionDisconnectResult, PlatformError> {
+    let recovery = recover_local_control_and_release_inputs(state, dispatcher)?;
+    let detached_session = peer_sessions.disconnect_session()?;
+
+    Ok(SessionDisconnectResult {
+        disconnected: detached_session.is_some(),
+        session: detached_session
+            .as_ref()
+            .map(|session| session_status_from_snapshot(session, false)),
+        mode: recovery.mode,
+    })
+}
+
+fn active_peer_statuses(
+    peer_sessions: &ManagedPeerSessionTransport,
+) -> Result<Vec<PeerStatus>, PlatformError> {
+    Ok(peer_sessions
+        .active_session()?
+        .into_iter()
+        .map(|session| PeerStatus {
+            display_name: session.peer_id.as_str().to_string(),
+            peer_id: session.peer_id.as_str().to_string(),
+            connected: true,
+        })
+        .collect())
+}
+
+fn session_status_from_snapshot(
+    snapshot: &ManagedPeerSessionSnapshot,
+    connected: bool,
+) -> SessionStatus {
+    SessionStatus {
+        peer_id: snapshot.peer_id.as_str().to_string(),
+        local_device_id: snapshot.local_device_id.as_str().to_string(),
+        address: snapshot.address.to_string(),
+        connected,
+    }
+}
+
+fn parse_non_empty_peer_id(value: &str) -> Result<PeerId, PlatformError> {
+    let value = require_non_empty_session_value("peerId", value)?;
+    Ok(PeerId::new(value))
+}
+
+fn parse_non_empty_device_id(value: &str) -> Result<DeviceId, PlatformError> {
+    let value = require_non_empty_session_value("localDeviceId", value)?;
+    Ok(DeviceId::new(value))
+}
+
+fn parse_peer_session_address(value: &str) -> Result<SocketAddr, PlatformError> {
+    let value = require_non_empty_session_value("address", value)?;
+    value
+        .parse::<SocketAddr>()
+        .map_err(|error| PlatformError::new(format!("invalid peer session address: {error}")))
+}
+
+fn require_non_empty_session_value<'a>(
+    field: &'static str,
+    value: &'a str,
+) -> Result<&'a str, PlatformError> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(PlatformError::new(format!(
+            "session connect field {field} must not be empty"
+        )))
+    } else {
+        Ok(value)
     }
 }
 
@@ -1748,7 +1920,10 @@ mod tests {
         ControlModeSnapshot, DaemonStatus, DaemonStatusParams, InputReleaseAllParams,
         InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities, JsonRpcFailure,
         JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_STATUS,
-        METHOD_INPUT_RELEASE_ALL, OsLocalIpcClient, call_json_rpc, to_json_line,
+        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
+        OsLocalIpcClient, PeerStatus, SessionConnectParams, SessionConnectResult,
+        SessionDisconnectParams, SessionDisconnectResult, SessionStatus, call_json_rpc,
+        to_json_line,
     };
     use akraz_platform::{
         DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, InputCapturePolicy,
@@ -1763,10 +1938,12 @@ mod tests {
         ManagedPeerSessionSnapshot, ManagedPeerSessionTransport, NoopCoreActionDispatcher,
         PeerTransportCommandExecution, PeerTransportMessage, PeerTransportSessionFrame,
         TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher,
-        apply_routed_capture_event_to_state, build_daemon_status, build_permissions_probe,
-        drain_capture_events, execute_peer_transport_command, handle_ipc_request_line,
-        input_capture_policy_for_control_mode, recover_local_control_and_release_inputs,
-        serve_daemon_ipc, serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
+        apply_routed_capture_event_to_state, build_daemon_status,
+        build_daemon_status_with_peer_sessions, build_permissions_probe, connect_peer_session,
+        disconnect_peer_session, drain_capture_events, execute_peer_transport_command,
+        handle_ipc_request_line, input_capture_policy_for_control_mode,
+        recover_local_control_and_release_inputs, serve_daemon_ipc,
+        serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
         serve_tcp_peer_transport_session_and_execute,
         serve_tcp_peer_transport_session_and_execute_until_closed, shared_runtime_state,
         start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
@@ -2957,6 +3134,202 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn peer_session_connect_command_attaches_session_and_updates_status() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread =
+            std::thread::spawn(move || serve_tcp_peer_transport_session(&listener, 0));
+        let platform = FakePlatformAdapter::default();
+        let state = RuntimeInputState::new();
+        let peer_sessions = ManagedPeerSessionTransport::new();
+
+        let result = connect_peer_session(
+            &SessionConnectParams {
+                peer_id: "right-peer".to_string(),
+                local_device_id: "windows-desktop".to_string(),
+                address: address.to_string(),
+            },
+            &peer_sessions,
+        )
+        .expect("connect managed peer session");
+
+        assert_eq!(
+            result,
+            SessionConnectResult {
+                connected: true,
+                session: SessionStatus {
+                    peer_id: "right-peer".to_string(),
+                    local_device_id: "windows-desktop".to_string(),
+                    address: address.to_string(),
+                    connected: true,
+                },
+            }
+        );
+        assert_eq!(
+            build_daemon_status_with_peer_sessions(&state, &platform, &peer_sessions)
+                .expect("daemon status")
+                .peers,
+            vec![PeerStatus {
+                peer_id: "right-peer".to_string(),
+                display_name: "right-peer".to_string(),
+                connected: true,
+            }]
+        );
+
+        let session = server_thread
+            .join()
+            .expect("TCP peer session server thread")
+            .expect("TCP peer session");
+        assert_eq!(session.hello.device_id, DeviceId::new("windows-desktop"));
+        assert_eq!(session.hello.peer_id, PeerId::new("right-peer"));
+        assert!(session.commands.is_empty());
+    }
+
+    #[test]
+    fn peer_session_disconnect_command_recovers_local_control_and_detaches_session() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread =
+            std::thread::spawn(move || serve_tcp_peer_transport_session(&listener, 2));
+        let mut state = RuntimeInputState::new();
+        state
+            .apply_event(RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            })
+            .expect("remote entry request");
+        state
+            .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-ipc"),
+            })
+            .expect("remote entry confirmed");
+        let platform = FakePlatformAdapter::default();
+        let peer_sessions = ManagedPeerSessionTransport::new();
+        let session = TcpPeerSessionTransport::connect(
+            PeerId::new("right-peer"),
+            DeviceId::new("windows-desktop"),
+            address,
+        )
+        .expect("connect TCP peer session");
+        peer_sessions
+            .attach_session(session)
+            .expect("attach managed peer session");
+        let dispatcher = LocalPlatformCoreActionDispatcher::new(
+            platform.clone(),
+            TransportCoreActionDispatcher::new(peer_sessions.clone()),
+        );
+
+        let result = disconnect_peer_session(&mut state, &dispatcher, &peer_sessions)
+            .expect("disconnect peer session");
+
+        assert_eq!(
+            result,
+            SessionDisconnectResult {
+                disconnected: true,
+                session: Some(SessionStatus {
+                    peer_id: "right-peer".to_string(),
+                    local_device_id: "windows-desktop".to_string(),
+                    address: address.to_string(),
+                    connected: false,
+                }),
+                mode: ControlModeSnapshot::Local,
+            }
+        );
+        assert_eq!(state.mode(), ControlMode::Local);
+        assert_eq!(platform.release_all_count(), Ok(1));
+        assert_eq!(peer_sessions.active_session(), Ok(None));
+
+        let session = server_thread
+            .join()
+            .expect("TCP peer session server thread")
+            .expect("TCP peer session");
+        assert_eq!(
+            session.commands,
+            vec![
+                DaemonTransportCommand::ReleaseAllInputs,
+                DaemonTransportCommand::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-ipc")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn daemon_ipc_server_handles_session_connect_and_disconnect_requests() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread =
+            std::thread::spawn(move || serve_tcp_peer_transport_session(&listener, 0));
+        let state = shared_runtime_state(RuntimeInputState::new());
+        let platform = FakePlatformAdapter::default();
+        let peer_sessions = ManagedPeerSessionTransport::new();
+        let dispatcher = LocalPlatformCoreActionDispatcher::new(
+            platform.clone(),
+            TransportCoreActionDispatcher::new(peer_sessions.clone()),
+        );
+        let server = DaemonIpcServer::from_shared_state_dispatcher_and_peer_sessions(
+            state,
+            platform,
+            std::sync::Arc::new(dispatcher),
+            peer_sessions.clone(),
+        );
+        let connect_request = JsonRpcRequest::new(
+            "req_connect",
+            METHOD_SESSION_CONNECT,
+            SessionConnectParams {
+                peer_id: "right-peer".to_string(),
+                local_device_id: "windows-desktop".to_string(),
+                address: address.to_string(),
+            },
+        );
+        let connect_line = match to_json_line(&connect_request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected connect request serialization: {error}"),
+        };
+
+        let connect_response_line = match server.handle_request_line(&connect_line) {
+            Ok(line) => line,
+            Err(error) => panic!("expected connect response: {error}"),
+        };
+        let connect_response: JsonRpcSuccess<SessionConnectResult> =
+            match serde_json::from_str(&connect_response_line) {
+                Ok(response) => response,
+                Err(error) => panic!("expected connect response JSON: {error}"),
+            };
+
+        assert_eq!(connect_response.id, "req_connect");
+        assert_eq!(connect_response.result.session.peer_id, "right-peer");
+
+        let disconnect_request = JsonRpcRequest::new(
+            "req_disconnect",
+            METHOD_SESSION_DISCONNECT,
+            SessionDisconnectParams::default(),
+        );
+        let disconnect_line = match to_json_line(&disconnect_request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected disconnect request serialization: {error}"),
+        };
+
+        let disconnect_response_line = match server.handle_request_line(&disconnect_line) {
+            Ok(line) => line,
+            Err(error) => panic!("expected disconnect response: {error}"),
+        };
+        let disconnect_response: JsonRpcSuccess<SessionDisconnectResult> =
+            match serde_json::from_str(&disconnect_response_line) {
+                Ok(response) => response,
+                Err(error) => panic!("expected disconnect response JSON: {error}"),
+            };
+
+        assert_eq!(disconnect_response.id, "req_disconnect");
+        assert!(disconnect_response.result.disconnected);
+        assert_eq!(peer_sessions.active_session(), Ok(None));
+
+        assert!(server_thread.join().expect("server thread").is_ok());
     }
 
     #[test]

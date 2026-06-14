@@ -52,6 +52,12 @@ pub const METHOD_PERMISSIONS_PROBE: &str = "permissions.probe";
 /// JSON-RPC method for emergency input release and local-control recovery.
 pub const METHOD_INPUT_RELEASE_ALL: &str = "input.releaseAll";
 
+/// JSON-RPC method for connecting the active peer session transport.
+pub const METHOD_SESSION_CONNECT: &str = "session.connect";
+
+/// JSON-RPC method for disconnecting the active peer session transport.
+pub const METHOD_SESSION_DISCONNECT: &str = "session.disconnect";
+
 /// JSON-RPC parse error code.
 pub const JSONRPC_ERROR_PARSE: i32 = -32700;
 
@@ -743,6 +749,8 @@ pub enum IpcRequest {
     DaemonStatus(JsonRpcRequest<DaemonStatusParams>),
     PermissionsProbe(JsonRpcRequest<PermissionsProbeParams>),
     InputReleaseAll(JsonRpcRequest<InputReleaseAllParams>),
+    SessionConnect(JsonRpcRequest<SessionConnectParams>),
+    SessionDisconnect(JsonRpcRequest<SessionDisconnectParams>),
 }
 
 impl IpcRequest {
@@ -752,6 +760,8 @@ impl IpcRequest {
             Self::DaemonStatus(request) => &request.id,
             Self::PermissionsProbe(request) => &request.id,
             Self::InputReleaseAll(request) => &request.id,
+            Self::SessionConnect(request) => &request.id,
+            Self::SessionDisconnect(request) => &request.id,
         }
     }
 
@@ -761,6 +771,8 @@ impl IpcRequest {
             Self::DaemonStatus(request) => &request.method,
             Self::PermissionsProbe(request) => &request.method,
             Self::InputReleaseAll(request) => &request.method,
+            Self::SessionConnect(request) => &request.method,
+            Self::SessionDisconnect(request) => &request.method,
         }
     }
 }
@@ -851,6 +863,20 @@ pub struct PermissionsProbeParams {}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputReleaseAllParams {}
+
+/// Params for `session.connect`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConnectParams {
+    pub peer_id: String,
+    pub local_device_id: String,
+    pub address: String,
+}
+
+/// Empty params for `session.disconnect`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDisconnectParams {}
 
 /// Wire-safe snapshot of the core control mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -946,6 +972,33 @@ pub struct PermissionsProbe {
 #[serde(rename_all = "camelCase")]
 pub struct InputReleaseAllResult {
     pub released: bool,
+    pub mode: ControlModeSnapshot,
+}
+
+/// Wire-safe active peer session snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatus {
+    pub peer_id: String,
+    pub local_device_id: String,
+    pub address: String,
+    pub connected: bool,
+}
+
+/// `session.connect` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConnectResult {
+    pub connected: bool,
+    pub session: SessionStatus,
+}
+
+/// `session.disconnect` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDisconnectResult {
+    pub disconnected: bool,
+    pub session: Option<SessionStatus>,
     pub mode: ControlModeSnapshot,
 }
 
@@ -1071,6 +1124,8 @@ pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
         METHOD_DAEMON_STATUS => parse_typed_request(raw).map(IpcRequest::DaemonStatus),
         METHOD_PERMISSIONS_PROBE => parse_typed_request(raw).map(IpcRequest::PermissionsProbe),
         METHOD_INPUT_RELEASE_ALL => parse_typed_request(raw).map(IpcRequest::InputReleaseAll),
+        METHOD_SESSION_CONNECT => parse_typed_request(raw).map(IpcRequest::SessionConnect),
+        METHOD_SESSION_DISCONNECT => parse_typed_request(raw).map(IpcRequest::SessionDisconnect),
         _ => Err(JsonRpcFailure::new(
             Some(raw.id),
             JsonRpcError::new(
@@ -1121,8 +1176,10 @@ mod tests {
         IpcPlatformCapabilities, IpcRequest, IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS,
         JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess,
         LocalIpcClient, LocalIpcServer, METHOD_DAEMON_STATUS, METHOD_INPUT_RELEASE_ALL,
-        OsLocalIpcClient, ProtocolVersionSnapshot, call_json_rpc, parse_request_line,
-        resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
+        METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
+        ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult,
+        SessionDisconnectParams, SessionDisconnectResult, SessionStatus, call_json_rpc,
+        parse_request_line, resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
     };
     use serde_json::json;
 
@@ -1273,6 +1330,113 @@ mod tests {
     }
 
     #[test]
+    fn session_connect_request_uses_camel_case_contract() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_SESSION_CONNECT,
+            SessionConnectParams {
+                peer_id: "linux-laptop".to_string(),
+                local_device_id: "windows-desktop".to_string(),
+                address: "127.0.0.1:24888".to_string(),
+            },
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "method": "session.connect",
+                "params": {
+                    "peerId": "linux-laptop",
+                    "localDeviceId": "windows-desktop",
+                    "address": "127.0.0.1:24888"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn session_connect_response_uses_camel_case_contract() {
+        let response = JsonRpcSuccess::new(
+            "req_1",
+            SessionConnectResult {
+                connected: true,
+                session: SessionStatus {
+                    peer_id: "linux-laptop".to_string(),
+                    local_device_id: "windows-desktop".to_string(),
+                    address: "127.0.0.1:24888".to_string(),
+                    connected: true,
+                },
+            },
+        );
+        let line = match to_json_line(&response) {
+            Ok(line) => line,
+            Err(error) => panic!("expected response serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "result": {
+                    "connected": true,
+                    "session": {
+                        "peerId": "linux-laptop",
+                        "localDeviceId": "windows-desktop",
+                        "address": "127.0.0.1:24888",
+                        "connected": true
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn session_disconnect_response_uses_camel_case_contract() {
+        let response = JsonRpcSuccess::new(
+            "req_1",
+            SessionDisconnectResult {
+                disconnected: true,
+                session: Some(SessionStatus {
+                    peer_id: "linux-laptop".to_string(),
+                    local_device_id: "windows-desktop".to_string(),
+                    address: "127.0.0.1:24888".to_string(),
+                    connected: false,
+                }),
+                mode: ControlModeSnapshot::Local,
+            },
+        );
+        let line = match to_json_line(&response) {
+            Ok(line) => line,
+            Err(error) => panic!("expected response serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "result": {
+                    "disconnected": true,
+                    "session": {
+                        "peerId": "linux-laptop",
+                        "localDeviceId": "windows-desktop",
+                        "address": "127.0.0.1:24888",
+                        "connected": false
+                    },
+                    "mode": "Local"
+                }
+            })
+        );
+    }
+
+    #[test]
     fn in_process_client_sends_request_lines_to_server() {
         let endpoint = match IpcEndpoint::manual("in-process://test") {
             Ok(endpoint) => endpoint,
@@ -1384,6 +1548,46 @@ mod tests {
         assert_eq!(
             parse_request_line(&line),
             Ok(IpcRequest::InputReleaseAll(request))
+        );
+    }
+
+    #[test]
+    fn parses_session_connect_request_line() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_SESSION_CONNECT,
+            SessionConnectParams {
+                peer_id: "linux-laptop".to_string(),
+                local_device_id: "windows-desktop".to_string(),
+                address: "127.0.0.1:24888".to_string(),
+            },
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(IpcRequest::SessionConnect(request))
+        );
+    }
+
+    #[test]
+    fn parses_session_disconnect_request_line() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_SESSION_DISCONNECT,
+            SessionDisconnectParams::default(),
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(IpcRequest::SessionDisconnect(request))
         );
     }
 

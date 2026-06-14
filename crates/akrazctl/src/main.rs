@@ -6,7 +6,8 @@ use std::process::ExitCode;
 use akraz_ipc::{
     DaemonStatusParams, InputReleaseAllParams, IpcCallError, IpcEndpoint, IpcEndpointError,
     IpcTransportError, JsonRpcRequest, METHOD_DAEMON_STATUS, METHOD_INPUT_RELEASE_ALL,
-    METHOD_PERMISSIONS_PROBE, OsLocalIpcClient, PermissionsProbeParams, call_json_rpc,
+    METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
+    PermissionsProbeParams, SessionConnectParams, SessionDisconnectParams, call_json_rpc,
     resolve_current_default_endpoint,
 };
 
@@ -68,13 +69,37 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("session") => match args.next().as_deref() {
+            Some("connect") => match parse_session_connect_options(args) {
+                Ok(options) => print_session_connect(options),
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            },
+            Some("disconnect") => match parse_endpoint_options(args) {
+                Ok(options) => print_session_disconnect(options),
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            },
+            Some(argument) => {
+                eprintln!("unknown session command: {argument}");
+                ExitCode::from(2)
+            }
+            None => {
+                eprintln!("missing session command");
+                ExitCode::from(2)
+            }
+        },
         Some(argument) => {
             eprintln!("unknown command: {argument}");
             ExitCode::from(2)
         }
         None => {
             eprintln!(
-                "usage: akrazctl <status|permissions probe|input release-all|daemon-args|--version>"
+                "usage: akrazctl <status|permissions probe|input release-all|session connect|session disconnect|daemon-args|--version>"
             );
             ExitCode::from(2)
         }
@@ -110,6 +135,30 @@ fn print_input_release_all(options: EndpointOptions) -> ExitCode {
         LOCAL_REQUEST_ID,
         METHOD_INPUT_RELEASE_ALL,
         InputReleaseAllParams::default(),
+    );
+
+    print_local_daemon_response(options.endpoint, &request)
+}
+
+fn print_session_connect(options: SessionConnectOptions) -> ExitCode {
+    let request = JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_SESSION_CONNECT,
+        SessionConnectParams {
+            peer_id: options.peer_id,
+            local_device_id: options.local_device_id,
+            address: options.address,
+        },
+    );
+
+    print_local_daemon_response(options.endpoint, &request)
+}
+
+fn print_session_disconnect(options: EndpointOptions) -> ExitCode {
+    let request = JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_SESSION_DISCONNECT,
+        SessionDisconnectParams::default(),
     );
 
     print_local_daemon_response(options.endpoint, &request)
@@ -196,6 +245,14 @@ struct DaemonArgsOptions {
     local_device_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionConnectOptions {
+    endpoint: Option<IpcEndpoint>,
+    peer_id: String,
+    local_device_id: String,
+    address: String,
+}
+
 fn parse_endpoint_options<I>(args: I) -> Result<EndpointOptions, CliUsageError>
 where
     I: IntoIterator<Item = String>,
@@ -215,6 +272,72 @@ where
     }
 
     Ok(EndpointOptions { endpoint })
+}
+
+fn parse_session_connect_options<I>(args: I) -> Result<SessionConnectOptions, CliUsageError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut endpoint = None;
+    let mut peer_id = None;
+    let mut local_device_id = None;
+    let mut address = None;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        if let Some(value) = argument.strip_prefix("--endpoint=") {
+            endpoint = Some(IpcEndpoint::manual(value).map_err(CliUsageError::from)?);
+        } else if argument == "--endpoint" {
+            let value = args.next().ok_or(CliUsageError::MissingEndpointValue)?;
+            endpoint = Some(IpcEndpoint::manual(value).map_err(CliUsageError::from)?);
+        } else if let Some(value) = argument.strip_prefix("--peer-id=") {
+            set_once_daemon_option(
+                "--peer-id",
+                &mut peer_id,
+                normalize_peer_id("--peer-id", value)?,
+            )?;
+        } else if argument == "--peer-id" {
+            let value = args
+                .next()
+                .ok_or(CliUsageError::MissingSessionOptionValue("--peer-id"))?;
+            let value = normalize_peer_id("--peer-id", &value)?;
+            set_once_daemon_option("--peer-id", &mut peer_id, value)?;
+        } else if let Some(value) = argument.strip_prefix("--local-device-id=") {
+            set_once_daemon_option(
+                "--local-device-id",
+                &mut local_device_id,
+                normalize_local_device_id_arg(value)?,
+            )?;
+        } else if argument == "--local-device-id" {
+            let value = args.next().ok_or(CliUsageError::MissingSessionOptionValue(
+                "--local-device-id",
+            ))?;
+            let value = normalize_local_device_id_arg(&value)?;
+            set_once_daemon_option("--local-device-id", &mut local_device_id, value)?;
+        } else if let Some(value) = argument.strip_prefix("--address=") {
+            set_once_daemon_option(
+                "--address",
+                &mut address,
+                normalize_socket_addr_arg("--address", value)?,
+            )?;
+        } else if argument == "--address" {
+            let value = args
+                .next()
+                .ok_or(CliUsageError::MissingSessionOptionValue("--address"))?;
+            let value = normalize_socket_addr_arg("--address", &value)?;
+            set_once_daemon_option("--address", &mut address, value)?;
+        } else {
+            return Err(CliUsageError::UnknownSessionOption(argument));
+        }
+    }
+
+    Ok(SessionConnectOptions {
+        endpoint,
+        peer_id: peer_id.ok_or(CliUsageError::MissingSessionConnectPeerId)?,
+        local_device_id: local_device_id
+            .ok_or(CliUsageError::MissingSessionConnectLocalDeviceId)?,
+        address: address.ok_or(CliUsageError::MissingSessionConnectAddress)?,
+    })
 }
 
 fn parse_daemon_args_options<I>(args: I) -> Result<DaemonArgsOptions, CliUsageError>
@@ -452,6 +575,10 @@ fn format_daemon_command_line(options: &DaemonArgsOptions) -> String {
 enum CliUsageError {
     MissingEndpointValue,
     MissingDaemonOptionValue(&'static str),
+    MissingSessionOptionValue(&'static str),
+    MissingSessionConnectPeerId,
+    MissingSessionConnectLocalDeviceId,
+    MissingSessionConnectAddress,
     DuplicateDaemonOption(&'static str),
     PeerSessionRequiresLocalDeviceId,
     InvalidEndpoint(String),
@@ -461,6 +588,7 @@ enum CliUsageError {
         reason: String,
     },
     UnknownStatusOption(String),
+    UnknownSessionOption(String),
     UnknownDaemonArgsOption(String),
 }
 
@@ -476,6 +604,18 @@ impl Display for CliUsageError {
             Self::MissingEndpointValue => formatter.write_str("missing value for --endpoint"),
             Self::MissingDaemonOptionValue(option) => {
                 write!(formatter, "missing value for {option}")
+            }
+            Self::MissingSessionOptionValue(option) => {
+                write!(formatter, "missing value for {option}")
+            }
+            Self::MissingSessionConnectPeerId => {
+                formatter.write_str("session connect requires --peer-id")
+            }
+            Self::MissingSessionConnectLocalDeviceId => {
+                formatter.write_str("session connect requires --local-device-id")
+            }
+            Self::MissingSessionConnectAddress => {
+                formatter.write_str("session connect requires --address")
             }
             Self::DuplicateDaemonOption(option) => {
                 write!(formatter, "{option} can only be provided once")
@@ -493,6 +633,9 @@ impl Display for CliUsageError {
             }
             Self::UnknownStatusOption(argument) => {
                 write!(formatter, "unknown status option: {argument}")
+            }
+            Self::UnknownSessionOption(argument) => {
+                write!(formatter, "unknown session option: {argument}")
             }
             Self::UnknownDaemonArgsOption(argument) => {
                 write!(formatter, "unknown daemon-args option: {argument}")
@@ -529,8 +672,10 @@ mod tests {
 
     use super::{
         CliRuntimeError, CliUsageError, DaemonArgsOptions, EndpointOptions, LOCAL_REQUEST_ID,
-        METHOD_DAEMON_STATUS, build_daemon_client_with_resolver, format_daemon_call_error,
+        METHOD_DAEMON_STATUS, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
+        SessionConnectOptions, build_daemon_client_with_resolver, format_daemon_call_error,
         format_daemon_command_line, parse_daemon_args_options, parse_endpoint_options,
+        parse_session_connect_options,
     };
     use akraz_ipc::METHOD_INPUT_RELEASE_ALL;
 
@@ -565,6 +710,110 @@ mod tests {
         assert_eq!(
             parse_endpoint_options(["--bad"].map(String::from)),
             Err(CliUsageError::UnknownStatusOption("--bad".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_session_connect_options() {
+        assert_eq!(
+            parse_session_connect_options(
+                [
+                    "--endpoint",
+                    "local-test",
+                    "--peer-id",
+                    "linux-laptop",
+                    "--local-device-id",
+                    "windows-desktop",
+                    "--address",
+                    "127.0.0.1:24888",
+                ]
+                .map(String::from)
+            ),
+            Ok(SessionConnectOptions {
+                endpoint: Some(IpcEndpoint {
+                    kind: IpcEndpointKind::Manual,
+                    address: "local-test".to_string(),
+                }),
+                peer_id: "linux-laptop".to_string(),
+                local_device_id: "windows-desktop".to_string(),
+                address: "127.0.0.1:24888".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_session_connect_options(
+                [
+                    "--peer-id=linux-laptop",
+                    "--local-device-id=windows-desktop",
+                    "--address=127.0.0.1:24888",
+                ]
+                .map(String::from)
+            ),
+            Ok(SessionConnectOptions {
+                endpoint: None,
+                peer_id: "linux-laptop".to_string(),
+                local_device_id: "windows-desktop".to_string(),
+                address: "127.0.0.1:24888".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_session_connect_options() {
+        assert_eq!(
+            parse_session_connect_options(["--peer-id"].map(String::from)),
+            Err(CliUsageError::MissingSessionOptionValue("--peer-id"))
+        );
+        assert_eq!(
+            parse_session_connect_options(
+                [
+                    "--local-device-id",
+                    "windows-desktop",
+                    "--address",
+                    "127.0.0.1:24888"
+                ]
+                .map(String::from)
+            ),
+            Err(CliUsageError::MissingSessionConnectPeerId)
+        );
+        assert_eq!(
+            parse_session_connect_options(
+                ["--peer-id", "linux-laptop", "--address", "127.0.0.1:24888"].map(String::from)
+            ),
+            Err(CliUsageError::MissingSessionConnectLocalDeviceId)
+        );
+        assert_eq!(
+            parse_session_connect_options(
+                [
+                    "--peer-id",
+                    "linux-laptop",
+                    "--local-device-id",
+                    "windows-desktop"
+                ]
+                .map(String::from)
+            ),
+            Err(CliUsageError::MissingSessionConnectAddress)
+        );
+        assert_eq!(
+            parse_session_connect_options(
+                [
+                    "--peer-id",
+                    "linux-laptop",
+                    "--local-device-id",
+                    "windows-desktop",
+                    "--address",
+                    "bad-address",
+                ]
+                .map(String::from)
+            ),
+            Err(CliUsageError::InvalidDaemonOptionValue {
+                option: "--address",
+                value: "bad-address".to_string(),
+                reason: "expected <ip>:<port> socket address".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_session_connect_options(["--bad"].map(String::from)),
+            Err(CliUsageError::UnknownSessionOption("--bad".to_string()))
         );
     }
 
@@ -710,6 +959,34 @@ mod tests {
 
         assert_eq!(request.id, LOCAL_REQUEST_ID);
         assert_eq!(request.method, METHOD_INPUT_RELEASE_ALL);
+    }
+
+    #[test]
+    fn session_connect_request_uses_session_connect_ipc_method() {
+        let request = JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_SESSION_CONNECT,
+            akraz_ipc::SessionConnectParams {
+                peer_id: "linux-laptop".to_string(),
+                local_device_id: "windows-desktop".to_string(),
+                address: "127.0.0.1:24888".to_string(),
+            },
+        );
+
+        assert_eq!(request.id, LOCAL_REQUEST_ID);
+        assert_eq!(request.method, METHOD_SESSION_CONNECT);
+    }
+
+    #[test]
+    fn session_disconnect_request_uses_session_disconnect_ipc_method() {
+        let request = JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_SESSION_DISCONNECT,
+            akraz_ipc::SessionDisconnectParams::default(),
+        );
+
+        assert_eq!(request.id, LOCAL_REQUEST_ID);
+        assert_eq!(request.method, METHOD_SESSION_DISCONNECT);
     }
 
     #[test]

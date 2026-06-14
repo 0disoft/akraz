@@ -74,7 +74,7 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
         DaemonIpcRunConfig::serve_forever(endpoint)
     };
     let platform = runtime_platform_adapter();
-    let (dispatcher, _peer_sessions) =
+    let (dispatcher, peer_sessions) =
         match build_configured_core_action_dispatcher(platform.clone(), &options) {
             Ok(dispatcher) => dispatcher,
             Err(error) => {
@@ -82,10 +82,11 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-    let server = DaemonIpcServer::from_shared_state_and_dispatcher(
+    let server = DaemonIpcServer::from_shared_state_dispatcher_and_peer_sessions(
         shared_runtime_state(RuntimeInputState::new()),
         platform.clone(),
         dispatcher.clone(),
+        peer_sessions,
     );
     let peer_listener_worker = match options.peer_listen {
         Some(address) => match start_peer_session_listener(address, platform.clone()) {
