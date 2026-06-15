@@ -23,6 +23,11 @@ pub const HANDSHAKE_NONCE_LEN: usize = 32;
 /// Fixed TLS exporter size mixed into the v1 authentication transcript.
 pub const TLS_EXPORTER_LEN: usize = 32;
 
+/// Canonical binary format version for v1 authentication transcripts.
+pub const AUTH_TRANSCRIPT_CANONICAL_VERSION: u8 = 1;
+
+const AUTH_TRANSCRIPT_STRING_FIELD_MAX_LEN: usize = u16::MAX as usize;
+
 /// Protocol version exchanged during session negotiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -216,6 +221,48 @@ impl AuthTranscript {
     pub const fn label(&self) -> &'static str {
         AUTH_TRANSCRIPT_LABEL
     }
+
+    /// Encode this transcript into the canonical byte sequence used for signing.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, AuthTranscriptEncodeError> {
+        let mut bytes = Vec::with_capacity(self.canonical_capacity_hint());
+        self.write_canonical(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Append the canonical byte sequence used for signing to `output`.
+    pub fn write_canonical(&self, output: &mut Vec<u8>) -> Result<(), AuthTranscriptEncodeError> {
+        write_u8(output, AUTH_TRANSCRIPT_CANONICAL_VERSION);
+        write_len_prefixed_str(output, "label", AUTH_TRANSCRIPT_LABEL)?;
+        write_len_prefixed_str(output, "local device id", &self.local_device_id)?;
+        write_len_prefixed_str(output, "remote device id", &self.remote_device_id)?;
+        output.extend_from_slice(&self.local_nonce);
+        output.extend_from_slice(&self.remote_nonce);
+        write_u16(output, self.protocol.major);
+        write_u16(output, self.protocol.minor);
+        write_u32(output, self.local_capabilities.bits());
+        write_u32(output, self.remote_capabilities.bits());
+        write_u8(output, self.role.canonical_byte());
+        output.extend_from_slice(&self.tls_exporter);
+
+        Ok(())
+    }
+
+    fn canonical_capacity_hint(&self) -> usize {
+        1 + 2
+            + AUTH_TRANSCRIPT_LABEL.len()
+            + 2
+            + self.local_device_id.len()
+            + 2
+            + self.remote_device_id.len()
+            + HANDSHAKE_NONCE_LEN
+            + HANDSHAKE_NONCE_LEN
+            + 2
+            + 2
+            + 4
+            + 4
+            + 1
+            + TLS_EXPORTER_LEN
+    }
 }
 
 /// Peer-session handshake message envelope.
@@ -231,14 +278,81 @@ pub enum HandshakeMessage {
     SessionReady(SessionReady),
 }
 
+impl PeerRole {
+    const fn canonical_byte(self) -> u8 {
+        match self {
+            Self::Initiator => 1,
+            Self::Responder => 2,
+        }
+    }
+}
+
+/// Failure returned when a transcript cannot be represented in canonical form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthTranscriptEncodeError {
+    StringFieldTooLong {
+        field: &'static str,
+        max: usize,
+        actual: usize,
+    },
+}
+
+impl Display for AuthTranscriptEncodeError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StringFieldTooLong { field, max, actual } => write!(
+                formatter,
+                "auth transcript {field} is too long: max {max} bytes, got {actual} bytes"
+            ),
+        }
+    }
+}
+
+impl Error for AuthTranscriptEncodeError {}
+
+fn write_len_prefixed_str(
+    output: &mut Vec<u8>,
+    field: &'static str,
+    value: &str,
+) -> Result<(), AuthTranscriptEncodeError> {
+    let bytes = value.as_bytes();
+    if bytes.len() > AUTH_TRANSCRIPT_STRING_FIELD_MAX_LEN {
+        return Err(AuthTranscriptEncodeError::StringFieldTooLong {
+            field,
+            max: AUTH_TRANSCRIPT_STRING_FIELD_MAX_LEN,
+            actual: bytes.len(),
+        });
+    }
+
+    write_u16(output, bytes.len() as u16);
+    output.extend_from_slice(bytes);
+
+    Ok(())
+}
+
+fn write_u8(output: &mut Vec<u8>, value: u8) {
+    output.push(value);
+}
+
+fn write_u16(output: &mut Vec<u8>, value: u16) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use serde_json::json;
 
     use super::{
-        AUTH_TRANSCRIPT_LABEL, AuthProof, AuthTranscript, CapabilityFlags, HANDSHAKE_NONCE_LEN,
-        HandshakeMessage, Hello, PeerRole, ProtocolNegotiationError, ProtocolVersion,
-        SESSION_TLS_EXPORTER_LABEL, SessionReady, TLS_EXPORTER_LEN,
+        AUTH_TRANSCRIPT_CANONICAL_VERSION, AUTH_TRANSCRIPT_LABEL, AuthProof, AuthTranscript,
+        AuthTranscriptEncodeError, CapabilityFlags, HANDSHAKE_NONCE_LEN, HandshakeMessage, Hello,
+        PeerRole, ProtocolNegotiationError, ProtocolVersion, SESSION_TLS_EXPORTER_LABEL,
+        SessionReady, TLS_EXPORTER_LEN,
     };
 
     #[test]
@@ -377,5 +491,89 @@ mod tests {
         assert_eq!(transcript.label(), AUTH_TRANSCRIPT_LABEL);
         assert_eq!(SESSION_TLS_EXPORTER_LABEL, "akraz/session/v1");
         assert_ne!(transcript, reflected);
+    }
+
+    #[test]
+    fn auth_transcript_canonical_bytes_match_test_vector() {
+        let transcript = auth_transcript_fixture(PeerRole::Initiator);
+
+        let bytes = transcript
+            .canonical_bytes()
+            .expect("canonical transcript bytes");
+
+        assert_eq!(bytes[0], AUTH_TRANSCRIPT_CANONICAL_VERSION);
+        assert_eq!(
+            hex(&bytes),
+            concat!(
+                "01",
+                "000d616b72617a2d617574682d7631",
+                "00086465766963652d61",
+                "00086465766963652d62",
+                "0101010101010101010101010101010101010101010101010101010101010101",
+                "0202020202020202020202020202020202020202020202020202020202020202",
+                "0001",
+                "0000",
+                "00000001",
+                "00000003",
+                "01",
+                "0303030303030303030303030303030303030303030303030303030303030303"
+            )
+        );
+    }
+
+    #[test]
+    fn auth_transcript_canonical_bytes_bind_peer_role() {
+        let initiator = auth_transcript_fixture(PeerRole::Initiator)
+            .canonical_bytes()
+            .expect("initiator transcript");
+        let responder = auth_transcript_fixture(PeerRole::Responder)
+            .canonical_bytes()
+            .expect("responder transcript");
+
+        assert_ne!(initiator, responder);
+        assert_eq!(initiator[initiator.len() - TLS_EXPORTER_LEN - 1], 1);
+        assert_eq!(responder[responder.len() - TLS_EXPORTER_LEN - 1], 2);
+    }
+
+    #[test]
+    fn auth_transcript_canonical_encoding_rejects_overlong_string_fields() {
+        let transcript = AuthTranscript {
+            local_device_id: "a".repeat(usize::from(u16::MAX) + 1),
+            ..auth_transcript_fixture(PeerRole::Initiator)
+        };
+
+        assert_eq!(
+            transcript.canonical_bytes(),
+            Err(AuthTranscriptEncodeError::StringFieldTooLong {
+                field: "local device id",
+                max: usize::from(u16::MAX),
+                actual: usize::from(u16::MAX) + 1,
+            })
+        );
+    }
+
+    fn auth_transcript_fixture(role: PeerRole) -> AuthTranscript {
+        AuthTranscript {
+            local_device_id: "device-a".to_string(),
+            remote_device_id: "device-b".to_string(),
+            local_nonce: [1; HANDSHAKE_NONCE_LEN],
+            remote_nonce: [2; HANDSHAKE_NONCE_LEN],
+            protocol: ProtocolVersion::CURRENT,
+            local_capabilities: CapabilityFlags::POINTER,
+            remote_capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            role,
+            tls_exporter: [3; TLS_EXPORTER_LEN],
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            if let Err(error) = write!(&mut output, "{byte:02x}") {
+                panic!("failed to write hex test vector: {error}");
+            }
+        }
+
+        output
     }
 }
