@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,9 +29,14 @@ const DAEMON_SIDECAR_NAME: &str = "akraz-daemon";
 const DAEMON_SERVE_ARG: &str = "--serve";
 const DAEMON_CAPTURE_INPUT_ARG: &str = "--capture-input";
 const DAEMON_EDGE_BINDING_ARG: &str = "--edge-binding";
+const DAEMON_IDENTITY_STORE_ARG: &str = "--identity-store";
+const DAEMON_IDENTITY_DISPLAY_NAME_ARG: &str = "--identity-display-name";
+const DAEMON_IDENTITY_DISPLAY_NAME: &str = "Akraz Desktop";
 const DAEMON_LIFECYCLE_SMOKE_FLAG: &str = "--akraz-smoke-daemon-lifecycle";
 const DAEMON_SETTINGS_START_SMOKE_FLAG: &str = "--akraz-smoke-settings-start";
 const SETTINGS_FILE_NAME: &str = "settings.json";
+const IDENTITY_STORE_DIR_NAME: &str = "secrets";
+const IDENTITY_STORE_FILE_NAME: &str = "identity.json";
 const DAEMON_START_RETRIES: usize = 50;
 const DAEMON_START_RETRY_DELAY: Duration = Duration::from_millis(40);
 const DAEMON_STOP_RETRIES: usize = 50;
@@ -680,6 +685,21 @@ fn app_settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(directory.join(SETTINGS_FILE_NAME))
 }
 
+fn daemon_identity_store_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("failed to resolve Akraz identity directory: {error}"))?;
+
+    Ok(identity_store_path_from_config_dir(directory))
+}
+
+fn identity_store_path_from_config_dir(config_dir: PathBuf) -> PathBuf {
+    config_dir
+        .join(IDENTITY_STORE_DIR_NAME)
+        .join(IDENTITY_STORE_FILE_NAME)
+}
+
 fn load_settings_from_path(path: &PathBuf) -> Result<AppSettings, String> {
     match fs::read_to_string(path) {
         Ok(contents) => {
@@ -829,21 +849,24 @@ fn spawn_daemon_process(
     app: &tauri::AppHandle,
     options: &DaemonStartOptions,
 ) -> Result<SpawnedDaemonProcess, String> {
+    let identity_store_path = daemon_identity_store_path(app)?;
     if let Some(executable) = resolve_env_daemon_executable() {
-        return spawn_os_daemon_process(&executable, options).map(|child| SpawnedDaemonProcess {
-            child: ManagedDaemonChild::Os(child),
-            sidecar_events: None,
+        return spawn_os_daemon_process(&executable, options, &identity_store_path).map(|child| {
+            SpawnedDaemonProcess {
+                child: ManagedDaemonChild::Os(child),
+                sidecar_events: None,
+            }
         });
     }
 
-    match spawn_sidecar_daemon_process(app, options) {
+    match spawn_sidecar_daemon_process(app, options, &identity_store_path) {
         Ok((sidecar_events, child)) => Ok(SpawnedDaemonProcess {
             child: ManagedDaemonChild::Sidecar(child),
             sidecar_events: Some(sidecar_events),
         }),
         Err(sidecar_error) => {
             let executable = resolve_adjacent_daemon_executable()?;
-            spawn_os_daemon_process(&executable, options)
+            spawn_os_daemon_process(&executable, options, &identity_store_path)
                 .map(|child| SpawnedDaemonProcess {
                     child: ManagedDaemonChild::Os(child),
                     sidecar_events: None,
@@ -861,11 +884,12 @@ fn spawn_daemon_process(
 fn spawn_sidecar_daemon_process(
     app: &tauri::AppHandle,
     options: &DaemonStartOptions,
+    identity_store_path: &Path,
 ) -> Result<(Receiver<CommandEvent>, CommandChild), String> {
     app.shell()
         .sidecar(DAEMON_SIDECAR_NAME)
         .map_err(|error| error.to_string())?
-        .args(daemon_spawn_args(options)?)
+        .args(daemon_spawn_args(options, identity_store_path)?)
         .spawn()
         .map_err(|error| error.to_string())
 }
@@ -873,9 +897,10 @@ fn spawn_sidecar_daemon_process(
 fn spawn_os_daemon_process(
     executable: &PathBuf,
     options: &DaemonStartOptions,
+    identity_store_path: &Path,
 ) -> Result<Child, String> {
     StdCommand::new(executable)
-        .args(daemon_spawn_args(options)?)
+        .args(daemon_spawn_args(options, identity_store_path)?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -888,15 +913,29 @@ fn spawn_os_daemon_process(
         })
 }
 
-fn daemon_spawn_args(options: &DaemonStartOptions) -> Result<Vec<String>, String> {
-    daemon_spawn_args_from(options, std::env::var_os(DAEMON_CAPTURE_INPUT_ENV))
+fn daemon_spawn_args(
+    options: &DaemonStartOptions,
+    identity_store_path: &Path,
+) -> Result<Vec<String>, String> {
+    daemon_spawn_args_from(
+        options,
+        std::env::var_os(DAEMON_CAPTURE_INPUT_ENV),
+        Some(identity_store_path),
+    )
 }
 
 fn daemon_spawn_args_from(
     options: &DaemonStartOptions,
     capture_input: Option<OsString>,
+    identity_store_path: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     let mut args = vec![DAEMON_SERVE_ARG.to_string()];
+    if let Some(identity_store_path) = identity_store_path {
+        args.push(DAEMON_IDENTITY_STORE_ARG.to_string());
+        args.push(format_daemon_path_arg(identity_store_path)?);
+        args.push(DAEMON_IDENTITY_DISPLAY_NAME_ARG.to_string());
+        args.push(DAEMON_IDENTITY_DISPLAY_NAME.to_string());
+    }
     if options
         .capture_input
         .unwrap_or_else(|| daemon_capture_input_enabled_from(capture_input))
@@ -909,6 +948,12 @@ fn daemon_spawn_args_from(
     }
 
     Ok(args)
+}
+
+fn format_daemon_path_arg(path: &Path) -> Result<String, String> {
+    path.to_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| "Akraz daemon path contains invalid Unicode.".to_string())
 }
 
 fn format_edge_binding_arg(binding: &DaemonEdgeBindingOption) -> Result<String, String> {
@@ -1070,13 +1115,15 @@ mod tests {
 
     use super::{
         AppSettings, DAEMON_CAPTURE_INPUT_ARG, DAEMON_EDGE_BINDING_ARG,
+        DAEMON_IDENTITY_DISPLAY_NAME, DAEMON_IDENTITY_DISPLAY_NAME_ARG, DAEMON_IDENTITY_STORE_ARG,
         DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_SERVE_ARG, DAEMON_SETTINGS_START_SMOKE_FLAG,
         DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase, DaemonScreenEdgeOption,
-        DaemonStartOptions, classify_daemon_call_error, daemon_capture_input_enabled_from,
-        daemon_executable_name, daemon_spawn_args_from, format_edge_binding_arg, has_exact_arg,
-        load_settings_from_path, normalize_session_connect_options, parse_daemon_status_response,
-        parse_json_rpc_response, resolve_env_daemon_executable_from, save_settings_to_path,
-        settings_start_smoke_settings,
+        DaemonStartOptions, IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME,
+        classify_daemon_call_error, daemon_capture_input_enabled_from, daemon_executable_name,
+        daemon_spawn_args_from, format_edge_binding_arg, has_exact_arg,
+        identity_store_path_from_config_dir, load_settings_from_path,
+        normalize_session_connect_options, parse_daemon_status_response, parse_json_rpc_response,
+        resolve_env_daemon_executable_from, save_settings_to_path, settings_start_smoke_settings,
     };
 
     fn status_fixture() -> DaemonStatus {
@@ -1232,11 +1279,15 @@ mod tests {
     #[test]
     fn daemon_spawn_args_include_capture_only_when_enabled() {
         assert_eq!(
-            daemon_spawn_args_from(&DaemonStartOptions::default(), None),
+            daemon_spawn_args_from(&DaemonStartOptions::default(), None, None),
             Ok(vec![DAEMON_SERVE_ARG.to_string()])
         );
         assert_eq!(
-            daemon_spawn_args_from(&DaemonStartOptions::default(), Some(OsString::from("1"))),
+            daemon_spawn_args_from(
+                &DaemonStartOptions::default(),
+                Some(OsString::from("1")),
+                None
+            ),
             Ok(vec![
                 DAEMON_SERVE_ARG.to_string(),
                 DAEMON_CAPTURE_INPUT_ARG.to_string()
@@ -1249,8 +1300,29 @@ mod tests {
                     edge_bindings: Vec::new(),
                 },
                 Some(OsString::from("1")),
+                None,
             ),
             Ok(vec![DAEMON_SERVE_ARG.to_string()])
+        );
+    }
+
+    #[test]
+    fn daemon_spawn_args_include_identity_store_when_configured() {
+        let identity_store_path = PathBuf::from("akraz-identity.json");
+
+        assert_eq!(
+            daemon_spawn_args_from(
+                &DaemonStartOptions::default(),
+                None,
+                Some(&identity_store_path)
+            ),
+            Ok(vec![
+                DAEMON_SERVE_ARG.to_string(),
+                DAEMON_IDENTITY_STORE_ARG.to_string(),
+                "akraz-identity.json".to_string(),
+                DAEMON_IDENTITY_DISPLAY_NAME_ARG.to_string(),
+                DAEMON_IDENTITY_DISPLAY_NAME.to_string()
+            ])
         );
     }
 
@@ -1266,13 +1338,23 @@ mod tests {
         };
 
         assert_eq!(
-            daemon_spawn_args_from(&options, None),
+            daemon_spawn_args_from(&options, None, None),
             Ok(vec![
                 DAEMON_SERVE_ARG.to_string(),
                 DAEMON_CAPTURE_INPUT_ARG.to_string(),
                 DAEMON_EDGE_BINDING_ARG.to_string(),
                 "right:linux-laptop:left".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn identity_store_path_lives_under_config_secrets_directory() {
+        assert_eq!(
+            identity_store_path_from_config_dir(PathBuf::from("akraz-config")),
+            PathBuf::from("akraz-config")
+                .join(IDENTITY_STORE_DIR_NAME)
+                .join(IDENTITY_STORE_FILE_NAME)
         );
     }
 
@@ -1404,7 +1486,7 @@ mod tests {
         let options = DaemonStartOptions::from(settings_start_smoke_settings());
 
         assert_eq!(
-            daemon_spawn_args_from(&options, None),
+            daemon_spawn_args_from(&options, None, None),
             Ok(vec![
                 DAEMON_SERVE_ARG.to_string(),
                 DAEMON_CAPTURE_INPUT_ARG.to_string(),
