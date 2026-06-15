@@ -726,14 +726,12 @@ fn protocol_version_from_wire(
         major: protocol.major,
         minor: protocol.minor,
     };
-    if ProtocolVersion::CURRENT.is_compatible_with(version) {
-        Ok(version)
-    } else {
-        Err(PlatformError::new(format!(
+    ProtocolVersion::negotiate_with_current(version).map_err(|_| {
+        PlatformError::new(format!(
             "unsupported peer transport protocol {}.{}",
             protocol.major, protocol.minor
-        )))
-    }
+        ))
+    })
 }
 
 fn validate_transport_command_peer(
@@ -777,7 +775,7 @@ impl PeerTransportMessage {
             major: self.protocol.major,
             minor: self.protocol.minor,
         };
-        if !ProtocolVersion::CURRENT.is_compatible_with(version) {
+        if ProtocolVersion::negotiate_with_current(version).is_err() {
             return Err(PlatformError::new(format!(
                 "unsupported peer transport protocol {}.{}",
                 self.protocol.major, self.protocol.minor
