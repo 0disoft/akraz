@@ -2,6 +2,7 @@ use std::env;
 use std::fmt::{Display, Formatter};
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +24,7 @@ use akraz_daemon::{
     serve_tcp_peer_transport_session_and_execute, shared_runtime_state,
     start_daemon_input_capture_with_edge_bindings_and_dispatcher,
 };
+use akraz_identity::FileIdentityStore;
 use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
 use akraz_platform::{
     FakePlatformAdapter, PlatformAdapter, PlatformError, runtime_platform_adapter,
@@ -74,14 +76,24 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
         DaemonIpcRunConfig::serve_forever(endpoint)
     };
     let platform = runtime_platform_adapter();
-    let (dispatcher, peer_sessions) =
-        match build_configured_core_action_dispatcher(platform.clone(), &options) {
-            Ok(dispatcher) => dispatcher,
-            Err(error) => {
-                eprintln!("failed to configure daemon recovery dispatcher: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let local_device_id = match resolve_local_device_id(&options) {
+        Ok(local_device_id) => local_device_id,
+        Err(error) => {
+            eprintln!("failed to resolve daemon identity: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (dispatcher, peer_sessions) = match build_configured_core_action_dispatcher(
+        platform.clone(),
+        &options,
+        local_device_id,
+    ) {
+        Ok(dispatcher) => dispatcher,
+        Err(error) => {
+            eprintln!("failed to configure daemon recovery dispatcher: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let server = DaemonIpcServer::from_shared_state_dispatcher_and_peer_sessions(
         shared_runtime_state(RuntimeInputState::new()),
         platform.clone(),
@@ -131,14 +143,17 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
 fn build_configured_core_action_dispatcher<P>(
     platform: P,
     options: &ServeOptions,
+    local_device_id: Option<DeviceId>,
 ) -> Result<(SharedCoreActionDispatcher, ManagedPeerSessionTransport), PlatformError>
 where
     P: PlatformAdapter + Clone + Send + Sync + 'static,
 {
     let peer_sessions = ManagedPeerSessionTransport::new();
     if let Some(peer_session) = &options.peer_session {
-        let local_device_id = options.local_device_id.clone().ok_or_else(|| {
-            PlatformError::new("peer session transport requires --local-device-id")
+        let local_device_id = local_device_id.ok_or_else(|| {
+            PlatformError::new(
+                "peer session transport requires --local-device-id or --identity-store",
+            )
         })?;
         let transport = TcpPeerSessionTransport::connect(
             peer_session.peer_id.clone(),
@@ -153,6 +168,28 @@ where
     ));
 
     Ok((dispatcher, peer_sessions))
+}
+
+fn resolve_local_device_id(options: &ServeOptions) -> Result<Option<DeviceId>, PlatformError> {
+    if let Some(local_device_id) = &options.local_device_id {
+        return Ok(Some(local_device_id.clone()));
+    }
+    let Some(identity_store) = &options.identity_store else {
+        return Ok(None);
+    };
+
+    let store = FileIdentityStore::new(identity_store);
+    let display_name = options
+        .identity_display_name
+        .as_deref()
+        .unwrap_or("Akraz Daemon");
+    let identity = store.load_or_create(display_name).map_err(|error| {
+        PlatformError::new(format!(
+            "failed to load identity store {}: {error}",
+            identity_store.display()
+        ))
+    })?;
+    Ok(Some(DeviceId::new(identity.identity().device_id())))
 }
 
 fn start_configured_input_capture<P>(
@@ -810,6 +847,7 @@ fn mouse_button_name(button: MouseButton) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 enum DaemonCommand {
     Serve(ServeOptions),
     Status,
@@ -829,6 +867,8 @@ struct ServeOptions {
     peer_listen: Option<SocketAddr>,
     peer_session: Option<ServePeerSessionOptions>,
     local_device_id: Option<DeviceId>,
+    identity_store: Option<PathBuf>,
+    identity_display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -867,7 +907,9 @@ where
                 || argument.starts_with("--edge-binding")
                 || argument.starts_with("--peer-listen")
                 || argument.starts_with("--peer-session")
-                || argument.starts_with("--local-device-id") =>
+                || argument.starts_with("--local-device-id")
+                || argument.starts_with("--identity-store")
+                || argument.starts_with("--identity-display-name") =>
         {
             parse_serve_options(std::iter::once(first).chain(args))
         }
@@ -935,12 +977,29 @@ where
                 .next()
                 .ok_or(DaemonUsageError::MissingLocalDeviceIdValue)?;
             options.local_device_id = Some(parse_device_id(&value)?);
+        } else if let Some(value) = argument.strip_prefix("--identity-store=") {
+            options.identity_store = Some(parse_identity_store(value)?);
+        } else if argument == "--identity-store" {
+            let value = args
+                .next()
+                .ok_or(DaemonUsageError::MissingIdentityStoreValue)?;
+            options.identity_store = Some(parse_identity_store(&value)?);
+        } else if let Some(value) = argument.strip_prefix("--identity-display-name=") {
+            options.identity_display_name = Some(parse_identity_display_name(value)?);
+        } else if argument == "--identity-display-name" {
+            let value = args
+                .next()
+                .ok_or(DaemonUsageError::MissingIdentityDisplayNameValue)?;
+            options.identity_display_name = Some(parse_identity_display_name(&value)?);
         } else {
             return Err(DaemonUsageError::UnknownArgument(argument));
         }
     }
-    if options.peer_session.is_some() && options.local_device_id.is_none() {
-        return Err(DaemonUsageError::MissingLocalDeviceIdForPeerSession);
+    if options.peer_session.is_some()
+        && options.local_device_id.is_none()
+        && options.identity_store.is_none()
+    {
+        return Err(DaemonUsageError::MissingLocalIdentityForPeerSession);
     }
 
     Ok(DaemonCommand::Serve(options))
@@ -1001,6 +1060,26 @@ fn parse_device_id(value: &str) -> Result<DeviceId, DaemonUsageError> {
     Ok(DeviceId::new(value))
 }
 
+fn parse_identity_store(value: &str) -> Result<PathBuf, DaemonUsageError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DaemonUsageError::InvalidIdentityStore(value.to_string()));
+    }
+
+    Ok(PathBuf::from(value))
+}
+
+fn parse_identity_display_name(value: &str) -> Result<String, DaemonUsageError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DaemonUsageError::InvalidIdentityDisplayName(
+            value.to_string(),
+        ));
+    }
+
+    Ok(value.to_string())
+}
+
 fn parse_edge_binding(value: &str) -> Result<ScreenEdgeBinding, DaemonUsageError> {
     let mut parts = value.split(':');
     let Some(local_edge) = parts.next() else {
@@ -1040,7 +1119,9 @@ enum DaemonUsageError {
     MissingPeerListenValue,
     MissingPeerSessionValue,
     MissingLocalDeviceIdValue,
-    MissingLocalDeviceIdForPeerSession,
+    MissingIdentityStoreValue,
+    MissingIdentityDisplayNameValue,
+    MissingLocalIdentityForPeerSession,
     DuplicatePeerListen,
     DuplicatePeerSession,
     InvalidEndpoint(String),
@@ -1048,6 +1129,8 @@ enum DaemonUsageError {
     InvalidPeerListen(String),
     InvalidPeerSession(String),
     InvalidLocalDeviceId(String),
+    InvalidIdentityStore(String),
+    InvalidIdentityDisplayName(String),
     UnknownArgument(String),
 }
 
@@ -1071,8 +1154,14 @@ impl Display for DaemonUsageError {
             Self::MissingLocalDeviceIdValue => {
                 formatter.write_str("missing value for --local-device-id")
             }
-            Self::MissingLocalDeviceIdForPeerSession => {
-                formatter.write_str("--peer-session requires --local-device-id")
+            Self::MissingIdentityStoreValue => {
+                formatter.write_str("missing value for --identity-store")
+            }
+            Self::MissingIdentityDisplayNameValue => {
+                formatter.write_str("missing value for --identity-display-name")
+            }
+            Self::MissingLocalIdentityForPeerSession => {
+                formatter.write_str("--peer-session requires --local-device-id or --identity-store")
             }
             Self::DuplicatePeerListen => {
                 formatter.write_str("--peer-listen can only be provided once")
@@ -1096,6 +1185,14 @@ impl Display for DaemonUsageError {
             Self::InvalidLocalDeviceId(value) => {
                 write!(formatter, "invalid local device id: {value}")
             }
+            Self::InvalidIdentityStore(value) => write!(
+                formatter,
+                "invalid identity store path: {value}. Expected a non-empty path"
+            ),
+            Self::InvalidIdentityDisplayName(value) => write!(
+                formatter,
+                "invalid identity display name: {value}. Expected a non-empty display name"
+            ),
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument: {argument}"),
         }
     }
@@ -1103,7 +1200,7 @@ impl Display for DaemonUsageError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{net::SocketAddr, path::PathBuf};
 
     use akraz_core::{DeviceId, PeerId, ScreenEdge, ScreenEdgeBinding};
     use akraz_ipc::{IpcEndpoint, IpcEndpointKind, IpcTransportError};
@@ -1128,6 +1225,8 @@ mod tests {
                 peer_listen: None,
                 peer_session: None,
                 local_device_id: None,
+                identity_store: None,
+                identity_display_name: None,
             }))
         );
     }
@@ -1156,6 +1255,8 @@ mod tests {
                 peer_listen: None,
                 peer_session: None,
                 local_device_id: None,
+                identity_store: None,
+                identity_display_name: None,
             }))
         );
         assert_eq!(
@@ -1173,6 +1274,8 @@ mod tests {
                 peer_listen: None,
                 peer_session: None,
                 local_device_id: None,
+                identity_store: None,
+                identity_display_name: None,
             }))
         );
     }
@@ -1203,6 +1306,8 @@ mod tests {
                 peer_listen: None,
                 peer_session: None,
                 local_device_id: None,
+                identity_store: None,
+                identity_display_name: None,
             }))
         );
         assert_eq!(
@@ -1217,6 +1322,8 @@ mod tests {
                 peer_listen: None,
                 peer_session: None,
                 local_device_id: None,
+                identity_store: None,
+                identity_display_name: None,
             }))
         );
     }
@@ -1253,6 +1360,8 @@ mod tests {
                         .expect("peer session address"),
                 }),
                 local_device_id: Some(DeviceId::new("windows-desktop")),
+                identity_store: None,
+                identity_display_name: None,
             }))
         );
 
@@ -1282,6 +1391,41 @@ mod tests {
                         .expect("peer session address"),
                 }),
                 local_device_id: Some(DeviceId::new("windows-desktop")),
+                identity_store: None,
+                identity_display_name: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_identity_store_peer_session_serve_options() {
+        assert_eq!(
+            parse_daemon_command(
+                [
+                    "--identity-store",
+                    "akraz-identity.json",
+                    "--identity-display-name",
+                    "Windows Desktop",
+                    "--peer-session",
+                    "linux-laptop@127.0.0.1:24888",
+                ]
+                .map(String::from)
+            ),
+            Ok(DaemonCommand::Serve(ServeOptions {
+                endpoint: None,
+                once: false,
+                capture_input: false,
+                edge_bindings: Vec::new(),
+                peer_listen: None,
+                peer_session: Some(ServePeerSessionOptions {
+                    peer_id: PeerId::new("linux-laptop"),
+                    address: "127.0.0.1:24888"
+                        .parse::<SocketAddr>()
+                        .expect("peer session address"),
+                }),
+                local_device_id: None,
+                identity_store: Some(PathBuf::from("akraz-identity.json")),
+                identity_display_name: Some("Windows Desktop".to_string()),
             }))
         );
     }
@@ -1523,7 +1667,7 @@ mod tests {
             parse_daemon_command(
                 ["--peer-session", "linux-laptop@127.0.0.1:24888"].map(String::from)
             ),
-            Err(DaemonUsageError::MissingLocalDeviceIdForPeerSession)
+            Err(DaemonUsageError::MissingLocalIdentityForPeerSession)
         );
         assert_eq!(
             parse_daemon_command(

@@ -243,6 +243,8 @@ struct DaemonArgsOptions {
     peer_listen: Option<String>,
     peer_session: Option<String>,
     local_device_id: Option<String>,
+    identity_store: Option<String>,
+    identity_display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +352,8 @@ where
         peer_listen: None,
         peer_session: None,
         local_device_id: None,
+        identity_store: None,
+        identity_display_name: None,
     };
     let mut args = args.into_iter();
 
@@ -403,12 +407,43 @@ where
                 .ok_or(CliUsageError::MissingDaemonOptionValue("--local-device-id"))?;
             let value = normalize_local_device_id_arg(&value)?;
             set_once_daemon_option("--local-device-id", &mut options.local_device_id, value)?;
+        } else if let Some(value) = argument.strip_prefix("--identity-store=") {
+            set_once_daemon_option(
+                "--identity-store",
+                &mut options.identity_store,
+                normalize_identity_store_arg(value)?,
+            )?;
+        } else if argument == "--identity-store" {
+            let value = args
+                .next()
+                .ok_or(CliUsageError::MissingDaemonOptionValue("--identity-store"))?;
+            let value = normalize_identity_store_arg(&value)?;
+            set_once_daemon_option("--identity-store", &mut options.identity_store, value)?;
+        } else if let Some(value) = argument.strip_prefix("--identity-display-name=") {
+            set_once_daemon_option(
+                "--identity-display-name",
+                &mut options.identity_display_name,
+                normalize_identity_display_name_arg(value)?,
+            )?;
+        } else if argument == "--identity-display-name" {
+            let value = args.next().ok_or(CliUsageError::MissingDaemonOptionValue(
+                "--identity-display-name",
+            ))?;
+            let value = normalize_identity_display_name_arg(&value)?;
+            set_once_daemon_option(
+                "--identity-display-name",
+                &mut options.identity_display_name,
+                value,
+            )?;
         } else {
             return Err(CliUsageError::UnknownDaemonArgsOption(argument));
         }
     }
 
-    if options.peer_session.is_some() && options.local_device_id.is_none() {
+    if options.peer_session.is_some()
+        && options.local_device_id.is_none()
+        && options.identity_store.is_none()
+    {
         return Err(CliUsageError::PeerSessionRequiresLocalDeviceId);
     }
 
@@ -517,6 +552,14 @@ fn normalize_local_device_id_arg(value: &str) -> Result<String, CliUsageError> {
     normalize_shell_safe_arg("--local-device-id", value)
 }
 
+fn normalize_identity_store_arg(value: &str) -> Result<String, CliUsageError> {
+    normalize_shell_safe_arg("--identity-store", value)
+}
+
+fn normalize_identity_display_name_arg(value: &str) -> Result<String, CliUsageError> {
+    normalize_shell_safe_arg("--identity-display-name", value)
+}
+
 fn normalize_shell_safe_arg(
     option_name: &'static str,
     value: &str,
@@ -562,6 +605,14 @@ fn format_daemon_command_line(options: &DaemonArgsOptions) -> String {
     if let Some(local_device_id) = &options.local_device_id {
         command.push("--local-device-id".to_string());
         command.push(local_device_id.clone());
+    }
+    if let Some(identity_store) = &options.identity_store {
+        command.push("--identity-store".to_string());
+        command.push(identity_store.clone());
+    }
+    if let Some(identity_display_name) = &options.identity_display_name {
+        command.push("--identity-display-name".to_string());
+        command.push(identity_display_name.clone());
     }
     if let Some(peer_session) = &options.peer_session {
         command.push("--peer-session".to_string());
@@ -621,7 +672,7 @@ impl Display for CliUsageError {
                 write!(formatter, "{option} can only be provided once")
             }
             Self::PeerSessionRequiresLocalDeviceId => {
-                formatter.write_str("--peer-session requires --local-device-id")
+                formatter.write_str("--peer-session requires --local-device-id or --identity-store")
             }
             Self::InvalidEndpoint(error) => write!(formatter, "invalid endpoint: {error}"),
             Self::InvalidDaemonOptionValue {
@@ -840,6 +891,34 @@ mod tests {
                 peer_listen: None,
                 peer_session: Some("linux-laptop@127.0.0.1:24888".to_string()),
                 local_device_id: Some("windows-desktop".to_string()),
+                identity_store: None,
+                identity_display_name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_identity_store_daemon_args() {
+        let options = parse_daemon_args_options(
+            [
+                "--identity-store",
+                "akraz-identity.json",
+                "--identity-display-name=Windows-Desktop",
+                "--peer-session=linux-laptop@127.0.0.1:24888",
+            ]
+            .map(String::from),
+        );
+
+        assert_eq!(
+            options,
+            Ok(DaemonArgsOptions {
+                capture_input: false,
+                edge_bindings: Vec::new(),
+                peer_listen: None,
+                peer_session: Some("linux-laptop@127.0.0.1:24888".to_string()),
+                local_device_id: None,
+                identity_store: Some("akraz-identity.json".to_string()),
+                identity_display_name: Some("Windows-Desktop".to_string()),
             })
         );
     }
@@ -856,6 +935,8 @@ mod tests {
                 peer_listen: Some("0.0.0.0:24888".to_string()),
                 peer_session: None,
                 local_device_id: None,
+                identity_store: None,
+                identity_display_name: None,
             })
         );
     }
@@ -868,11 +949,13 @@ mod tests {
             peer_listen: Some("127.0.0.1:24887".to_string()),
             peer_session: Some("linux-laptop@127.0.0.1:24888".to_string()),
             local_device_id: Some("windows-desktop".to_string()),
+            identity_store: Some("akraz-identity.json".to_string()),
+            identity_display_name: Some("Windows-Desktop".to_string()),
         };
 
         assert_eq!(
             format_daemon_command_line(&options),
-            "akraz-daemon --serve --capture-input --edge-binding right:linux-laptop:left --peer-listen 127.0.0.1:24887 --local-device-id windows-desktop --peer-session linux-laptop@127.0.0.1:24888"
+            "akraz-daemon --serve --capture-input --edge-binding right:linux-laptop:left --peer-listen 127.0.0.1:24887 --local-device-id windows-desktop --identity-store akraz-identity.json --identity-display-name Windows-Desktop --peer-session linux-laptop@127.0.0.1:24888"
         );
     }
 
