@@ -265,6 +265,24 @@ impl AuthTranscript {
     }
 }
 
+/// Boundary used by identity-key implementations to sign a canonical auth transcript.
+pub trait AuthProofSigner {
+    type Error;
+
+    fn sign_auth_transcript(&self, canonical_transcript: &[u8]) -> Result<Vec<u8>, Self::Error>;
+}
+
+/// Boundary used by identity-key implementations to verify a canonical auth transcript.
+pub trait AuthProofVerifier {
+    type Error;
+
+    fn verify_auth_transcript(
+        &self,
+        canonical_transcript: &[u8],
+        signature: &[u8],
+    ) -> Result<(), Self::Error>;
+}
+
 /// Peer-session handshake message envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -276,6 +294,70 @@ pub enum HandshakeMessage {
     Hello(Hello),
     AuthProof(AuthProof),
     SessionReady(SessionReady),
+}
+
+impl AuthProof {
+    /// Sign a canonical auth transcript and build an `AuthProof` frame.
+    pub fn sign_transcript<S>(
+        device_id: impl Into<String>,
+        role: PeerRole,
+        transcript: &AuthTranscript,
+        signer: &S,
+    ) -> Result<Self, AuthProofSignError<S::Error>>
+    where
+        S: AuthProofSigner,
+    {
+        let canonical = transcript
+            .canonical_bytes()
+            .map_err(AuthProofSignError::Transcript)?;
+        let signature = signer
+            .sign_auth_transcript(&canonical)
+            .map_err(AuthProofSignError::Signer)?;
+
+        Ok(Self {
+            device_id: device_id.into(),
+            role,
+            signature,
+        })
+    }
+
+    /// Verify this proof against the expected peer identity, role, and transcript.
+    pub fn verify_transcript<V>(
+        &self,
+        expected_device_id: &str,
+        expected_role: PeerRole,
+        transcript: &AuthTranscript,
+        verifier: &V,
+    ) -> Result<(), AuthProofVerifyError<V::Error>>
+    where
+        V: AuthProofVerifier,
+    {
+        if self.device_id != expected_device_id {
+            return Err(AuthProofVerifyError::DeviceIdMismatch {
+                expected: expected_device_id.to_string(),
+                actual: self.device_id.clone(),
+            });
+        }
+        if self.role != expected_role {
+            return Err(AuthProofVerifyError::ProofRoleMismatch {
+                expected: expected_role,
+                actual: self.role,
+            });
+        }
+        if transcript.role != expected_role {
+            return Err(AuthProofVerifyError::TranscriptRoleMismatch {
+                expected: expected_role,
+                actual: transcript.role,
+            });
+        }
+
+        let canonical = transcript
+            .canonical_bytes()
+            .map_err(AuthProofVerifyError::Transcript)?;
+        verifier
+            .verify_auth_transcript(&canonical, &self.signature)
+            .map_err(AuthProofVerifyError::Verifier)
+    }
 }
 
 impl PeerRole {
@@ -309,6 +391,76 @@ impl Display for AuthTranscriptEncodeError {
 }
 
 impl Error for AuthTranscriptEncodeError {}
+
+/// Failure returned while building an authentication proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthProofSignError<E> {
+    Transcript(AuthTranscriptEncodeError),
+    Signer(E),
+}
+
+impl<E> Display for AuthProofSignError<E>
+where
+    E: Display,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transcript(error) => {
+                write!(formatter, "failed to encode auth transcript: {error}")
+            }
+            Self::Signer(error) => write!(formatter, "failed to sign auth transcript: {error}"),
+        }
+    }
+}
+
+impl<E> Error for AuthProofSignError<E> where E: Error + 'static {}
+
+/// Failure returned while verifying an authentication proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthProofVerifyError<E> {
+    DeviceIdMismatch {
+        expected: String,
+        actual: String,
+    },
+    ProofRoleMismatch {
+        expected: PeerRole,
+        actual: PeerRole,
+    },
+    TranscriptRoleMismatch {
+        expected: PeerRole,
+        actual: PeerRole,
+    },
+    Transcript(AuthTranscriptEncodeError),
+    Verifier(E),
+}
+
+impl<E> Display for AuthProofVerifyError<E>
+where
+    E: Display,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeviceIdMismatch { expected, actual } => write!(
+                formatter,
+                "auth proof device id mismatch: expected {expected}, got {actual}"
+            ),
+            Self::ProofRoleMismatch { expected, actual } => write!(
+                formatter,
+                "auth proof role mismatch: expected {expected:?}, got {actual:?}"
+            ),
+            Self::TranscriptRoleMismatch { expected, actual } => write!(
+                formatter,
+                "auth transcript role mismatch: expected {expected:?}, got {actual:?}"
+            ),
+            Self::Transcript(error) => {
+                write!(formatter, "failed to encode auth transcript: {error}")
+            }
+            Self::Verifier(error) => write!(formatter, "failed to verify auth transcript: {error}"),
+        }
+    }
+}
+
+impl<E> Error for AuthProofVerifyError<E> where E: Error + 'static {}
 
 fn write_len_prefixed_str(
     output: &mut Vec<u8>,
@@ -344,12 +496,13 @@ fn write_u32(output: &mut Vec<u8>, value: u32) {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
+    use std::fmt::{Display, Formatter, Write as _};
 
     use serde_json::json;
 
     use super::{
-        AUTH_TRANSCRIPT_CANONICAL_VERSION, AUTH_TRANSCRIPT_LABEL, AuthProof, AuthTranscript,
+        AUTH_TRANSCRIPT_CANONICAL_VERSION, AUTH_TRANSCRIPT_LABEL, AuthProof, AuthProofSignError,
+        AuthProofSigner, AuthProofVerifier, AuthProofVerifyError, AuthTranscript,
         AuthTranscriptEncodeError, CapabilityFlags, HANDSHAKE_NONCE_LEN, HandshakeMessage, Hello,
         PeerRole, ProtocolNegotiationError, ProtocolVersion, SESSION_TLS_EXPORTER_LABEL,
         SessionReady, TLS_EXPORTER_LEN,
@@ -552,6 +705,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn auth_proof_sign_and_verify_round_trips_canonical_transcript() {
+        let transcript = auth_transcript_fixture(PeerRole::Initiator);
+
+        let proof =
+            AuthProof::sign_transcript("device-a", PeerRole::Initiator, &transcript, &EchoSigner)
+                .expect("auth proof");
+
+        assert_eq!(proof.device_id, "device-a");
+        assert_eq!(proof.role, PeerRole::Initiator);
+        assert!(proof.signature.starts_with(b"akraz-test-signature:"));
+        assert_eq!(
+            proof.verify_transcript("device-a", PeerRole::Initiator, &transcript, &EchoVerifier),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn auth_proof_signing_returns_transcript_encoding_failures() {
+        let transcript = AuthTranscript {
+            remote_device_id: "b".repeat(usize::from(u16::MAX) + 1),
+            ..auth_transcript_fixture(PeerRole::Initiator)
+        };
+
+        assert_eq!(
+            AuthProof::sign_transcript("device-a", PeerRole::Initiator, &transcript, &EchoSigner),
+            Err(AuthProofSignError::Transcript(
+                AuthTranscriptEncodeError::StringFieldTooLong {
+                    field: "remote device id",
+                    max: usize::from(u16::MAX),
+                    actual: usize::from(u16::MAX) + 1,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn auth_proof_verification_rejects_mismatched_identity_before_signature_check() {
+        let transcript = auth_transcript_fixture(PeerRole::Initiator);
+        let proof =
+            AuthProof::sign_transcript("device-a", PeerRole::Initiator, &transcript, &EchoSigner)
+                .expect("auth proof");
+
+        assert_eq!(
+            proof.verify_transcript("device-b", PeerRole::Initiator, &transcript, &EchoVerifier),
+            Err(AuthProofVerifyError::DeviceIdMismatch {
+                expected: "device-b".to_string(),
+                actual: "device-a".to_string(),
+            })
+        );
+        assert_eq!(
+            proof.verify_transcript("device-a", PeerRole::Responder, &transcript, &EchoVerifier),
+            Err(AuthProofVerifyError::ProofRoleMismatch {
+                expected: PeerRole::Responder,
+                actual: PeerRole::Initiator,
+            })
+        );
+    }
+
+    #[test]
+    fn auth_proof_verification_rejects_invalid_signature() {
+        let transcript = auth_transcript_fixture(PeerRole::Initiator);
+        let mut proof =
+            AuthProof::sign_transcript("device-a", PeerRole::Initiator, &transcript, &EchoSigner)
+                .expect("auth proof");
+        proof.signature.push(0);
+
+        assert_eq!(
+            proof.verify_transcript("device-a", PeerRole::Initiator, &transcript, &EchoVerifier),
+            Err(AuthProofVerifyError::Verifier(TestCryptoError::Rejected))
+        );
+    }
+
     fn auth_transcript_fixture(role: PeerRole) -> AuthTranscript {
         AuthTranscript {
             local_device_id: "device-a".to_string(),
@@ -575,5 +801,55 @@ mod tests {
         }
 
         output
+    }
+
+    struct EchoSigner;
+
+    impl AuthProofSigner for EchoSigner {
+        type Error = TestCryptoError;
+
+        fn sign_auth_transcript(
+            &self,
+            canonical_transcript: &[u8],
+        ) -> Result<Vec<u8>, Self::Error> {
+            Ok(test_signature(canonical_transcript))
+        }
+    }
+
+    struct EchoVerifier;
+
+    impl AuthProofVerifier for EchoVerifier {
+        type Error = TestCryptoError;
+
+        fn verify_auth_transcript(
+            &self,
+            canonical_transcript: &[u8],
+            signature: &[u8],
+        ) -> Result<(), Self::Error> {
+            if signature == test_signature(canonical_transcript) {
+                Ok(())
+            } else {
+                Err(TestCryptoError::Rejected)
+            }
+        }
+    }
+
+    fn test_signature(canonical_transcript: &[u8]) -> Vec<u8> {
+        let mut signature = b"akraz-test-signature:".to_vec();
+        signature.extend_from_slice(canonical_transcript);
+        signature
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TestCryptoError {
+        Rejected,
+    }
+
+    impl Display for TestCryptoError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Rejected => formatter.write_str("signature rejected"),
+            }
+        }
     }
 }
