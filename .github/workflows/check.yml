@@ -24,6 +24,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
+      - if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          cargo build -p akraz-daemon
+          New-Item -ItemType Directory -Force apps/akraz/src-tauri/binaries
+          Copy-Item target/debug/akraz-daemon.exe apps/akraz/src-tauri/binaries/akraz-daemon-x86_64-pc-windows-msvc.exe
       - run: cargo clippy ${{ matrix.cargo_scope }} --all-targets -- -D warnings
       - run: cargo test ${{ matrix.cargo_scope }}
 
