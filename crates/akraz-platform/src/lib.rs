@@ -1350,9 +1350,11 @@ fn fake_desktop_geometry() -> DesktopGeometry {
 mod tests {
     use std::sync::mpsc::TryRecvError;
 
+    #[cfg(windows)]
+    use akraz_core::MouseButton;
     use akraz_core::{
         CapturedInputEvent, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize,
-        MouseButton, PhysicalKey, PressState,
+        PhysicalKey, PressState,
     };
 
     use super::{
