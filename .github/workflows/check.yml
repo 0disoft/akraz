@@ -10,7 +10,13 @@ jobs:
   rust:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            cargo_scope: "--workspace"
+          - os: ubuntu-latest
+            cargo_scope: "--workspace --exclude akraz-app"
+          - os: macos-latest
+            cargo_scope: "--workspace --exclude akraz-app"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -18,8 +24,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy ${{ matrix.cargo_scope }} --all-targets -- -D warnings
+      - run: cargo test ${{ matrix.cargo_scope }}
 
   frontend:
     runs-on: ubuntu-latest

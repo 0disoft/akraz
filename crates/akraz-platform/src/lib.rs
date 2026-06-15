@@ -1,23 +1,21 @@
 //! Platform adapter contract shared by OS-specific akraz crates.
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{
-    Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
-};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
-use akraz_core::{
-    CapturedInputEvent, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize, MouseButton,
-    PhysicalKey, PressState,
-};
+use akraz_core::{CapturedInputEvent, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize};
 
 #[cfg(windows)]
 use akraz_core::DEFAULT_PANIC_HOTKEY_KEY;
+#[cfg(windows)]
+use akraz_core::{MouseButton, PhysicalKey, PressState};
+
+#[cfg(windows)]
+use std::collections::BTreeSet;
 
 #[cfg(windows)]
 use std::mem::size_of;
@@ -27,7 +25,11 @@ use std::ptr::{null, null_mut};
 #[cfg(windows)]
 use std::cell::RefCell;
 #[cfg(windows)]
+use std::sync::mpsc::{SyncSender, TrySendError};
+#[cfg(windows)]
 use std::thread;
+#[cfg(windows)]
+use std::thread::JoinHandle;
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
