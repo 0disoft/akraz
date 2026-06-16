@@ -277,7 +277,7 @@ pub struct TcpPeerSessionTransport {
     peer_id: PeerId,
     local_device_id: DeviceId,
     address: SocketAddr,
-    stream: Arc<Mutex<TcpStream>>,
+    stream: Arc<Mutex<TcpPeerSessionStreamState>>,
     _heartbeat_worker: Arc<TcpPeerSessionHeartbeatWorker>,
 }
 
@@ -303,7 +303,7 @@ impl TcpPeerSessionTransport {
 
         write_peer_transport_session_frame(&mut stream, &hello)?;
 
-        let stream = Arc::new(Mutex::new(stream));
+        let stream = Arc::new(Mutex::new(TcpPeerSessionStreamState::new(stream)));
         let heartbeat_worker = TcpPeerSessionHeartbeatWorker::start(
             peer_id.clone(),
             address,
@@ -337,6 +337,29 @@ impl TcpPeerSessionTransport {
 }
 
 #[derive(Debug)]
+struct TcpPeerSessionStreamState {
+    stream: TcpStream,
+    next_sequence: u64,
+}
+
+impl TcpPeerSessionStreamState {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            next_sequence: 0,
+        }
+    }
+
+    fn next_sequence(&mut self) -> Result<u64, PlatformError> {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
+            PlatformError::new("peer session sequence number overflowed before frame write")
+        })?;
+        Ok(sequence)
+    }
+}
+
+#[derive(Debug)]
 struct TcpPeerSessionHeartbeatWorker {
     running: Arc<AtomicBool>,
     handle: Mutex<Option<JoinHandle<()>>>,
@@ -346,14 +369,12 @@ impl TcpPeerSessionHeartbeatWorker {
     fn start(
         peer_id: PeerId,
         address: SocketAddr,
-        stream: Arc<Mutex<TcpStream>>,
+        stream: Arc<Mutex<TcpPeerSessionStreamState>>,
         interval: Duration,
     ) -> Arc<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let worker_running = Arc::clone(&running);
         let handle = thread::spawn(move || {
-            let frame = PeerTransportSessionFrame::Heartbeat;
-
             while worker_running.load(Ordering::Acquire) {
                 thread::park_timeout(interval);
                 if !worker_running.load(Ordering::Acquire) {
@@ -363,7 +384,9 @@ impl TcpPeerSessionHeartbeatWorker {
                 let result = stream
                     .lock()
                     .map_err(|_| PlatformError::new("peer session stream is unavailable"))
-                    .and_then(|mut stream| write_peer_transport_session_frame(&mut stream, &frame));
+                    .and_then(|mut stream| {
+                        write_peer_transport_session_heartbeat_frame(&mut stream)
+                    });
                 if let Err(error) = result {
                     eprintln!(
                         "peer session heartbeat stopped for {} at {}: {error}",
@@ -402,15 +425,13 @@ impl DaemonPeerTransport for TcpPeerSessionTransport {
     ) -> Result<(), PlatformError> {
         validate_transport_command_peer(&self.peer_id, &command)?;
 
-        let frame = PeerTransportSessionFrame::Command {
-            command: PeerTransportCommandPayload::from(&command),
-        };
+        let command = PeerTransportCommandPayload::from(&command);
         let mut stream = self
             .stream
             .lock()
             .map_err(|_| PlatformError::new("peer session stream is unavailable"))?;
 
-        write_peer_transport_session_frame(&mut stream, &frame)
+        write_peer_transport_session_command_frame(&mut stream, command)
     }
 }
 
@@ -596,9 +617,13 @@ pub fn serve_tcp_peer_transport_session(
     let mut reader = BufReader::new(stream);
     let hello = read_peer_transport_session_hello(&mut reader)?;
     let mut commands = Vec::with_capacity(max_commands);
+    let mut sequence = PeerTransportSessionSequence::new();
 
     for _ in 0..max_commands {
-        commands.push(read_peer_transport_session_command(&mut reader)?);
+        commands.push(read_peer_transport_session_command_with_sequence(
+            &mut reader,
+            &mut sequence,
+        )?);
     }
 
     Ok(PeerTransportSession { hello, commands })
@@ -619,9 +644,11 @@ where
     let mut reader = BufReader::new(stream);
     let hello = read_peer_transport_session_hello(&mut reader)?;
     let mut outcomes = Vec::with_capacity(max_commands);
+    let mut sequence = PeerTransportSessionSequence::new();
 
     for _ in 0..max_commands {
-        let command = read_peer_transport_session_command(&mut reader)?;
+        let command =
+            read_peer_transport_session_command_with_sequence(&mut reader, &mut sequence)?;
         outcomes.push(execute_peer_transport_command(platform, &command)?);
     }
 
@@ -711,6 +738,7 @@ where
     let hello = read_peer_transport_session_hello(reader)?;
     let mut outcomes = Vec::new();
     let mut needs_release_on_close = false;
+    let mut sequence = PeerTransportSessionSequence::new();
 
     loop {
         let frame = match read_optional_peer_transport_session_frame(reader) {
@@ -725,7 +753,17 @@ where
         };
 
         match frame {
-            Some(PeerTransportSessionFrame::Command { command }) => {
+            Some(PeerTransportSessionFrame::Command {
+                sequence: received_sequence,
+                command,
+            }) => {
+                if let Err(error) = sequence.accept(received_sequence) {
+                    return Err(release_peer_transport_inputs_after_error(
+                        platform,
+                        needs_release_on_close,
+                        error,
+                    ));
+                }
                 let command = match command.into_command() {
                     Ok(command) => command,
                     Err(error) => {
@@ -758,7 +796,17 @@ where
                     ),
                 ));
             }
-            Some(PeerTransportSessionFrame::Heartbeat) => {}
+            Some(PeerTransportSessionFrame::Heartbeat {
+                sequence: received_sequence,
+            }) => {
+                if let Err(error) = sequence.accept(received_sequence) {
+                    return Err(release_peer_transport_inputs_after_error(
+                        platform,
+                        needs_release_on_close,
+                        error,
+                    ));
+                }
+            }
             None => {
                 if needs_release_on_close {
                     platform.release_all()?;
@@ -804,6 +852,31 @@ where
         Err(release_error) => PlatformError::new(format!(
             "{error}; additionally failed to release peer session inputs: {release_error}"
         )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerTransportSessionSequence {
+    expected: u64,
+}
+
+impl PeerTransportSessionSequence {
+    fn new() -> Self {
+        Self { expected: 0 }
+    }
+
+    fn accept(&mut self, received: u64) -> Result<(), PlatformError> {
+        if received != self.expected {
+            return Err(PlatformError::new(format!(
+                "peer session sequence mismatch: expected {}, received {}",
+                self.expected, received
+            )));
+        }
+
+        self.expected = self.expected.checked_add(1).ok_or_else(|| {
+            PlatformError::new("peer session sequence number overflowed after frame read")
+        })?;
+        Ok(())
     }
 }
 
@@ -855,6 +928,23 @@ fn write_peer_transport_session_frame(
         .map_err(|error| PlatformError::new(format!("failed to write peer session frame: {error}")))
 }
 
+fn write_peer_transport_session_command_frame(
+    stream: &mut TcpPeerSessionStreamState,
+    command: PeerTransportCommandPayload,
+) -> Result<(), PlatformError> {
+    let sequence = stream.next_sequence()?;
+    let frame = PeerTransportSessionFrame::Command { sequence, command };
+    write_peer_transport_session_frame(&mut stream.stream, &frame)
+}
+
+fn write_peer_transport_session_heartbeat_frame(
+    stream: &mut TcpPeerSessionStreamState,
+) -> Result<(), PlatformError> {
+    let sequence = stream.next_sequence()?;
+    let frame = PeerTransportSessionFrame::Heartbeat { sequence };
+    write_peer_transport_session_frame(&mut stream.stream, &frame)
+}
+
 fn read_peer_transport_session_hello<R>(
     reader: &mut R,
 ) -> Result<PeerTransportSessionHello, PlatformError>
@@ -877,27 +967,38 @@ where
         PeerTransportSessionFrame::Command { .. } => Err(PlatformError::new(
             "peer session expected hello frame before command frames",
         )),
-        PeerTransportSessionFrame::Heartbeat => Err(PlatformError::new(
+        PeerTransportSessionFrame::Heartbeat { .. } => Err(PlatformError::new(
             "peer session expected hello frame before heartbeat frames",
         )),
     }
 }
 
-fn read_peer_transport_session_command<R>(
+fn read_peer_transport_session_command_with_sequence<R>(
     reader: &mut R,
+    sequence: &mut PeerTransportSessionSequence,
 ) -> Result<DaemonTransportCommand, PlatformError>
 where
     R: BufRead,
 {
     loop {
         match read_peer_transport_session_frame(reader)? {
-            PeerTransportSessionFrame::Command { command } => return command.into_command(),
+            PeerTransportSessionFrame::Command {
+                sequence: received_sequence,
+                command,
+            } => {
+                sequence.accept(received_sequence)?;
+                return command.into_command();
+            }
             PeerTransportSessionFrame::Hello { .. } => {
                 return Err(PlatformError::new(
                     "peer session received duplicate hello frame after session start",
                 ));
             }
-            PeerTransportSessionFrame::Heartbeat => {}
+            PeerTransportSessionFrame::Heartbeat {
+                sequence: received_sequence,
+            } => {
+                sequence.accept(received_sequence)?;
+            }
         }
     }
 }
@@ -1014,9 +1115,12 @@ pub enum PeerTransportSessionFrame {
         peer_id: String,
     },
     Command {
+        sequence: u64,
         command: PeerTransportCommandPayload,
     },
-    Heartbeat,
+    Heartbeat {
+        sequence: u64,
+    },
 }
 
 /// Wire-safe protocol version for peer transport messages.
@@ -2231,6 +2335,13 @@ mod tests {
         )
     }
 
+    fn peer_session_command_frame(
+        sequence: u64,
+        command: PeerTransportCommandPayload,
+    ) -> PeerTransportSessionFrame {
+        PeerTransportSessionFrame::Command { sequence, command }
+    }
+
     #[cfg(unix)]
     fn unique_os_endpoint() -> IpcEndpoint {
         let nanos = std::time::SystemTime::now()
@@ -2330,7 +2441,7 @@ mod tests {
         assert_eq!(status.daemon_version, DAEMON_VERSION);
         assert_eq!(status.mode, ControlModeSnapshot::from(ControlMode::Local));
         assert_eq!(status.protocol.major, 1);
-        assert_eq!(status.protocol.minor, 1);
+        assert_eq!(status.protocol.minor, 2);
         assert!(status.peers.is_empty());
         assert_eq!(
             status.capabilities,
@@ -2720,7 +2831,7 @@ mod tests {
     #[test]
     fn peer_transport_message_rejects_unknown_wire_values() {
         let message = PeerTransportMessage {
-            protocol: super::PeerTransportProtocolVersion { major: 1, minor: 1 },
+            protocol: super::PeerTransportProtocolVersion { major: 1, minor: 2 },
             command: super::PeerTransportCommandPayload::ForwardInput {
                 event: super::PeerTransportInputEvent::Key {
                     key: "notARealKey".to_string(),
@@ -2891,7 +3002,12 @@ mod tests {
 
             loop {
                 match super::read_optional_peer_transport_session_frame(&mut reader)? {
-                    Some(PeerTransportSessionFrame::Heartbeat) => {
+                    Some(PeerTransportSessionFrame::Heartbeat { sequence }) => {
+                        if sequence != 0 {
+                            return Err(PlatformError::new(format!(
+                                "test peer expected first heartbeat sequence 0, got {sequence}"
+                            )));
+                        }
                         return Ok::<_, PlatformError>(hello);
                     }
                     Some(PeerTransportSessionFrame::Command { .. }) => {}
@@ -3311,14 +3427,15 @@ mod tests {
             Ok::<_, PlatformError>((error.to_string(), injected_events, release_all_count))
         });
         let mut stream = std::net::TcpStream::connect(address).expect("connect loopback server");
-        let forward_frame = PeerTransportSessionFrame::Command {
-            command: PeerTransportCommandPayload::ForwardInput {
+        let forward_frame = peer_session_command_frame(
+            0,
+            PeerTransportCommandPayload::ForwardInput {
                 event: PeerTransportInputEvent::PointerMoved {
                     delta_x: 8,
                     delta_y: 2,
                 },
             },
-        };
+        );
 
         super::write_peer_transport_session_frame(&mut stream, &peer_session_hello_frame())
             .expect("write session hello");
@@ -3347,14 +3464,15 @@ mod tests {
     #[test]
     fn peer_session_executor_releases_inputs_when_stream_errors_after_forwarded_input() {
         let platform = FakePlatformAdapter::default();
-        let forward_frame = PeerTransportSessionFrame::Command {
-            command: PeerTransportCommandPayload::ForwardInput {
+        let forward_frame = peer_session_command_frame(
+            0,
+            PeerTransportCommandPayload::ForwardInput {
                 event: PeerTransportInputEvent::PointerMoved {
                     delta_x: 8,
                     delta_y: 2,
                 },
             },
-        };
+        );
         let mut stream = String::new();
         stream.push_str(&peer_session_frame_line(&peer_session_hello_frame()));
         stream.push_str(&peer_session_frame_line(&forward_frame));
@@ -3389,22 +3507,24 @@ mod tests {
     fn peer_session_executor_releases_inputs_when_command_payload_is_rejected_after_forwarded_input()
      {
         let platform = FakePlatformAdapter::default();
-        let forward_frame = PeerTransportSessionFrame::Command {
-            command: PeerTransportCommandPayload::ForwardInput {
+        let forward_frame = peer_session_command_frame(
+            0,
+            PeerTransportCommandPayload::ForwardInput {
                 event: PeerTransportInputEvent::PointerMoved {
                     delta_x: 8,
                     delta_y: 2,
                 },
             },
-        };
-        let rejected_frame = PeerTransportSessionFrame::Command {
-            command: PeerTransportCommandPayload::ForwardInput {
+        );
+        let rejected_frame = peer_session_command_frame(
+            1,
+            PeerTransportCommandPayload::ForwardInput {
                 event: PeerTransportInputEvent::Key {
                     key: "notARealKey".to_string(),
                     state: "pressed".to_string(),
                 },
             },
-        };
+        );
         let mut stream = String::new();
         stream.push_str(&peer_session_frame_line(&peer_session_hello_frame()));
         stream.push_str(&peer_session_frame_line(&forward_frame));
@@ -3434,6 +3554,48 @@ mod tests {
     }
 
     #[test]
+    fn peer_session_executor_releases_inputs_when_sequence_mismatch_follows_forwarded_input() {
+        let platform = FakePlatformAdapter::default();
+        let forward_frame = peer_session_command_frame(
+            0,
+            PeerTransportCommandPayload::ForwardInput {
+                event: PeerTransportInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            },
+        );
+        let duplicate_frame =
+            peer_session_command_frame(0, PeerTransportCommandPayload::ReleaseAllInputs);
+        let mut stream = String::new();
+        stream.push_str(&peer_session_frame_line(&peer_session_hello_frame()));
+        stream.push_str(&peer_session_frame_line(&forward_frame));
+        stream.push_str(&peer_session_frame_line(&duplicate_frame));
+        let mut reader = std::io::Cursor::new(stream.into_bytes());
+
+        let error = execute_peer_transport_session_stream_until_closed(&mut reader, &platform)
+            .expect_err("duplicate sequence should fail the peer session");
+
+        assert_eq!(
+            error.to_string(),
+            "peer session sequence mismatch: expected 1, received 0"
+        );
+        assert_eq!(
+            platform.injected_events().expect("fake injected events"),
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }]
+        );
+        assert_eq!(
+            platform
+                .release_all_count()
+                .expect("fake release all count"),
+            1
+        );
+    }
+
+    #[test]
     fn tcp_peer_session_rejects_command_before_hello() {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
@@ -3441,9 +3603,8 @@ mod tests {
         let server_thread =
             std::thread::spawn(move || serve_tcp_peer_transport_session(&listener, 1));
         let mut stream = std::net::TcpStream::connect(address).expect("connect loopback server");
-        let frame = PeerTransportSessionFrame::Command {
-            command: super::PeerTransportCommandPayload::ReleaseAllInputs,
-        };
+        let frame =
+            peer_session_command_frame(0, super::PeerTransportCommandPayload::ReleaseAllInputs);
         let line = serde_json::to_string(&frame).expect("session frame JSON");
 
         std::io::Write::write_all(&mut stream, line.as_bytes()).expect("write command frame");

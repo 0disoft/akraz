@@ -273,7 +273,7 @@ function assertPeerHello(hello) {
   if (
     hello?.kind !== "hello" ||
     hello.protocol?.major !== 1 ||
-    hello.protocol.minor !== 1 ||
+    hello.protocol.minor !== 2 ||
     hello.deviceId !== "local-smoke-device" ||
     hello.peerId !== "loopback-peer"
   ) {

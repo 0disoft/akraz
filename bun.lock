@@ -12,7 +12,7 @@
     },
     "apps/akraz": {
       "name": "akraz",
-      "version": "0.4.27",
+      "version": "0.4.28",
       "dependencies": {
         "@tauri-apps/api": "^2.11.0",
       },

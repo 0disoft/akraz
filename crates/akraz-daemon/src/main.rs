@@ -1565,7 +1565,7 @@ mod tests {
 
         assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(report.hello.protocol_major, 1);
-        assert_eq!(report.hello.protocol_minor, 1);
+        assert_eq!(report.hello.protocol_minor, 2);
         assert_eq!(report.hello.device_id, "local-smoke-device");
         assert_eq!(report.hello.peer_id, "loopback-peer");
         assert_eq!(report.commands.len(), 4);
@@ -1604,7 +1604,7 @@ mod tests {
 
         assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(report.hello.protocol_major, 1);
-        assert_eq!(report.hello.protocol_minor, 1);
+        assert_eq!(report.hello.protocol_minor, 2);
         assert_eq!(report.hello.device_id, "local-smoke-device");
         assert_eq!(report.hello.peer_id, "loopback-peer");
         assert_eq!(report.outcomes.len(), 4);

@@ -44,7 +44,7 @@ if (report.daemonVersion !== appPackage.version) {
 
 if (
   report.hello?.protocolMajor !== 1 ||
-  report.hello.protocolMinor !== 1 ||
+  report.hello.protocolMinor !== 2 ||
   report.hello.deviceId !== "local-smoke-device" ||
   report.hello.peerId !== "loopback-peer"
 ) {
