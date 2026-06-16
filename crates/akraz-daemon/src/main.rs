@@ -19,7 +19,7 @@ use akraz_daemon::{
     LoopbackPeerTransport, ManagedPeerSessionTransport, PeerTransportCommandExecution,
     PeerTransportSession, PeerTransportSessionExecution, SharedCoreActionDispatcher,
     TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher, build_daemon_status,
-    execute_peer_transport_session_stream_until_closed, serve_daemon_ipc,
+    execute_tcp_peer_transport_session_until_closed, serve_daemon_ipc,
     serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
     serve_tcp_peer_transport_session_and_execute, shared_runtime_state,
     start_daemon_input_capture_with_edge_bindings_and_dispatcher,
@@ -264,9 +264,8 @@ where
     while running.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
-                let mut reader = std::io::BufReader::new(stream);
                 if let Err(error) =
-                    execute_peer_transport_session_stream_until_closed(&mut reader, &platform)
+                    execute_tcp_peer_transport_session_until_closed(stream, &platform)
                 {
                     eprintln!("peer session ended with error: {error}");
                 }
@@ -1566,7 +1565,7 @@ mod tests {
 
         assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(report.hello.protocol_major, 1);
-        assert_eq!(report.hello.protocol_minor, 0);
+        assert_eq!(report.hello.protocol_minor, 1);
         assert_eq!(report.hello.device_id, "local-smoke-device");
         assert_eq!(report.hello.peer_id, "loopback-peer");
         assert_eq!(report.commands.len(), 4);
@@ -1605,7 +1604,7 @@ mod tests {
 
         assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(report.hello.protocol_major, 1);
-        assert_eq!(report.hello.protocol_minor, 0);
+        assert_eq!(report.hello.protocol_minor, 1);
         assert_eq!(report.hello.device_id, "local-smoke-device");
         assert_eq!(report.hello.peer_id, "loopback-peer");
         assert_eq!(report.outcomes.len(), 4);

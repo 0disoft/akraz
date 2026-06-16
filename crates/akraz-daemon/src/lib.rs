@@ -35,6 +35,8 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const JSONRPC_DAEMON_ERROR: i32 = -32000;
 const DEFAULT_CAPTURE_DRAIN_BATCH_SIZE: usize = 64;
 const DEFAULT_CAPTURE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DEFAULT_PEER_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
+const DEFAULT_PEER_SESSION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Shared daemon runtime state observed by IPC and capture workers.
 pub type SharedRuntimeInputState = Arc<Mutex<RuntimeInputState>>;
@@ -276,6 +278,7 @@ pub struct TcpPeerSessionTransport {
     local_device_id: DeviceId,
     address: SocketAddr,
     stream: Arc<Mutex<TcpStream>>,
+    _heartbeat_worker: Arc<TcpPeerSessionHeartbeatWorker>,
 }
 
 impl TcpPeerSessionTransport {
@@ -300,11 +303,20 @@ impl TcpPeerSessionTransport {
 
         write_peer_transport_session_frame(&mut stream, &hello)?;
 
+        let stream = Arc::new(Mutex::new(stream));
+        let heartbeat_worker = TcpPeerSessionHeartbeatWorker::start(
+            peer_id.clone(),
+            address,
+            Arc::clone(&stream),
+            DEFAULT_PEER_SESSION_HEARTBEAT_INTERVAL,
+        );
+
         Ok(Self {
             peer_id,
             local_device_id,
             address,
-            stream: Arc::new(Mutex::new(stream)),
+            stream,
+            _heartbeat_worker: heartbeat_worker,
         })
     }
 
@@ -321,6 +333,65 @@ impl TcpPeerSessionTransport {
     /// Return the TCP address this session is connected to.
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+}
+
+#[derive(Debug)]
+struct TcpPeerSessionHeartbeatWorker {
+    running: Arc<AtomicBool>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl TcpPeerSessionHeartbeatWorker {
+    fn start(
+        peer_id: PeerId,
+        address: SocketAddr,
+        stream: Arc<Mutex<TcpStream>>,
+        interval: Duration,
+    ) -> Arc<Self> {
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let handle = thread::spawn(move || {
+            let frame = PeerTransportSessionFrame::Heartbeat;
+
+            while worker_running.load(Ordering::Acquire) {
+                thread::park_timeout(interval);
+                if !worker_running.load(Ordering::Acquire) {
+                    break;
+                }
+
+                let result = stream
+                    .lock()
+                    .map_err(|_| PlatformError::new("peer session stream is unavailable"))
+                    .and_then(|mut stream| write_peer_transport_session_frame(&mut stream, &frame));
+                if let Err(error) = result {
+                    eprintln!(
+                        "peer session heartbeat stopped for {} at {}: {error}",
+                        peer_id.as_str(),
+                        address
+                    );
+                    break;
+                }
+            }
+        });
+
+        Arc::new(Self {
+            running,
+            handle: Mutex::new(Some(handle)),
+        })
+    }
+}
+
+impl Drop for TcpPeerSessionHeartbeatWorker {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        let Some(handle) = self.handle.lock().ok().and_then(|mut handle| handle.take()) else {
+            return;
+        };
+        handle.thread().unpark();
+        if handle.join().is_err() {
+            eprintln!("peer session heartbeat thread panicked");
+        }
     }
 }
 
@@ -565,9 +636,64 @@ pub fn serve_tcp_peer_transport_session_and_execute_until_closed<P>(
 where
     P: PlatformAdapter,
 {
+    serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout(
+        listener,
+        platform,
+        DEFAULT_PEER_SESSION_HEARTBEAT_TIMEOUT,
+    )
+}
+
+/// Serve one persistent TCP peer session and execute commands until EOF or heartbeat timeout.
+pub fn serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout<P>(
+    listener: &TcpListener,
+    platform: &P,
+    heartbeat_timeout: Duration,
+) -> Result<PeerTransportSessionExecution, PlatformError>
+where
+    P: PlatformAdapter,
+{
     let (stream, _) = listener
         .accept()
         .map_err(|error| PlatformError::new(format!("failed to accept peer session: {error}")))?;
+
+    execute_tcp_peer_transport_session_until_closed_with_timeout(
+        stream,
+        platform,
+        heartbeat_timeout,
+    )
+}
+
+/// Execute a TCP peer transport session until EOF or heartbeat timeout.
+pub fn execute_tcp_peer_transport_session_until_closed<P>(
+    stream: TcpStream,
+    platform: &P,
+) -> Result<PeerTransportSessionExecution, PlatformError>
+where
+    P: PlatformAdapter,
+{
+    execute_tcp_peer_transport_session_until_closed_with_timeout(
+        stream,
+        platform,
+        DEFAULT_PEER_SESSION_HEARTBEAT_TIMEOUT,
+    )
+}
+
+/// Execute a TCP peer transport session with an explicit heartbeat timeout.
+pub fn execute_tcp_peer_transport_session_until_closed_with_timeout<P>(
+    stream: TcpStream,
+    platform: &P,
+    heartbeat_timeout: Duration,
+) -> Result<PeerTransportSessionExecution, PlatformError>
+where
+    P: PlatformAdapter,
+{
+    stream
+        .set_read_timeout(Some(heartbeat_timeout))
+        .map_err(|error| {
+            PlatformError::new(format!(
+                "failed to configure peer session heartbeat timeout: {error}"
+            ))
+        })?;
     let mut reader = BufReader::new(stream);
 
     execute_peer_transport_session_stream_until_closed(&mut reader, platform)
@@ -632,6 +758,7 @@ where
                     ),
                 ));
             }
+            Some(PeerTransportSessionFrame::Heartbeat) => {}
             None => {
                 if needs_release_on_close {
                     platform.release_all()?;
@@ -750,6 +877,9 @@ where
         PeerTransportSessionFrame::Command { .. } => Err(PlatformError::new(
             "peer session expected hello frame before command frames",
         )),
+        PeerTransportSessionFrame::Heartbeat => Err(PlatformError::new(
+            "peer session expected hello frame before heartbeat frames",
+        )),
     }
 }
 
@@ -759,11 +889,16 @@ fn read_peer_transport_session_command<R>(
 where
     R: BufRead,
 {
-    match read_peer_transport_session_frame(reader)? {
-        PeerTransportSessionFrame::Command { command } => command.into_command(),
-        PeerTransportSessionFrame::Hello { .. } => Err(PlatformError::new(
-            "peer session received duplicate hello frame after session start",
-        )),
+    loop {
+        match read_peer_transport_session_frame(reader)? {
+            PeerTransportSessionFrame::Command { command } => return command.into_command(),
+            PeerTransportSessionFrame::Hello { .. } => {
+                return Err(PlatformError::new(
+                    "peer session received duplicate hello frame after session start",
+                ));
+            }
+            PeerTransportSessionFrame::Heartbeat => {}
+        }
     }
 }
 
@@ -881,6 +1016,7 @@ pub enum PeerTransportSessionFrame {
     Command {
         command: PeerTransportCommandPayload,
     },
+    Heartbeat,
 }
 
 /// Wire-safe protocol version for peer transport messages.
@@ -2023,9 +2159,10 @@ mod tests {
         input_capture_policy_for_control_mode, recover_local_control_and_release_inputs,
         serve_daemon_ipc, serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
         serve_tcp_peer_transport_session_and_execute,
-        serve_tcp_peer_transport_session_and_execute_until_closed, shared_runtime_state,
-        start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
-        start_daemon_input_capture_with_routing,
+        serve_tcp_peer_transport_session_and_execute_until_closed,
+        serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout,
+        shared_runtime_state, start_daemon_input_capture,
+        start_daemon_input_capture_with_edge_bindings, start_daemon_input_capture_with_routing,
         start_daemon_input_capture_with_routing_and_dispatcher, sync_capture_policy_with_state,
     };
 
@@ -2193,7 +2330,7 @@ mod tests {
         assert_eq!(status.daemon_version, DAEMON_VERSION);
         assert_eq!(status.mode, ControlModeSnapshot::from(ControlMode::Local));
         assert_eq!(status.protocol.major, 1);
-        assert_eq!(status.protocol.minor, 0);
+        assert_eq!(status.protocol.minor, 1);
         assert!(status.peers.is_empty());
         assert_eq!(
             status.capabilities,
@@ -2583,7 +2720,7 @@ mod tests {
     #[test]
     fn peer_transport_message_rejects_unknown_wire_values() {
         let message = PeerTransportMessage {
-            protocol: super::PeerTransportProtocolVersion { major: 1, minor: 0 },
+            protocol: super::PeerTransportProtocolVersion { major: 1, minor: 1 },
             command: super::PeerTransportCommandPayload::ForwardInput {
                 event: super::PeerTransportInputEvent::Key {
                     key: "notARealKey".to_string(),
@@ -2733,6 +2870,59 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn tcp_peer_session_transport_sends_heartbeat_frames_while_idle() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().map_err(|error| {
+                PlatformError::new(format!("failed to accept test peer: {error}"))
+            })?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .map_err(|error| {
+                    PlatformError::new(format!("failed to configure test read timeout: {error}"))
+                })?;
+            let mut reader = std::io::BufReader::new(stream);
+            let hello = super::read_peer_transport_session_hello(&mut reader)?;
+
+            loop {
+                match super::read_optional_peer_transport_session_frame(&mut reader)? {
+                    Some(PeerTransportSessionFrame::Heartbeat) => {
+                        return Ok::<_, PlatformError>(hello);
+                    }
+                    Some(PeerTransportSessionFrame::Command { .. }) => {}
+                    Some(PeerTransportSessionFrame::Hello { .. }) => {
+                        return Err(PlatformError::new(
+                            "test peer received duplicate hello before heartbeat",
+                        ));
+                    }
+                    None => {
+                        return Err(PlatformError::new(
+                            "test peer closed before heartbeat was received",
+                        ));
+                    }
+                }
+            }
+        });
+        let transport = TcpPeerSessionTransport::connect(
+            PeerId::new("right-peer"),
+            DeviceId::new("windows-desktop"),
+            address,
+        )
+        .expect("connect TCP peer session");
+
+        let hello = server_thread
+            .join()
+            .expect("TCP peer heartbeat server thread")
+            .expect("TCP peer heartbeat");
+        drop(transport);
+
+        assert_eq!(hello.device_id, DeviceId::new("windows-desktop"));
+        assert_eq!(hello.peer_id, PeerId::new("right-peer"));
     }
 
     #[test]
@@ -3090,6 +3280,59 @@ mod tests {
                 },
                 PeerTransportCommandExecution::InputsReleased,
             ]
+        );
+        assert_eq!(
+            injected_events,
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }]
+        );
+        assert_eq!(release_all_count, 1);
+    }
+
+    #[test]
+    fn tcp_peer_session_executor_releases_inputs_when_heartbeat_timeout_elapses_after_forwarded_input()
+     {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread = std::thread::spawn(move || {
+            let platform = FakePlatformAdapter::default();
+            let error = serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout(
+                &listener,
+                &platform,
+                std::time::Duration::from_millis(50),
+            )
+            .expect_err("missing heartbeat should fail the peer session");
+            let injected_events = platform.injected_events()?;
+            let release_all_count = platform.release_all_count()?;
+
+            Ok::<_, PlatformError>((error.to_string(), injected_events, release_all_count))
+        });
+        let mut stream = std::net::TcpStream::connect(address).expect("connect loopback server");
+        let forward_frame = PeerTransportSessionFrame::Command {
+            command: PeerTransportCommandPayload::ForwardInput {
+                event: PeerTransportInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            },
+        };
+
+        super::write_peer_transport_session_frame(&mut stream, &peer_session_hello_frame())
+            .expect("write session hello");
+        super::write_peer_transport_session_frame(&mut stream, &forward_frame)
+            .expect("write forward frame");
+
+        let (error, injected_events, release_all_count) = server_thread
+            .join()
+            .expect("TCP peer session executor thread")
+            .expect("TCP peer timeout execution");
+
+        assert!(
+            error.contains("failed to read peer session frame"),
+            "unexpected error: {error}"
         );
         assert_eq!(
             injected_events,
