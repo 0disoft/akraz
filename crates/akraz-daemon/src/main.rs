@@ -269,7 +269,6 @@ where
                     execute_peer_transport_session_stream_until_closed(&mut reader, &platform)
                 {
                     eprintln!("peer session ended with error: {error}");
-                    platform.release_all()?;
                 }
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {

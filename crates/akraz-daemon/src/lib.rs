@@ -584,20 +584,99 @@ where
 {
     let hello = read_peer_transport_session_hello(reader)?;
     let mut outcomes = Vec::new();
+    let mut needs_release_on_close = false;
 
     loop {
-        match read_optional_peer_transport_session_frame(reader)? {
-            Some(PeerTransportSessionFrame::Command { command }) => {
-                let command = command.into_command()?;
-                outcomes.push(execute_peer_transport_command(platform, &command)?);
-            }
-            Some(PeerTransportSessionFrame::Hello { .. }) => {
-                return Err(PlatformError::new(
-                    "peer session received duplicate hello frame after session start",
+        let frame = match read_optional_peer_transport_session_frame(reader) {
+            Ok(frame) => frame,
+            Err(error) => {
+                return Err(release_peer_transport_inputs_after_error(
+                    platform,
+                    needs_release_on_close,
+                    error,
                 ));
             }
-            None => return Ok(PeerTransportSessionExecution { hello, outcomes }),
+        };
+
+        match frame {
+            Some(PeerTransportSessionFrame::Command { command }) => {
+                let command = match command.into_command() {
+                    Ok(command) => command,
+                    Err(error) => {
+                        return Err(release_peer_transport_inputs_after_error(
+                            platform,
+                            needs_release_on_close,
+                            error,
+                        ));
+                    }
+                };
+                let outcome = match execute_peer_transport_command(platform, &command) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return Err(release_peer_transport_inputs_after_error(
+                            platform,
+                            needs_release_on_close,
+                            error,
+                        ));
+                    }
+                };
+                update_peer_transport_release_guard(&mut needs_release_on_close, &command);
+                outcomes.push(outcome);
+            }
+            Some(PeerTransportSessionFrame::Hello { .. }) => {
+                return Err(release_peer_transport_inputs_after_error(
+                    platform,
+                    needs_release_on_close,
+                    PlatformError::new(
+                        "peer session received duplicate hello frame after session start",
+                    ),
+                ));
+            }
+            None => {
+                if needs_release_on_close {
+                    platform.release_all()?;
+                    outcomes.push(PeerTransportCommandExecution::InputsReleased);
+                }
+
+                return Ok(PeerTransportSessionExecution { hello, outcomes });
+            }
         }
+    }
+}
+
+fn update_peer_transport_release_guard(
+    needs_release_on_close: &mut bool,
+    command: &DaemonTransportCommand,
+) {
+    match command {
+        DaemonTransportCommand::StartRemoteSession { .. }
+        | DaemonTransportCommand::ForwardInput { .. } => {
+            *needs_release_on_close = true;
+        }
+        DaemonTransportCommand::ReleaseAllInputs => {
+            *needs_release_on_close = false;
+        }
+        DaemonTransportCommand::StopRemoteSession { .. } => {}
+    }
+}
+
+fn release_peer_transport_inputs_after_error<P>(
+    platform: &P,
+    needs_release_on_close: bool,
+    error: PlatformError,
+) -> PlatformError
+where
+    P: PlatformAdapter,
+{
+    if !needs_release_on_close {
+        return error;
+    }
+
+    match platform.release_all() {
+        Ok(()) => error,
+        Err(release_error) => PlatformError::new(format!(
+            "{error}; additionally failed to release peer session inputs: {release_error}"
+        )),
     }
 }
 
@@ -1934,14 +2013,15 @@ mod tests {
         DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer, DaemonPeerTransport,
         DaemonTransportCommand, LocalPlatformCoreActionDispatcher, LoopbackPeerTransport,
         ManagedPeerSessionSnapshot, ManagedPeerSessionTransport, NoopCoreActionDispatcher,
-        PeerTransportCommandExecution, PeerTransportMessage, PeerTransportSessionFrame,
+        PeerTransportCommandExecution, PeerTransportCommandPayload, PeerTransportInputEvent,
+        PeerTransportMessage, PeerTransportProtocolVersion, PeerTransportSessionFrame,
         TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher,
         apply_routed_capture_event_to_state, build_daemon_status,
         build_daemon_status_with_peer_sessions, build_permissions_probe, connect_peer_session,
         disconnect_peer_session, drain_capture_events, execute_peer_transport_command,
-        handle_ipc_request_line, input_capture_policy_for_control_mode,
-        recover_local_control_and_release_inputs, serve_daemon_ipc,
-        serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
+        execute_peer_transport_session_stream_until_closed, handle_ipc_request_line,
+        input_capture_policy_for_control_mode, recover_local_control_and_release_inputs,
+        serve_daemon_ipc, serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
         serve_tcp_peer_transport_session_and_execute,
         serve_tcp_peer_transport_session_and_execute_until_closed, shared_runtime_state,
         start_daemon_input_capture, start_daemon_input_capture_with_edge_bindings,
@@ -1994,6 +2074,24 @@ mod tests {
                 },
             },
         }
+    }
+
+    fn peer_session_hello_frame() -> PeerTransportSessionFrame {
+        PeerTransportSessionFrame::Hello {
+            protocol: PeerTransportProtocolVersion {
+                major: akraz_protocol::ProtocolVersion::CURRENT.major,
+                minor: akraz_protocol::ProtocolVersion::CURRENT.minor,
+            },
+            device_id: "windows-desktop".to_string(),
+            peer_id: "right-peer".to_string(),
+        }
+    }
+
+    fn peer_session_frame_line(frame: &PeerTransportSessionFrame) -> String {
+        format!(
+            "{}\n",
+            serde_json::to_string(frame).expect("peer session frame JSON")
+        )
     }
 
     #[cfg(unix)]
@@ -2941,6 +3039,155 @@ mod tests {
             }]
         );
         assert_eq!(release_all_count, 1);
+    }
+
+    #[test]
+    fn tcp_peer_session_executor_releases_inputs_when_peer_closes_without_release() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread = std::thread::spawn(move || {
+            let platform = FakePlatformAdapter::default();
+            let execution =
+                serve_tcp_peer_transport_session_and_execute_until_closed(&listener, &platform)?;
+            let injected_events = platform.injected_events()?;
+            let release_all_count = platform.release_all_count()?;
+
+            Ok::<_, PlatformError>((execution, injected_events, release_all_count))
+        });
+        let transport = TcpPeerSessionTransport::connect(
+            PeerId::new("right-peer"),
+            DeviceId::new("windows-desktop"),
+            address,
+        )
+        .expect("connect TCP peer session");
+        let dispatcher = TransportCoreActionDispatcher::new(transport.clone());
+
+        dispatcher
+            .dispatch_core_actions(&[CoreAction::ForwardInput {
+                event: InjectedInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            }])
+            .expect("TCP peer session dispatch");
+        drop(dispatcher);
+        drop(transport);
+
+        let (execution, injected_events, release_all_count) = server_thread
+            .join()
+            .expect("TCP peer session executor thread")
+            .expect("TCP peer session execution");
+
+        assert_eq!(
+            execution.outcomes,
+            vec![
+                PeerTransportCommandExecution::InputForwarded {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 8,
+                        delta_y: 2,
+                    },
+                },
+                PeerTransportCommandExecution::InputsReleased,
+            ]
+        );
+        assert_eq!(
+            injected_events,
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }]
+        );
+        assert_eq!(release_all_count, 1);
+    }
+
+    #[test]
+    fn peer_session_executor_releases_inputs_when_stream_errors_after_forwarded_input() {
+        let platform = FakePlatformAdapter::default();
+        let forward_frame = PeerTransportSessionFrame::Command {
+            command: PeerTransportCommandPayload::ForwardInput {
+                event: PeerTransportInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            },
+        };
+        let mut stream = String::new();
+        stream.push_str(&peer_session_frame_line(&peer_session_hello_frame()));
+        stream.push_str(&peer_session_frame_line(&forward_frame));
+        stream.push_str("{\"kind\":\"command\",\"command\":\n");
+        let mut reader = std::io::Cursor::new(stream.into_bytes());
+
+        let error = execute_peer_transport_session_stream_until_closed(&mut reader, &platform)
+            .expect_err("malformed frame should fail the peer session");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode peer session frame"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            platform.injected_events().expect("fake injected events"),
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }]
+        );
+        assert_eq!(
+            platform
+                .release_all_count()
+                .expect("fake release all count"),
+            1
+        );
+    }
+
+    #[test]
+    fn peer_session_executor_releases_inputs_when_command_payload_is_rejected_after_forwarded_input()
+     {
+        let platform = FakePlatformAdapter::default();
+        let forward_frame = PeerTransportSessionFrame::Command {
+            command: PeerTransportCommandPayload::ForwardInput {
+                event: PeerTransportInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            },
+        };
+        let rejected_frame = PeerTransportSessionFrame::Command {
+            command: PeerTransportCommandPayload::ForwardInput {
+                event: PeerTransportInputEvent::Key {
+                    key: "notARealKey".to_string(),
+                    state: "pressed".to_string(),
+                },
+            },
+        };
+        let mut stream = String::new();
+        stream.push_str(&peer_session_frame_line(&peer_session_hello_frame()));
+        stream.push_str(&peer_session_frame_line(&forward_frame));
+        stream.push_str(&peer_session_frame_line(&rejected_frame));
+        let mut reader = std::io::Cursor::new(stream.into_bytes());
+
+        let error = execute_peer_transport_session_stream_until_closed(&mut reader, &platform)
+            .expect_err("rejected payload should fail the peer session");
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported peer transport value: notARealKey"
+        );
+        assert_eq!(
+            platform.injected_events().expect("fake injected events"),
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }]
+        );
+        assert_eq!(
+            platform
+                .release_all_count()
+                .expect("fake release all count"),
+            1
+        );
     }
 
     #[test]
