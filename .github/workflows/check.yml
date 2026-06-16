@@ -44,3 +44,23 @@ jobs:
       - run: bun run check
       - run: bun run format:check
       - run: bun run lint
+
+  smoke:
+    needs:
+      - rust
+      - frontend
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run smoke:loopback-transport
+      - run: bun run smoke:tcp-transport
+      - run: bun run smoke:peer-session
+      - run: bun run smoke:peer-session-executor
+      - run: bun run smoke:session-connect-lifecycle
+      - run: bun run smoke:daemon-lifecycle
+      - run: bun run smoke:settings-start
