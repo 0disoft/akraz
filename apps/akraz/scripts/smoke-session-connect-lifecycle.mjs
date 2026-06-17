@@ -1,6 +1,7 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,156 +12,178 @@ const appPackage = JSON.parse(readFileSync(join(appRoot, "package.json"), "utf8"
 const extension = process.platform === "win32" ? ".exe" : "";
 const daemonExecutable = join(workspaceRoot, "target", "debug", `akraz-daemon${extension}`);
 const ctlExecutable = join(workspaceRoot, "target", "debug", `akrazctl${extension}`);
-const endpoint =
-  process.platform === "win32"
-    ? `\\\\.\\pipe\\akrazd-session-smoke-${process.pid}-${Date.now()}`
-    : join(
-        process.env.XDG_RUNTIME_DIR || process.env.TMPDIR || "/tmp",
-        `akrazd-session-smoke-${process.pid}-${Date.now()}.sock`,
-      );
+const tempDir = mkdtempSync(join(tmpdir(), `akraz-session-smoke-${process.pid}-`));
+const sourceEndpoint = smokeEndpoint("source");
+const targetEndpoint = smokeEndpoint("target");
+const sourceStore = join(tempDir, "source-identity.json");
+const targetStore = join(tempDir, "target-identity.json");
+const sourceDocumentPath = join(tempDir, "source-peer.json");
+const targetDocumentPath = join(tempDir, "target-peer.json");
 
 execFileSync("cargo", ["build", "-p", "akraz-daemon", "-p", "akrazctl"], {
   cwd: workspaceRoot,
   stdio: "inherit",
 });
 
-const peerServer = await startPeerSessionServer();
-const daemon = spawn(daemonExecutable, ["--serve", "--endpoint", endpoint], {
-  cwd: workspaceRoot,
-  stdio: ["ignore", "pipe", "pipe"],
-});
-const daemonOutput = [];
+const sourceIdentity = runCtlDocument([
+  "identity",
+  "show",
+  "--identity-store",
+  sourceStore,
+  "--identity-display-name",
+  "Local Smoke Device",
+]);
+const targetIdentity = runCtlDocument([
+  "identity",
+  "show",
+  "--identity-store",
+  targetStore,
+  "--identity-display-name",
+  "Remote Smoke Device",
+]);
+writeFileSync(sourceDocumentPath, `${JSON.stringify(sourceIdentity, null, 2)}\n`);
+writeFileSync(targetDocumentPath, `${JSON.stringify(targetIdentity, null, 2)}\n`);
+runCtlDocument([
+  "identity",
+  "trust",
+  "--identity-store",
+  sourceStore,
+  "--peer-file",
+  targetDocumentPath,
+]);
+runCtlDocument([
+  "identity",
+  "trust",
+  "--identity-store",
+  targetStore,
+  "--peer-file",
+  sourceDocumentPath,
+]);
 
-daemon.stdout.setEncoding("utf8");
-daemon.stderr.setEncoding("utf8");
-daemon.stdout.on("data", (chunk) => {
-  daemonOutput.push(chunk);
-  process.stdout.write(chunk);
-});
-daemon.stderr.on("data", (chunk) => {
-  daemonOutput.push(chunk);
-  process.stderr.write(chunk);
-});
+const targetDaemon = startDaemon("target", [
+  "--serve",
+  "--endpoint",
+  targetEndpoint,
+  "--identity-store",
+  targetStore,
+  "--peer-listen",
+  "127.0.0.1:0",
+]);
+const sourceDaemon = startDaemon("source", [
+  "--serve",
+  "--endpoint",
+  sourceEndpoint,
+  "--identity-store",
+  sourceStore,
+]);
 
 let disconnected = false;
 
 try {
-  const initial = await waitForDaemonStatus();
-  assertStatusMode(initial, "Local", "initial status");
-  assertPeerCount(initial, 0, "initial status");
+  const targetListenAddress = await waitForPeerListenerAddress(targetDaemon.output);
+  const initialSource = await waitForDaemonStatus(sourceEndpoint, "source initial status");
+  const initialTarget = await waitForDaemonStatus(targetEndpoint, "target initial status");
+  assertStatusMode(initialSource, "Local", "source initial status");
+  assertStatusMode(initialTarget, "Local", "target initial status");
+  assertPeerCount(initialSource, 0, "source initial status");
+  assertPeerCount(initialTarget, 0, "target initial status");
 
-  const connected = runCtlJson([
+  const connected = runCtlJsonRpc([
     "session",
     "connect",
     "--endpoint",
-    endpoint,
+    sourceEndpoint,
     "--peer-id",
-    "loopback-peer",
+    targetIdentity.deviceId,
     "--local-device-id",
-    "local-smoke-device",
+    sourceIdentity.deviceId,
     "--address",
-    peerServer.address,
+    targetListenAddress,
   ]);
-  assertSessionConnected(connected);
+  assertSessionConnected(connected, sourceIdentity.deviceId, targetIdentity.deviceId);
 
-  const afterConnect = runCtlJson(["status", "--endpoint", endpoint]);
-  assertStatusMode(afterConnect, "Local", "connected status");
-  assertPeerCount(afterConnect, 1, "connected status");
-  assertPeer(afterConnect.result.peers[0], true);
+  const afterConnect = runCtlJsonRpc(["status", "--endpoint", sourceEndpoint]);
+  assertStatusMode(afterConnect, "Local", "source connected status");
+  assertPeerCount(afterConnect, 1, "source connected status");
+  assertPeer(afterConnect.result.peers[0], targetIdentity.deviceId, true);
 
-  const disconnectedResponse = runCtlJson(["session", "disconnect", "--endpoint", endpoint]);
+  const disconnectedResponse = runCtlJsonRpc([
+    "session",
+    "disconnect",
+    "--endpoint",
+    sourceEndpoint,
+  ]);
   disconnected = true;
-  assertSessionDisconnected(disconnectedResponse);
+  assertSessionDisconnected(disconnectedResponse, sourceIdentity.deviceId, targetIdentity.deviceId);
 
-  const peerSession = await withTimeout(
-    peerServer.sessionClosed,
-    5_000,
-    "peer session did not close after disconnect",
-  );
-  assertPeerHello(peerSession.hello);
-  if (peerSession.frames.length !== 1) {
-    throw new Error(
-      `session connect lifecycle smoke expected only a hello frame, got ${peerSession.frames.length} frames`,
-    );
-  }
-
-  const afterDisconnect = runCtlJson(["status", "--endpoint", endpoint]);
-  assertStatusMode(afterDisconnect, "Local", "disconnected status");
-  assertPeerCount(afterDisconnect, 0, "disconnected status");
+  const afterDisconnect = runCtlJsonRpc(["status", "--endpoint", sourceEndpoint]);
+  assertStatusMode(afterDisconnect, "Local", "source disconnected status");
+  assertPeerCount(afterDisconnect, 0, "source disconnected status");
 
   console.log("Session connect lifecycle smoke passed.");
 } finally {
   if (!disconnected) {
-    spawnSync(ctlExecutable, ["session", "disconnect", "--endpoint", endpoint], {
+    spawnSync(ctlExecutable, ["session", "disconnect", "--endpoint", sourceEndpoint], {
       cwd: workspaceRoot,
       encoding: "utf8",
     });
   }
-  peerServer.close();
-  if (!daemon.killed) {
-    daemon.kill();
+  stopDaemon(sourceDaemon.process);
+  stopDaemon(targetDaemon.process);
+  await waitForDaemonExit(sourceDaemon.process);
+  await waitForDaemonExit(targetDaemon.process);
+  rmSync(tempDir, { force: true, recursive: true });
+}
+
+function smokeEndpoint(name) {
+  if (process.platform === "win32") {
+    return `\\\\.\\pipe\\akrazd-session-smoke-${name}-${process.pid}-${Date.now()}`;
   }
-  await waitForDaemonExit(daemon);
+
+  return join(
+    process.env.XDG_RUNTIME_DIR || process.env.TMPDIR || "/tmp",
+    `akrazd-session-smoke-${name}-${process.pid}-${Date.now()}.sock`,
+  );
 }
 
-async function startPeerSessionServer() {
-  let listenAddress;
-  const server = createServer();
-  const sessionClosed = new Promise((resolve, reject) => {
-    server.on("connection", (socket) => {
-      const frames = [];
-      let buffer = "";
-      let settled = false;
+function startDaemon(label, args) {
+  const daemon = spawn(daemonExecutable, args, {
+    cwd: workspaceRoot,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const output = [];
 
-      socket.setEncoding("utf8");
-      socket.on("data", (chunk) => {
-        buffer += chunk;
-        while (buffer.includes("\n")) {
-          const newlineIndex = buffer.indexOf("\n");
-          const line = buffer.slice(0, newlineIndex).trim();
-          buffer = buffer.slice(newlineIndex + 1);
-          if (line) {
-            frames.push(JSON.parse(line));
-          }
-        }
-      });
-      socket.on("error", reject);
-      socket.on("close", () => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        resolve({
-          frames,
-          hello: frames[0],
-        });
-      });
-    });
-
-    server.on("error", reject);
+  daemon.stdout.setEncoding("utf8");
+  daemon.stderr.setEncoding("utf8");
+  daemon.stdout.on("data", (chunk) => {
+    output.push(chunk);
+    process.stdout.write(`[${label}] ${chunk}`);
+  });
+  daemon.stderr.on("data", (chunk) => {
+    output.push(chunk);
+    process.stderr.write(`[${label}] ${chunk}`);
   });
 
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      listenAddress = `${address.address}:${address.port}`;
-      resolve();
-    });
-  });
-
-  return {
-    address: listenAddress,
-    sessionClosed,
-    close() {
-      server.close();
-    },
-  };
+  return { process: daemon, output };
 }
 
-async function waitForDaemonStatus(attempt = 0, lastError = "") {
+async function waitForPeerListenerAddress(output, attempt = 0) {
   if (attempt >= 80) {
-    throw new Error(`session connect lifecycle smoke could not reach daemon: ${lastError}`);
+    throw new Error(`session connect lifecycle smoke could not find peer listener address`);
+  }
+  const combined = output.join("");
+  const match = combined.match(/akraz-daemon peer session listener at ([^\r\n]+)/);
+  if (match) {
+    return match[1].trim();
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  return waitForPeerListenerAddress(output, attempt + 1);
+}
+
+async function waitForDaemonStatus(endpoint, label, attempt = 0, lastError = "") {
+  if (attempt >= 80) {
+    throw new Error(`session connect lifecycle smoke could not reach ${label}: ${lastError}`);
   }
 
   const result = spawnSync(ctlExecutable, ["status", "--endpoint", endpoint], {
@@ -168,18 +191,41 @@ async function waitForDaemonStatus(attempt = 0, lastError = "") {
     encoding: "utf8",
   });
   if (result.status === 0) {
-    return parseJsonRpc(result.stdout, "daemon status");
+    return parseJsonRpc(result.stdout, label);
   }
 
   await new Promise((resolve) => setTimeout(resolve, 50));
 
   return waitForDaemonStatus(
+    endpoint,
+    label,
     attempt + 1,
     result.stderr || result.stdout || String(result.error || "unknown error"),
   );
 }
 
-function runCtlJson(args) {
+function runCtlDocument(args) {
+  const result = spawnSync(ctlExecutable, args, {
+    cwd: workspaceRoot,
+    encoding: "utf8",
+  });
+  if (result.stderr) {
+    process.stderr.write(result.stderr);
+  }
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(`akrazctl ${args.join(" ")} failed with exit code ${result.status}`);
+  }
+  if (result.stdout) {
+    process.stdout.write(result.stdout);
+  }
+
+  return JSON.parse(result.stdout);
+}
+
+function runCtlJsonRpc(args) {
   const result = spawnSync(ctlExecutable, args, {
     cwd: workspaceRoot,
     encoding: "utf8",
@@ -235,63 +281,39 @@ function assertPeerCount(response, expected, label) {
   }
 }
 
-function assertPeer(peer, connected) {
-  if (
-    peer?.peerId !== "loopback-peer" ||
-    peer.displayName !== "loopback-peer" ||
-    peer.connected !== connected
-  ) {
+function assertPeer(peer, peerId, connected) {
+  if (peer?.peerId !== peerId || peer.displayName !== peerId || peer.connected !== connected) {
     throw new Error("session connect lifecycle smoke reported unexpected peer status");
   }
 }
 
-function assertSessionConnected(response) {
+function assertSessionConnected(response, localDeviceId, peerId) {
   if (response.result?.connected !== true) {
     throw new Error("session connect lifecycle smoke did not connect the session");
   }
-  assertSessionStatus(response.result.session, true);
+  assertSessionStatus(response.result.session, localDeviceId, peerId, true);
 }
 
-function assertSessionDisconnected(response) {
+function assertSessionDisconnected(response, localDeviceId, peerId) {
   if (response.result?.disconnected !== true || response.result.mode !== "Local") {
     throw new Error("session connect lifecycle smoke did not disconnect the session");
   }
-  assertSessionStatus(response.result.session, false);
+  assertSessionStatus(response.result.session, localDeviceId, peerId, false);
 }
 
-function assertSessionStatus(session, connected) {
+function assertSessionStatus(session, localDeviceId, peerId, connected) {
   if (
-    session?.peerId !== "loopback-peer" ||
-    session.localDeviceId !== "local-smoke-device" ||
+    session?.peerId !== peerId ||
+    session.localDeviceId !== localDeviceId ||
     session.connected !== connected
   ) {
     throw new Error("session connect lifecycle smoke reported unexpected session status");
   }
 }
 
-function assertPeerHello(hello) {
-  if (
-    hello?.kind !== "hello" ||
-    hello.protocol?.major !== 1 ||
-    hello.protocol.minor !== 2 ||
-    hello.deviceId !== "local-smoke-device" ||
-    hello.peerId !== "loopback-peer"
-  ) {
-    throw new Error("session connect lifecycle smoke reported unexpected peer hello frame");
-  }
-}
-
-async function withTimeout(promise, timeoutMs, message) {
-  let timeout;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timeout);
+function stopDaemon(process) {
+  if (!process.killed) {
+    process.kill();
   }
 }
 
