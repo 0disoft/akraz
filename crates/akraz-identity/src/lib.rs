@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const IDENTITY_STORE_VERSION: u32 = 1;
+const PAIRING_IDENTITY_DOCUMENT_KIND: &str = "akraz.peerIdentity";
+const PAIRING_IDENTITY_DOCUMENT_VERSION: u32 = 1;
 const ED25519_SECRET_KEY_LEN: usize = 32;
 const ED25519_PUBLIC_KEY_LEN: usize = 32;
 const FINGERPRINT_BODY_LEN: usize = 32;
@@ -256,7 +258,47 @@ impl FileIdentityStore {
         }
     }
 
+    /// Save or replace one trusted peer identity in the fallback identity file.
+    pub fn save_trusted_peer(&self, peer: &TrustedPeerIdentity) -> Result<(), IdentityStoreError> {
+        let mut stored = self.read_stored_file()?;
+        let stored_peer = StoredTrustedPeerFile::from_identity(peer);
+
+        if let Some(existing) = stored
+            .trusted_peers
+            .iter_mut()
+            .find(|existing| existing.peer_id == stored_peer.peer_id)
+        {
+            *existing = stored_peer;
+        } else {
+            stored.trusted_peers.push(stored_peer);
+        }
+
+        self.write_stored_file(&stored)
+    }
+
+    /// Load a trusted peer verifier by stable peer id.
+    pub fn load_trusted_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<TrustedPeer<Ed25519PublicKey>, IdentityStoreError> {
+        let stored = self.read_stored_file()?;
+        let stored_peer = stored
+            .trusted_peers
+            .into_iter()
+            .find(|peer| peer.peer_id == peer_id)
+            .ok_or_else(|| IdentityStoreError::TrustedPeerNotFound {
+                path: self.path.clone(),
+                peer_id: peer_id.to_string(),
+            })?;
+
+        stored_peer.into_trusted_peer(&self.path)
+    }
+
     fn load_existing(&self) -> Result<StoredLocalIdentity, IdentityStoreError> {
+        self.read_stored_file()?.into_stored_identity(&self.path)
+    }
+
+    fn read_stored_file(&self) -> Result<StoredIdentityFile, IdentityStoreError> {
         reject_identity_path_symlink(&self.path)?;
         let contents = fs::read_to_string(&self.path).map_err(|source| match source.kind() {
             ErrorKind::NotFound => IdentityStoreError::MissingIdentityFile {
@@ -273,7 +315,35 @@ impl FileIdentityStore {
                 source: CorruptIdentityFileSource::Json(source),
             }
         })?;
-        stored.into_stored_identity(&self.path)
+        Ok(stored)
+    }
+
+    fn write_stored_file(&self, stored: &StoredIdentityFile) -> Result<(), IdentityStoreError> {
+        reject_identity_path_symlink(&self.path)?;
+        let mut contents = serde_json::to_vec_pretty(stored).map_err(|source| {
+            IdentityStoreError::EncodeIdentityFile {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        contents.push(b'\n');
+
+        let mut options = OpenOptions::new();
+        options.write(true).truncate(true);
+        set_secret_file_create_mode(&mut options);
+        let mut file =
+            options
+                .open(&self.path)
+                .map_err(|source| IdentityStoreError::WriteIdentityFile {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+        file.write_all(&contents)
+            .map_err(|source| IdentityStoreError::WriteIdentityFile {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     fn create_new_identity(
@@ -332,6 +402,160 @@ impl FileIdentityStore {
     }
 }
 
+/// Public pairing document shared with another device.
+///
+/// This document intentionally contains only public identity material. It is safe to copy between
+/// devices and is the source accepted by `FileIdentityStore::save_trusted_peer` after validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingIdentityDocument {
+    kind: String,
+    version: u32,
+    device_id: String,
+    display_name: String,
+    identity_public_key: String,
+    fingerprint: String,
+    capabilities: CapabilityFlags,
+}
+
+impl PairingIdentityDocument {
+    /// Build a public pairing document from local identity metadata.
+    pub fn from_device_identity(identity: &DeviceIdentity, capabilities: CapabilityFlags) -> Self {
+        Self {
+            kind: PAIRING_IDENTITY_DOCUMENT_KIND.to_string(),
+            version: PAIRING_IDENTITY_DOCUMENT_VERSION,
+            device_id: identity.device_id().to_string(),
+            display_name: identity.display_name().to_string(),
+            identity_public_key: BASE64.encode(identity.identity_public_key()),
+            fingerprint: identity.fingerprint().to_string(),
+            capabilities,
+        }
+    }
+
+    /// Convert a decoded public pairing document into a trusted peer identity.
+    pub fn into_trusted_peer_identity(self) -> Result<TrustedPeerIdentity, IdentityDocumentError> {
+        if self.kind != PAIRING_IDENTITY_DOCUMENT_KIND {
+            return Err(IdentityDocumentError::InvalidKind { actual: self.kind });
+        }
+        if self.version != PAIRING_IDENTITY_DOCUMENT_VERSION {
+            return Err(IdentityDocumentError::UnsupportedVersion {
+                version: self.version,
+            });
+        }
+        let device_id = self.device_id.trim();
+        if device_id.is_empty() {
+            return Err(IdentityDocumentError::EmptyDeviceId);
+        }
+        let public_key = BASE64
+            .decode(self.identity_public_key.as_bytes())
+            .map_err(IdentityDocumentError::InvalidPublicKeyEncoding)?;
+        let public_key = fixed_array::<ED25519_PUBLIC_KEY_LEN>(&public_key)
+            .map_err(|actual| IdentityDocumentError::InvalidPublicKeyLength { actual })?;
+        let expected_fingerprint = fingerprint_for_public_key(&public_key);
+        if self.fingerprint != expected_fingerprint {
+            return Err(IdentityDocumentError::FingerprintMismatch {
+                expected: expected_fingerprint,
+                actual: self.fingerprint,
+            });
+        }
+        Ed25519PublicKey::from_public_key_bytes(&public_key)
+            .map_err(IdentityDocumentError::InvalidPublicKey)?;
+
+        Ok(TrustedPeerIdentity::new(
+            device_id,
+            normalize_display_name(&self.display_name),
+            public_key,
+            expected_fingerprint,
+            CapabilityFlags::from_wire_bits(self.capabilities.bits()),
+        ))
+    }
+
+    /// Stable device id exported by the pairing document.
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    /// Human-readable display name exported by the pairing document.
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    /// User-visible fingerprint exported by the pairing document.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Capability bits exported by the pairing document.
+    pub fn capabilities(&self) -> CapabilityFlags {
+        self.capabilities
+    }
+}
+
+/// Errors produced while validating a public pairing document.
+#[derive(Debug)]
+pub enum IdentityDocumentError {
+    InvalidKind { actual: String },
+    UnsupportedVersion { version: u32 },
+    EmptyDeviceId,
+    InvalidPublicKeyEncoding(data_encoding::DecodeError),
+    InvalidPublicKeyLength { actual: usize },
+    InvalidPublicKey(IdentityKeyError),
+    FingerprintMismatch { expected: String, actual: String },
+}
+
+impl Display for IdentityDocumentError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidKind { actual } => {
+                write!(
+                    formatter,
+                    "invalid pairing identity document kind: {actual}"
+                )
+            }
+            Self::UnsupportedVersion { version } => {
+                write!(
+                    formatter,
+                    "unsupported pairing identity document version: {version}"
+                )
+            }
+            Self::EmptyDeviceId => {
+                formatter.write_str("pairing identity document has empty device id")
+            }
+            Self::InvalidPublicKeyEncoding(_) => {
+                formatter.write_str("pairing identity document public key is not valid base64")
+            }
+            Self::InvalidPublicKeyLength { actual } => write!(
+                formatter,
+                "pairing identity document public key has invalid length: {actual}"
+            ),
+            Self::InvalidPublicKey(source) => {
+                write!(
+                    formatter,
+                    "pairing identity document public key is invalid: {source}"
+                )
+            }
+            Self::FingerprintMismatch { expected, actual } => write!(
+                formatter,
+                "pairing identity document fingerprint mismatch: expected {expected}, got {actual}"
+            ),
+        }
+    }
+}
+
+impl Error for IdentityDocumentError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidPublicKeyEncoding(source) => Some(source),
+            Self::InvalidPublicKey(source) => Some(source),
+            Self::InvalidKind { .. }
+            | Self::UnsupportedVersion { .. }
+            | Self::EmptyDeviceId
+            | Self::InvalidPublicKeyLength { .. }
+            | Self::FingerprintMismatch { .. } => None,
+        }
+    }
+}
+
 /// Errors produced while loading or creating durable identity key material.
 #[derive(Debug)]
 pub enum IdentityStoreError {
@@ -360,6 +584,15 @@ pub enum IdentityStoreError {
     EncodeIdentityFile {
         path: PathBuf,
         source: serde_json::Error,
+    },
+    TrustedPeerNotFound {
+        path: PathBuf,
+        peer_id: String,
+    },
+    InvalidTrustedPeerPublicKey {
+        path: PathBuf,
+        peer_id: String,
+        source: IdentityKeyError,
     },
     CorruptIdentityFile {
         path: PathBuf,
@@ -423,6 +656,24 @@ impl Display for IdentityStoreError {
                     path.display()
                 )
             }
+            Self::TrustedPeerNotFound { path, peer_id } => {
+                write!(
+                    formatter,
+                    "trusted peer {peer_id} was not found in identity file {}",
+                    path.display()
+                )
+            }
+            Self::InvalidTrustedPeerPublicKey {
+                path,
+                peer_id,
+                source,
+            } => {
+                write!(
+                    formatter,
+                    "trusted peer {peer_id} in identity file {} has invalid public key: {source}",
+                    path.display()
+                )
+            }
             Self::CorruptIdentityFile { path, source } => {
                 write!(
                     formatter,
@@ -449,9 +700,11 @@ impl Error for IdentityStoreError {
             | Self::CreateStoreDirectory { source, .. }
             | Self::WriteIdentityFile { source, .. } => Some(source),
             Self::EncodeIdentityFile { source, .. } => Some(source),
+            Self::InvalidTrustedPeerPublicKey { source, .. } => Some(source),
             Self::CorruptIdentityFile { source, .. } => Some(source),
             Self::MissingIdentityFile { .. }
             | Self::IdentityPathIsSymlink { .. }
+            | Self::TrustedPeerNotFound { .. }
             | Self::UnsupportedIdentityFileVersion { .. } => None,
         }
     }
@@ -521,6 +774,8 @@ struct StoredIdentityFile {
     identity_secret_key: String,
     identity_public_key: String,
     fingerprint: String,
+    #[serde(default)]
+    trusted_peers: Vec<StoredTrustedPeerFile>,
 }
 
 impl StoredIdentityFile {
@@ -532,6 +787,7 @@ impl StoredIdentityFile {
             identity_secret_key: BASE64.encode(&secret_key.export_secret_key_bytes()),
             identity_public_key: BASE64.encode(identity.identity_public_key()),
             fingerprint: identity.fingerprint().to_string(),
+            trusted_peers: Vec::new(),
         }
     }
 
@@ -585,6 +841,66 @@ impl StoredIdentityFile {
             expected_fingerprint,
         );
         Ok(StoredLocalIdentity::new(identity, secret_key))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredTrustedPeerFile {
+    peer_id: String,
+    display_name: String,
+    identity_public_key: String,
+    fingerprint: String,
+    capabilities: CapabilityFlags,
+}
+
+impl StoredTrustedPeerFile {
+    fn from_identity(identity: &TrustedPeerIdentity) -> Self {
+        Self {
+            peer_id: identity.peer_id().to_string(),
+            display_name: identity.display_name().to_string(),
+            identity_public_key: BASE64.encode(identity.identity_public_key()),
+            fingerprint: identity.fingerprint().to_string(),
+            capabilities: identity.capabilities(),
+        }
+    }
+
+    fn into_trusted_peer(
+        self,
+        path: &Path,
+    ) -> Result<TrustedPeer<Ed25519PublicKey>, IdentityStoreError> {
+        let public_key = BASE64
+            .decode(self.identity_public_key.as_bytes())
+            .map_err(|source| IdentityStoreError::CorruptIdentityFile {
+                path: path.to_path_buf(),
+                source: CorruptIdentityFileSource::InvalidPublicKeyEncoding(source),
+            })?;
+        let expected_fingerprint = fingerprint_for_public_key(&public_key);
+        if self.fingerprint != expected_fingerprint {
+            return Err(IdentityStoreError::CorruptIdentityFile {
+                path: path.to_path_buf(),
+                source: CorruptIdentityFileSource::FingerprintMismatch {
+                    expected: expected_fingerprint,
+                    actual: self.fingerprint,
+                },
+            });
+        }
+        let verifier = Ed25519PublicKey::from_public_key_bytes(&public_key).map_err(|source| {
+            IdentityStoreError::InvalidTrustedPeerPublicKey {
+                path: path.to_path_buf(),
+                peer_id: self.peer_id.clone(),
+                source,
+            }
+        })?;
+        let identity = TrustedPeerIdentity::new(
+            self.peer_id,
+            normalize_display_name(&self.display_name),
+            public_key,
+            expected_fingerprint,
+            self.capabilities,
+        );
+
+        Ok(TrustedPeer::new(identity, verifier))
     }
 }
 
@@ -892,8 +1208,9 @@ mod tests {
 
     use super::{
         CorruptIdentityFileSource, DeviceIdentity, Ed25519IdentityKey, Ed25519PublicKey,
-        FileIdentityStore, IdentityPublicKey, IdentitySecretKey, IdentityStoreError, LocalIdentity,
-        TrustedPeer, TrustedPeerIdentity, fingerprint_for_public_key,
+        FileIdentityStore, IdentityDocumentError, IdentityPublicKey, IdentitySecretKey,
+        IdentityStoreError, LocalIdentity, PairingIdentityDocument, TrustedPeer,
+        TrustedPeerIdentity, fingerprint_for_public_key,
     };
 
     #[test]
@@ -965,6 +1282,124 @@ mod tests {
             loaded.secret_key().export_secret_key_bytes(),
             created_secret
         );
+
+        remove_identity_path(path);
+    }
+
+    #[test]
+    fn file_identity_store_saves_and_loads_trusted_peer() {
+        let path = unique_identity_path("trusted-peer");
+        let store = FileIdentityStore::new(&path);
+        store
+            .load_or_create("Device A")
+            .expect("created local identity");
+        let peer_secret = Ed25519IdentityKey::generate();
+        let peer_public = peer_secret.public_key_bytes();
+        let peer = TrustedPeerIdentity::new(
+            "device-b",
+            "Device B",
+            peer_public,
+            fingerprint_for_public_key(&peer_public),
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+
+        store.save_trusted_peer(&peer).expect("saved trusted peer");
+        let loaded = store
+            .load_trusted_peer("device-b")
+            .expect("loaded trusted peer");
+
+        assert_eq!(loaded.identity().peer_id(), "device-b");
+        assert_eq!(loaded.identity().display_name(), "Device B");
+        assert_eq!(loaded.identity().identity_public_key(), peer_public);
+        assert_eq!(
+            loaded.identity().capabilities(),
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+        );
+
+        remove_identity_path(path);
+    }
+
+    #[test]
+    fn pairing_identity_document_round_trips_public_identity() {
+        let secret_key = Ed25519IdentityKey::generate();
+        let public_key = secret_key.public_key_bytes();
+        let identity = DeviceIdentity::new(
+            "device-b",
+            "Device B",
+            public_key,
+            fingerprint_for_public_key(&public_key),
+        );
+        let document = PairingIdentityDocument::from_device_identity(
+            &identity,
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+        let encoded = serde_json::to_string(&document).expect("pairing document JSON");
+        let decoded: PairingIdentityDocument =
+            serde_json::from_str(&encoded).expect("decoded pairing document");
+
+        let trusted = decoded
+            .into_trusted_peer_identity()
+            .expect("trusted peer identity");
+
+        assert_eq!(trusted.peer_id(), "device-b");
+        assert_eq!(trusted.display_name(), "Device B");
+        assert_eq!(trusted.identity_public_key(), public_key);
+        assert_eq!(
+            trusted.fingerprint(),
+            fingerprint_for_public_key(&public_key)
+        );
+        assert_eq!(
+            trusted.capabilities(),
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+        );
+        assert!(!encoded.contains("identitySecretKey"));
+    }
+
+    #[test]
+    fn pairing_identity_document_rejects_tampered_fingerprint() {
+        let secret_key = Ed25519IdentityKey::generate();
+        let public_key = secret_key.public_key_bytes();
+        let identity = DeviceIdentity::new(
+            "device-b",
+            "Device B",
+            public_key,
+            fingerprint_for_public_key(&public_key),
+        );
+        let document =
+            PairingIdentityDocument::from_device_identity(&identity, CapabilityFlags::POINTER);
+        let mut value = serde_json::to_value(&document).expect("pairing document value");
+        value["fingerprint"] = Value::String("AKRZ-TAMP-ERED-DOCS-0000-0000-0000-0000-0000".into());
+        let tampered: PairingIdentityDocument =
+            serde_json::from_value(value).expect("tampered pairing document");
+
+        let error = tampered
+            .into_trusted_peer_identity()
+            .expect_err("tampered fingerprint should fail");
+
+        assert!(matches!(
+            error,
+            IdentityDocumentError::FingerprintMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn file_identity_store_rejects_missing_trusted_peer() {
+        let path = unique_identity_path("missing-trusted-peer");
+        let store = FileIdentityStore::new(&path);
+        store
+            .load_or_create("Device A")
+            .expect("created local identity");
+
+        let error = store
+            .load_trusted_peer("device-b")
+            .expect_err("missing trusted peer should fail");
+
+        match error {
+            IdentityStoreError::TrustedPeerNotFound { peer_id, .. } => {
+                assert_eq!(peer_id, "device-b");
+            }
+            other => panic!("expected missing trusted peer error, got {other:?}"),
+        }
 
         remove_identity_path(path);
     }

@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,10 @@ use akraz_core::{
     CapturedInputEvent, ControlMode, CoreAction, CoreTransitionError, DeviceId, EdgeCrossing,
     InjectedInputEvent, LogicalPoint, MouseButton, PeerId, PhysicalKey, PressState, RuntimeEvent,
     RuntimeInputState, ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
+};
+use akraz_identity::{
+    Ed25519PublicKey, FileIdentityStore, IdentityPublicKey, IdentitySecretKey, LocalIdentity,
+    TrustedPeer,
 };
 use akraz_ipc::{
     ControlModeSnapshot, DaemonStatus, InputReleaseAllResult, IpcCodecError,
@@ -26,7 +31,11 @@ use akraz_platform::{
     DesktopGeometry, InputCaptureConfig, InputCapturePolicy, InputCaptureSession, PlatformAdapter,
     PlatformError,
 };
-use akraz_protocol::ProtocolVersion;
+use akraz_protocol::{
+    AuthProof, AuthTranscript, CapabilityFlags, HANDSHAKE_NONCE_LEN, PeerRole, ProtocolVersion,
+    SessionReady, TLS_EXPORTER_LEN,
+};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 /// Current daemon package version.
@@ -37,6 +46,38 @@ const DEFAULT_CAPTURE_DRAIN_BATCH_SIZE: usize = 64;
 const DEFAULT_CAPTURE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_PEER_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_PEER_SESSION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
+const PRE_TLS_REMOTE_NONCE: [u8; HANDSHAKE_NONCE_LEN] = [0; HANDSHAKE_NONCE_LEN];
+const PRE_TLS_EXPORTER: [u8; TLS_EXPORTER_LEN] = [0; TLS_EXPORTER_LEN];
+
+fn peer_session_capabilities() -> CapabilityFlags {
+    CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+}
+
+fn generate_peer_session_nonce() -> [u8; HANDSHAKE_NONCE_LEN] {
+    let mut nonce = [0; HANDSHAKE_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
+fn build_pre_tls_initiator_auth_transcript(
+    local_device_id: impl Into<String>,
+    remote_device_id: impl Into<String>,
+    local_nonce: [u8; HANDSHAKE_NONCE_LEN],
+    local_capabilities: CapabilityFlags,
+    remote_capabilities: CapabilityFlags,
+) -> AuthTranscript {
+    AuthTranscript {
+        local_device_id: local_device_id.into(),
+        remote_device_id: remote_device_id.into(),
+        local_nonce,
+        remote_nonce: PRE_TLS_REMOTE_NONCE,
+        protocol: ProtocolVersion::CURRENT,
+        local_capabilities,
+        remote_capabilities,
+        role: PeerRole::Initiator,
+        tls_exporter: PRE_TLS_EXPORTER,
+    }
+}
 
 /// Shared daemon runtime state observed by IPC and capture workers.
 pub type SharedRuntimeInputState = Arc<Mutex<RuntimeInputState>>;
@@ -299,9 +340,100 @@ impl TcpPeerSessionTransport {
             protocol: PeerTransportProtocolVersion::current(),
             device_id: local_device_id.as_str().to_string(),
             peer_id: peer_id.as_str().to_string(),
+            nonce: None,
+            capabilities: peer_session_capabilities(),
         };
 
         write_peer_transport_session_frame(&mut stream, &hello)?;
+
+        let stream = Arc::new(Mutex::new(TcpPeerSessionStreamState::new(stream)));
+        let heartbeat_worker = TcpPeerSessionHeartbeatWorker::start(
+            peer_id.clone(),
+            address,
+            Arc::clone(&stream),
+            DEFAULT_PEER_SESSION_HEARTBEAT_INTERVAL,
+        );
+
+        Ok(Self {
+            peer_id,
+            local_device_id,
+            address,
+            stream,
+            _heartbeat_worker: heartbeat_worker,
+        })
+    }
+
+    /// Connect to a paired peer and send the authenticated session prelude before input frames.
+    pub fn connect_authenticated<S>(
+        peer_id: PeerId,
+        local_identity: &LocalIdentity<S>,
+        address: SocketAddr,
+        trusted_peer: &TrustedPeer<Ed25519PublicKey>,
+    ) -> Result<Self, PlatformError>
+    where
+        S: IdentitySecretKey,
+        S::Error: Display,
+    {
+        if trusted_peer.identity().peer_id() != peer_id.as_str() {
+            return Err(PlatformError::new(format!(
+                "trusted peer id {} does not match requested peer {}",
+                trusted_peer.identity().peer_id(),
+                peer_id.as_str()
+            )));
+        }
+
+        let local_device_id = DeviceId::new(local_identity.identity().device_id());
+        let local_nonce = generate_peer_session_nonce();
+        let local_capabilities = peer_session_capabilities();
+        let remote_capabilities = trusted_peer.identity().capabilities();
+        let transcript = build_pre_tls_initiator_auth_transcript(
+            local_identity.identity().device_id(),
+            trusted_peer.identity().peer_id(),
+            local_nonce,
+            local_capabilities,
+            remote_capabilities,
+        );
+        let proof = local_identity
+            .sign_auth_proof(PeerRole::Initiator, &transcript)
+            .map_err(|error| {
+                PlatformError::new(format!(
+                    "failed to sign peer session auth proof for {}: {error}",
+                    peer_id.as_str()
+                ))
+            })?;
+
+        let mut stream = TcpStream::connect(address).map_err(|error| {
+            PlatformError::new(format!(
+                "failed to connect peer session {} at {}: {error}",
+                peer_id.as_str(),
+                address
+            ))
+        })?;
+        let hello = PeerTransportSessionFrame::Hello {
+            protocol: PeerTransportProtocolVersion::current(),
+            device_id: local_identity.identity().device_id().to_string(),
+            peer_id: peer_id.as_str().to_string(),
+            nonce: Some(local_nonce),
+            capabilities: local_capabilities,
+        };
+        let ready = PeerTransportSessionFrame::SessionReady {
+            ready: SessionReady {
+                session_id: format!(
+                    "{}->{}",
+                    local_identity.identity().device_id(),
+                    trusted_peer.identity().peer_id()
+                ),
+                sequence_base: 0,
+                capabilities: local_capabilities.intersection(remote_capabilities),
+            },
+        };
+
+        write_peer_transport_session_frame(&mut stream, &hello)?;
+        write_peer_transport_session_frame(
+            &mut stream,
+            &PeerTransportSessionFrame::AuthProof { proof },
+        )?;
+        write_peer_transport_session_frame(&mut stream, &ready)?;
 
         let stream = Arc::new(Mutex::new(TcpPeerSessionStreamState::new(stream)));
         let heartbeat_worker = TcpPeerSessionHeartbeatWorker::start(
@@ -439,12 +571,33 @@ impl DaemonPeerTransport for TcpPeerSessionTransport {
 #[derive(Debug, Default, Clone)]
 pub struct ManagedPeerSessionTransport {
     active_session: Arc<Mutex<Option<TcpPeerSessionTransport>>>,
+    auth_config: Option<ManagedPeerSessionAuthConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedPeerSessionAuthConfig {
+    identity_store: PathBuf,
+    identity_display_name: String,
 }
 
 impl ManagedPeerSessionTransport {
     /// Create an empty managed peer session transport.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an empty managed peer session transport backed by paired identity storage.
+    pub fn with_identity_store(
+        identity_store: impl Into<PathBuf>,
+        identity_display_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            active_session: Arc::new(Mutex::new(None)),
+            auth_config: Some(ManagedPeerSessionAuthConfig {
+                identity_store: identity_store.into(),
+                identity_display_name: identity_display_name.into(),
+            }),
+        }
     }
 
     /// Return whether a peer session is currently active.
@@ -477,6 +630,56 @@ impl ManagedPeerSessionTransport {
 
         *active_session = Some(session);
         Ok(())
+    }
+
+    /// Connect and attach a peer session using the manager's configured security boundary.
+    pub fn connect_session(
+        &self,
+        peer_id: PeerId,
+        local_device_id: DeviceId,
+        address: SocketAddr,
+    ) -> Result<(), PlatformError> {
+        let session = match &self.auth_config {
+            Some(auth_config) => {
+                let store = FileIdentityStore::new(&auth_config.identity_store);
+                let local = store
+                    .load_or_create(&auth_config.identity_display_name)
+                    .map_err(|error| {
+                        PlatformError::new(format!(
+                            "failed to load identity store {}: {error}",
+                            auth_config.identity_store.display()
+                        ))
+                    })?
+                    .into_local_identity();
+                if local.identity().device_id() != local_device_id.as_str() {
+                    return Err(PlatformError::new(format!(
+                        "session local device id {} does not match identity store device id {}",
+                        local_device_id.as_str(),
+                        local.identity().device_id()
+                    )));
+                }
+                let trusted_peer = store.load_trusted_peer(peer_id.as_str()).map_err(|error| {
+                    PlatformError::new(format!(
+                        "failed to load trusted peer {} from {}: {error}",
+                        peer_id.as_str(),
+                        auth_config.identity_store.display()
+                    ))
+                })?;
+                TcpPeerSessionTransport::connect_authenticated(
+                    peer_id,
+                    &local,
+                    address,
+                    &trusted_peer,
+                )?
+            }
+            None => {
+                return Err(PlatformError::new(
+                    "managed peer session requires identity store before session.connect",
+                ));
+            }
+        };
+
+        self.attach_session(session)
     }
 
     /// Disconnect the active peer session and return the detached session snapshot.
@@ -544,6 +747,8 @@ pub struct PeerTransportSessionHello {
     pub protocol: ProtocolVersion,
     pub device_id: DeviceId,
     pub peer_id: PeerId,
+    pub nonce: Option<[u8; HANDSHAKE_NONCE_LEN]>,
+    pub capabilities: CapabilityFlags,
 }
 
 /// Result of executing one remote peer command against a platform adapter.
@@ -726,6 +931,35 @@ where
     execute_peer_transport_session_stream_until_closed(&mut reader, platform)
 }
 
+/// Execute an authenticated TCP peer transport session with an explicit heartbeat timeout.
+pub fn execute_paired_tcp_peer_transport_session_until_closed_with_timeout<P, F>(
+    stream: TcpStream,
+    platform: &P,
+    heartbeat_timeout: Duration,
+    local_device_id: &DeviceId,
+    trusted_peer_lookup: F,
+) -> Result<PeerTransportSessionExecution, PlatformError>
+where
+    P: PlatformAdapter,
+    F: FnOnce(&DeviceId) -> Result<TrustedPeer<Ed25519PublicKey>, PlatformError>,
+{
+    stream
+        .set_read_timeout(Some(heartbeat_timeout))
+        .map_err(|error| {
+            PlatformError::new(format!(
+                "failed to configure peer session heartbeat timeout: {error}"
+            ))
+        })?;
+    let mut reader = BufReader::new(stream);
+
+    execute_paired_peer_transport_session_stream_until_closed(
+        &mut reader,
+        platform,
+        local_device_id,
+        trusted_peer_lookup,
+    )
+}
+
 /// Execute a decoded peer transport session from any buffered stream until EOF.
 pub fn execute_peer_transport_session_stream_until_closed<R, P>(
     reader: &mut R,
@@ -736,6 +970,99 @@ where
     P: PlatformAdapter,
 {
     let hello = read_peer_transport_session_hello(reader)?;
+    execute_peer_transport_session_frames_until_closed(reader, platform, hello)
+}
+
+/// Execute a decoded authenticated peer transport session after proving the trusted peer identity.
+pub fn execute_authenticated_peer_transport_session_stream_until_closed<R, P, V>(
+    reader: &mut R,
+    platform: &P,
+    trusted_peer: &TrustedPeer<V>,
+    expected_role: PeerRole,
+    transcript: &AuthTranscript,
+) -> Result<PeerTransportSessionExecution, PlatformError>
+where
+    R: BufRead,
+    P: PlatformAdapter,
+    V: IdentityPublicKey,
+    V::Error: Display,
+{
+    let hello = read_peer_transport_session_hello(reader)?;
+    let proof = read_peer_transport_session_auth_proof(reader)?;
+    trusted_peer
+        .verify_auth_proof(expected_role, transcript, &proof)
+        .map_err(|error| {
+            PlatformError::new(format!(
+                "peer session auth proof rejected for {} ({}): {error}",
+                trusted_peer.identity().peer_id(),
+                trusted_peer.identity().fingerprint()
+            ))
+        })?;
+    let ready = read_peer_transport_session_ready(reader)?;
+    if ready.sequence_base != 0 {
+        return Err(PlatformError::new(format!(
+            "peer session sequence base {} is not supported yet",
+            ready.sequence_base
+        )));
+    }
+
+    execute_peer_transport_session_frames_until_closed(reader, platform, hello)
+}
+
+/// Execute a paired peer session by resolving the trusted sender from the opening hello frame.
+pub fn execute_paired_peer_transport_session_stream_until_closed<R, P, F>(
+    reader: &mut R,
+    platform: &P,
+    local_device_id: &DeviceId,
+    trusted_peer_lookup: F,
+) -> Result<PeerTransportSessionExecution, PlatformError>
+where
+    R: BufRead,
+    P: PlatformAdapter,
+    F: FnOnce(&DeviceId) -> Result<TrustedPeer<Ed25519PublicKey>, PlatformError>,
+{
+    let hello = read_peer_transport_session_hello(reader)?;
+    let trusted_peer = trusted_peer_lookup(&hello.device_id)?;
+    let nonce = hello
+        .nonce
+        .ok_or_else(|| PlatformError::new("peer session hello is missing authentication nonce"))?;
+    let transcript = build_pre_tls_initiator_auth_transcript(
+        hello.device_id.as_str(),
+        local_device_id.as_str(),
+        nonce,
+        hello.capabilities,
+        peer_session_capabilities(),
+    );
+    let proof = read_peer_transport_session_auth_proof(reader)?;
+    trusted_peer
+        .verify_auth_proof(PeerRole::Initiator, &transcript, &proof)
+        .map_err(|error| {
+            PlatformError::new(format!(
+                "peer session auth proof rejected for {} ({}): {error}",
+                trusted_peer.identity().peer_id(),
+                trusted_peer.identity().fingerprint()
+            ))
+        })?;
+    let ready = read_peer_transport_session_ready(reader)?;
+    if ready.sequence_base != 0 {
+        return Err(PlatformError::new(format!(
+            "peer session sequence base {} is not supported yet",
+            ready.sequence_base
+        )));
+    }
+
+    execute_peer_transport_session_frames_until_closed(reader, platform, hello)
+}
+
+fn execute_peer_transport_session_frames_until_closed<R, P>(
+    reader: &mut R,
+    platform: &P,
+    hello: PeerTransportSessionHello,
+) -> Result<PeerTransportSessionExecution, PlatformError>
+where
+    R: BufRead,
+    P: PlatformAdapter,
+{
     let mut outcomes = Vec::new();
     let mut needs_release_on_close = false;
     let mut sequence = PeerTransportSessionSequence::new();
@@ -793,6 +1120,24 @@ where
                     needs_release_on_close,
                     PlatformError::new(
                         "peer session received duplicate hello frame after session start",
+                    ),
+                ));
+            }
+            Some(PeerTransportSessionFrame::AuthProof { .. }) => {
+                return Err(release_peer_transport_inputs_after_error(
+                    platform,
+                    needs_release_on_close,
+                    PlatformError::new(
+                        "peer session received duplicate auth proof frame after session start",
+                    ),
+                ));
+            }
+            Some(PeerTransportSessionFrame::SessionReady { .. }) => {
+                return Err(release_peer_transport_inputs_after_error(
+                    platform,
+                    needs_release_on_close,
+                    PlatformError::new(
+                        "peer session received duplicate session ready frame after session start",
                     ),
                 ));
             }
@@ -956,19 +1301,71 @@ where
             protocol,
             device_id,
             peer_id,
+            nonce,
+            capabilities,
         } => {
             let version = protocol_version_from_wire(protocol)?;
             Ok(PeerTransportSessionHello {
                 protocol: version,
                 device_id: DeviceId::new(device_id),
                 peer_id: PeerId::new(peer_id),
+                nonce,
+                capabilities,
             })
         }
         PeerTransportSessionFrame::Command { .. } => Err(PlatformError::new(
             "peer session expected hello frame before command frames",
         )),
+        PeerTransportSessionFrame::AuthProof { .. } => Err(PlatformError::new(
+            "peer session expected hello frame before auth proof frames",
+        )),
+        PeerTransportSessionFrame::SessionReady { .. } => Err(PlatformError::new(
+            "peer session expected hello frame before session ready frames",
+        )),
         PeerTransportSessionFrame::Heartbeat { .. } => Err(PlatformError::new(
             "peer session expected hello frame before heartbeat frames",
+        )),
+    }
+}
+
+fn read_peer_transport_session_auth_proof<R>(reader: &mut R) -> Result<AuthProof, PlatformError>
+where
+    R: BufRead,
+{
+    match read_peer_transport_session_frame(reader)? {
+        PeerTransportSessionFrame::AuthProof { proof } => Ok(proof),
+        PeerTransportSessionFrame::Hello { .. } => Err(PlatformError::new(
+            "peer session received duplicate hello frame before auth proof",
+        )),
+        PeerTransportSessionFrame::SessionReady { .. } => Err(PlatformError::new(
+            "peer session expected auth proof frame before session ready frames",
+        )),
+        PeerTransportSessionFrame::Command { .. } => Err(PlatformError::new(
+            "peer session expected auth proof frame before command frames",
+        )),
+        PeerTransportSessionFrame::Heartbeat { .. } => Err(PlatformError::new(
+            "peer session expected auth proof frame before heartbeat frames",
+        )),
+    }
+}
+
+fn read_peer_transport_session_ready<R>(reader: &mut R) -> Result<SessionReady, PlatformError>
+where
+    R: BufRead,
+{
+    match read_peer_transport_session_frame(reader)? {
+        PeerTransportSessionFrame::SessionReady { ready } => Ok(ready),
+        PeerTransportSessionFrame::Hello { .. } => Err(PlatformError::new(
+            "peer session received duplicate hello frame before session ready",
+        )),
+        PeerTransportSessionFrame::AuthProof { .. } => Err(PlatformError::new(
+            "peer session received duplicate auth proof frame before session ready",
+        )),
+        PeerTransportSessionFrame::Command { .. } => Err(PlatformError::new(
+            "peer session expected session ready frame before command frames",
+        )),
+        PeerTransportSessionFrame::Heartbeat { .. } => Err(PlatformError::new(
+            "peer session expected session ready frame before heartbeat frames",
         )),
     }
 }
@@ -992,6 +1389,16 @@ where
             PeerTransportSessionFrame::Hello { .. } => {
                 return Err(PlatformError::new(
                     "peer session received duplicate hello frame after session start",
+                ));
+            }
+            PeerTransportSessionFrame::AuthProof { .. } => {
+                return Err(PlatformError::new(
+                    "peer session received auth proof frame after session start",
+                ));
+            }
+            PeerTransportSessionFrame::SessionReady { .. } => {
+                return Err(PlatformError::new(
+                    "peer session received session ready frame after session start",
                 ));
             }
             PeerTransportSessionFrame::Heartbeat {
@@ -1113,6 +1520,16 @@ pub enum PeerTransportSessionFrame {
         protocol: PeerTransportProtocolVersion,
         device_id: String,
         peer_id: String,
+        #[serde(default)]
+        nonce: Option<[u8; HANDSHAKE_NONCE_LEN]>,
+        #[serde(default)]
+        capabilities: CapabilityFlags,
+    },
+    AuthProof {
+        proof: AuthProof,
+    },
+    SessionReady {
+        ready: SessionReady,
     },
     Command {
         sequence: u64,
@@ -2045,9 +2462,8 @@ pub fn connect_peer_session(
     let peer_id = parse_non_empty_peer_id(&params.peer_id)?;
     let local_device_id = parse_non_empty_device_id(&params.local_device_id)?;
     let address = parse_peer_session_address(&params.address)?;
-    let session = TcpPeerSessionTransport::connect(peer_id, local_device_id, address)?;
 
-    peer_sessions.attach_session(session)?;
+    peer_sessions.connect_session(peer_id, local_device_id, address)?;
 
     let snapshot = peer_sessions
         .active_session()?
@@ -2233,35 +2649,43 @@ mod tests {
         PeerId, PhysicalKey, PressState, RuntimeEvent, RuntimeInputState, ScreenEdge,
         ScreenEdgeBinding, ScreenLayout, SessionId,
     };
+    use akraz_identity::{
+        DeviceIdentity, Ed25519IdentityKey, Ed25519PublicKey, LocalIdentity, TrustedPeer,
+        TrustedPeerIdentity, fingerprint_for_public_key,
+    };
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, DaemonStatusParams, InputReleaseAllParams,
         InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities, JsonRpcFailure,
         JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_STATUS,
-        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
-        OsLocalIpcClient, PeerStatus, SessionConnectParams, SessionConnectResult,
-        SessionDisconnectParams, SessionDisconnectResult, SessionStatus, call_json_rpc,
-        to_json_line,
+        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, OsLocalIpcClient, SessionConnectParams,
+        SessionDisconnectResult, SessionStatus, call_json_rpc, to_json_line,
     };
     use akraz_platform::{
         DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, InputCapturePolicy,
         PlatformAdapter, PlatformCapabilities, PlatformError,
+    };
+    use akraz_protocol::{
+        AuthTranscript, CapabilityFlags, HANDSHAKE_NONCE_LEN, PeerRole, ProtocolVersion,
+        SessionReady, TLS_EXPORTER_LEN,
     };
     use serde_json::json;
 
     use super::{
         CapturedInputRouter, CoreActionDispatcher, DAEMON_VERSION, DaemonInputCaptureConfig,
         DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer, DaemonPeerTransport,
-        DaemonTransportCommand, LocalPlatformCoreActionDispatcher, LoopbackPeerTransport,
-        ManagedPeerSessionSnapshot, ManagedPeerSessionTransport, NoopCoreActionDispatcher,
-        PeerTransportCommandExecution, PeerTransportCommandPayload, PeerTransportInputEvent,
-        PeerTransportMessage, PeerTransportProtocolVersion, PeerTransportSessionFrame,
-        TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher,
-        apply_routed_capture_event_to_state, build_daemon_status,
-        build_daemon_status_with_peer_sessions, build_permissions_probe, connect_peer_session,
-        disconnect_peer_session, drain_capture_events, execute_peer_transport_command,
-        execute_peer_transport_session_stream_until_closed, handle_ipc_request_line,
-        input_capture_policy_for_control_mode, recover_local_control_and_release_inputs,
-        serve_daemon_ipc, serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
+        DaemonTransportCommand, JSONRPC_DAEMON_ERROR, LocalPlatformCoreActionDispatcher,
+        LoopbackPeerTransport, ManagedPeerSessionSnapshot, ManagedPeerSessionTransport,
+        NoopCoreActionDispatcher, PeerTransportCommandExecution, PeerTransportCommandPayload,
+        PeerTransportInputEvent, PeerTransportMessage, PeerTransportProtocolVersion,
+        PeerTransportSessionFrame, TcpPeerSessionTransport, TcpPeerTransport,
+        TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
+        build_permissions_probe, connect_peer_session, disconnect_peer_session,
+        drain_capture_events, execute_authenticated_peer_transport_session_stream_until_closed,
+        execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
+        execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
+        handle_ipc_request_line, input_capture_policy_for_control_mode,
+        recover_local_control_and_release_inputs, serve_daemon_ipc,
+        serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
         serve_tcp_peer_transport_session_and_execute,
         serve_tcp_peer_transport_session_and_execute_until_closed,
         serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout,
@@ -2325,6 +2749,8 @@ mod tests {
             },
             device_id: "windows-desktop".to_string(),
             peer_id: "right-peer".to_string(),
+            nonce: Some([1; HANDSHAKE_NONCE_LEN]),
+            capabilities: super::peer_session_capabilities(),
         }
     }
 
@@ -2340,6 +2766,114 @@ mod tests {
         command: PeerTransportCommandPayload,
     ) -> PeerTransportSessionFrame {
         PeerTransportSessionFrame::Command { sequence, command }
+    }
+
+    fn peer_session_auth_fixture() -> (
+        LocalIdentity<Ed25519IdentityKey>,
+        TrustedPeer<Ed25519PublicKey>,
+        AuthTranscript,
+    ) {
+        let secret_key = Ed25519IdentityKey::generate();
+        let public_key = secret_key.public_key_bytes();
+        let fingerprint = fingerprint_for_public_key(&public_key);
+        let local = LocalIdentity::new(
+            DeviceIdentity::new(
+                "windows-desktop",
+                "Windows Desktop",
+                public_key,
+                fingerprint.clone(),
+            ),
+            secret_key,
+        );
+        let trusted = TrustedPeer::new(
+            TrustedPeerIdentity::new(
+                "windows-desktop",
+                "Windows Desktop",
+                public_key,
+                fingerprint,
+                CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            ),
+            Ed25519PublicKey::from_public_key_bytes(&public_key).expect("trusted public key"),
+        );
+        let transcript = AuthTranscript {
+            local_device_id: "windows-desktop".to_string(),
+            remote_device_id: "right-peer".to_string(),
+            local_nonce: [1; HANDSHAKE_NONCE_LEN],
+            remote_nonce: [2; HANDSHAKE_NONCE_LEN],
+            protocol: ProtocolVersion::CURRENT,
+            local_capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            remote_capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            role: PeerRole::Initiator,
+            tls_exporter: [3; TLS_EXPORTER_LEN],
+        };
+
+        (local, trusted, transcript)
+    }
+
+    fn peer_session_pair_auth_fixture() -> (
+        LocalIdentity<Ed25519IdentityKey>,
+        TrustedPeer<Ed25519PublicKey>,
+        TrustedPeer<Ed25519PublicKey>,
+    ) {
+        let source_secret = Ed25519IdentityKey::generate();
+        let source_public = source_secret.public_key_bytes();
+        let source_fingerprint = fingerprint_for_public_key(&source_public);
+        let source = LocalIdentity::new(
+            DeviceIdentity::new(
+                "windows-desktop",
+                "Windows Desktop",
+                source_public,
+                source_fingerprint.clone(),
+            ),
+            source_secret,
+        );
+
+        let target_secret = Ed25519IdentityKey::generate();
+        let target_public = target_secret.public_key_bytes();
+        let target_fingerprint = fingerprint_for_public_key(&target_public);
+        let trusted_target = TrustedPeer::new(
+            TrustedPeerIdentity::new(
+                "right-peer",
+                "Right Peer",
+                target_public,
+                target_fingerprint,
+                super::peer_session_capabilities(),
+            ),
+            Ed25519PublicKey::from_public_key_bytes(&target_public).expect("target public key"),
+        );
+        let trusted_source = TrustedPeer::new(
+            TrustedPeerIdentity::new(
+                "windows-desktop",
+                "Windows Desktop",
+                source_public,
+                source_fingerprint,
+                super::peer_session_capabilities(),
+            ),
+            Ed25519PublicKey::from_public_key_bytes(&source_public).expect("source public key"),
+        );
+
+        (source, trusted_target, trusted_source)
+    }
+
+    fn peer_session_auth_proof_frame(
+        local: &LocalIdentity<Ed25519IdentityKey>,
+        transcript: &AuthTranscript,
+    ) -> PeerTransportSessionFrame {
+        PeerTransportSessionFrame::AuthProof {
+            proof: local
+                .sign_auth_proof(PeerRole::Initiator, transcript)
+                .expect("auth proof"),
+        }
+    }
+
+    fn peer_session_ready_frame() -> PeerTransportSessionFrame {
+        PeerTransportSessionFrame::SessionReady {
+            ready: SessionReady {
+                session_id: "loopback-session".to_string(),
+                sequence_base: 0,
+                capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            },
+        }
     }
 
     #[cfg(unix)]
@@ -2441,7 +2975,7 @@ mod tests {
         assert_eq!(status.daemon_version, DAEMON_VERSION);
         assert_eq!(status.mode, ControlModeSnapshot::from(ControlMode::Local));
         assert_eq!(status.protocol.major, 1);
-        assert_eq!(status.protocol.minor, 2);
+        assert_eq!(status.protocol.minor, 4);
         assert!(status.peers.is_empty());
         assert_eq!(
             status.capabilities,
@@ -2831,7 +3365,7 @@ mod tests {
     #[test]
     fn peer_transport_message_rejects_unknown_wire_values() {
         let message = PeerTransportMessage {
-            protocol: super::PeerTransportProtocolVersion { major: 1, minor: 2 },
+            protocol: super::PeerTransportProtocolVersion { major: 1, minor: 4 },
             command: super::PeerTransportCommandPayload::ForwardInput {
                 event: super::PeerTransportInputEvent::Key {
                     key: "notARealKey".to_string(),
@@ -3014,6 +3548,16 @@ mod tests {
                     Some(PeerTransportSessionFrame::Hello { .. }) => {
                         return Err(PlatformError::new(
                             "test peer received duplicate hello before heartbeat",
+                        ));
+                    }
+                    Some(PeerTransportSessionFrame::AuthProof { .. }) => {
+                        return Err(PlatformError::new(
+                            "test peer received auth proof before heartbeat",
+                        ));
+                    }
+                    Some(PeerTransportSessionFrame::SessionReady { .. }) => {
+                        return Err(PlatformError::new(
+                            "test peer received session ready before heartbeat",
                         ));
                     }
                     None => {
@@ -3596,6 +4140,233 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_peer_session_executor_applies_commands_after_auth_ready() {
+        let platform = FakePlatformAdapter::default();
+        let (local, trusted, transcript) = peer_session_auth_fixture();
+        let forward_frame = peer_session_command_frame(
+            0,
+            PeerTransportCommandPayload::ForwardInput {
+                event: PeerTransportInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            },
+        );
+        let mut stream = String::new();
+        stream.push_str(&peer_session_frame_line(&peer_session_hello_frame()));
+        stream.push_str(&peer_session_frame_line(&peer_session_auth_proof_frame(
+            &local,
+            &transcript,
+        )));
+        stream.push_str(&peer_session_frame_line(&peer_session_ready_frame()));
+        stream.push_str(&peer_session_frame_line(&forward_frame));
+        let mut reader = std::io::Cursor::new(stream.into_bytes());
+
+        let execution = execute_authenticated_peer_transport_session_stream_until_closed(
+            &mut reader,
+            &platform,
+            &trusted,
+            PeerRole::Initiator,
+            &transcript,
+        )
+        .expect("authenticated peer session execution");
+
+        assert_eq!(
+            execution.outcomes,
+            vec![
+                PeerTransportCommandExecution::InputForwarded {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 8,
+                        delta_y: 2,
+                    },
+                },
+                PeerTransportCommandExecution::InputsReleased,
+            ]
+        );
+        assert_eq!(
+            platform.injected_events().expect("fake injected events"),
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }]
+        );
+        assert_eq!(
+            platform
+                .release_all_count()
+                .expect("fake release all count"),
+            1
+        );
+    }
+
+    #[test]
+    fn authenticated_peer_session_executor_rejects_command_before_auth_proof() {
+        let platform = FakePlatformAdapter::default();
+        let (_, trusted, transcript) = peer_session_auth_fixture();
+        let forward_frame = peer_session_command_frame(
+            0,
+            PeerTransportCommandPayload::ForwardInput {
+                event: PeerTransportInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            },
+        );
+        let mut stream = String::new();
+        stream.push_str(&peer_session_frame_line(&peer_session_hello_frame()));
+        stream.push_str(&peer_session_frame_line(&forward_frame));
+        let mut reader = std::io::Cursor::new(stream.into_bytes());
+
+        let error = execute_authenticated_peer_transport_session_stream_until_closed(
+            &mut reader,
+            &platform,
+            &trusted,
+            PeerRole::Initiator,
+            &transcript,
+        )
+        .expect_err("command before auth proof should fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "peer session expected auth proof frame before command frames"
+        );
+        assert_eq!(
+            platform.injected_events().expect("fake injected events"),
+            Vec::<InjectedInputEvent>::new()
+        );
+        assert_eq!(
+            platform
+                .release_all_count()
+                .expect("fake release all count"),
+            0
+        );
+    }
+
+    #[test]
+    fn authenticated_peer_session_executor_rejects_invalid_auth_proof_before_input() {
+        let platform = FakePlatformAdapter::default();
+        let (local, trusted, transcript) = peer_session_auth_fixture();
+        let mut proof = local
+            .sign_auth_proof(PeerRole::Initiator, &transcript)
+            .expect("auth proof");
+        proof.signature.push(0);
+        let forward_frame = peer_session_command_frame(
+            0,
+            PeerTransportCommandPayload::ForwardInput {
+                event: PeerTransportInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            },
+        );
+        let mut stream = String::new();
+        stream.push_str(&peer_session_frame_line(&peer_session_hello_frame()));
+        stream.push_str(&peer_session_frame_line(
+            &PeerTransportSessionFrame::AuthProof { proof },
+        ));
+        stream.push_str(&peer_session_frame_line(&peer_session_ready_frame()));
+        stream.push_str(&peer_session_frame_line(&forward_frame));
+        let mut reader = std::io::Cursor::new(stream.into_bytes());
+
+        let error = execute_authenticated_peer_transport_session_stream_until_closed(
+            &mut reader,
+            &platform,
+            &trusted,
+            PeerRole::Initiator,
+            &transcript,
+        )
+        .expect_err("invalid auth proof should fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("peer session auth proof rejected for windows-desktop (AKRZ-")
+        );
+        assert_eq!(
+            platform.injected_events().expect("fake injected events"),
+            Vec::<InjectedInputEvent>::new()
+        );
+        assert_eq!(
+            platform
+                .release_all_count()
+                .expect("fake release all count"),
+            0
+        );
+    }
+
+    #[test]
+    fn paired_tcp_peer_session_connects_after_auth_and_executes_input() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let (source, trusted_target, trusted_source) = peer_session_pair_auth_fixture();
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept authenticated peer");
+            let platform = FakePlatformAdapter::default();
+            let execution = execute_paired_tcp_peer_transport_session_until_closed_with_timeout(
+                stream,
+                &platform,
+                std::time::Duration::from_millis(500),
+                &DeviceId::new("right-peer"),
+                |peer_device_id| {
+                    assert_eq!(peer_device_id, &DeviceId::new("windows-desktop"));
+                    Ok(trusted_source)
+                },
+            )?;
+            let injected_events = platform.injected_events()?;
+            let release_all_count = platform.release_all_count()?;
+
+            Ok::<_, PlatformError>((execution, injected_events, release_all_count))
+        });
+        let transport = TcpPeerSessionTransport::connect_authenticated(
+            PeerId::new("right-peer"),
+            &source,
+            address,
+            &trusted_target,
+        )
+        .expect("connect authenticated TCP peer session");
+        let dispatcher = TransportCoreActionDispatcher::new(transport);
+
+        dispatcher
+            .dispatch_core_actions(&[CoreAction::ForwardInput {
+                event: InjectedInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            }])
+            .expect("dispatch authenticated input");
+        drop(dispatcher);
+
+        let (execution, injected_events, release_all_count) = server_thread
+            .join()
+            .expect("authenticated TCP peer server thread")
+            .expect("authenticated TCP peer execution");
+
+        assert_eq!(execution.hello.device_id, DeviceId::new("windows-desktop"));
+        assert_eq!(execution.hello.peer_id, PeerId::new("right-peer"));
+        assert!(execution.hello.nonce.is_some());
+        assert_eq!(
+            execution.outcomes,
+            vec![
+                PeerTransportCommandExecution::InputForwarded {
+                    event: InjectedInputEvent::PointerMoved {
+                        delta_x: 8,
+                        delta_y: 2,
+                    },
+                },
+                PeerTransportCommandExecution::InputsReleased,
+            ]
+        );
+        assert_eq!(
+            injected_events,
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            }]
+        );
+        assert_eq!(release_all_count, 1);
+    }
+
+    #[test]
     fn tcp_peer_session_rejects_command_before_hello() {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
@@ -3786,56 +4557,24 @@ mod tests {
     }
 
     #[test]
-    fn peer_session_connect_command_attaches_session_and_updates_status() {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
-        let address = listener.local_addr().expect("loopback listener address");
-        let server_thread =
-            std::thread::spawn(move || serve_tcp_peer_transport_session(&listener, 0));
-        let platform = FakePlatformAdapter::default();
-        let state = RuntimeInputState::new();
+    fn peer_session_connect_command_rejects_unpaired_manager() {
         let peer_sessions = ManagedPeerSessionTransport::new();
 
-        let result = connect_peer_session(
+        let error = connect_peer_session(
             &SessionConnectParams {
                 peer_id: "right-peer".to_string(),
                 local_device_id: "windows-desktop".to_string(),
-                address: address.to_string(),
+                address: "127.0.0.1:24888".to_string(),
             },
             &peer_sessions,
         )
-        .expect("connect managed peer session");
+        .expect_err("reject session.connect without identity store");
 
         assert_eq!(
-            result,
-            SessionConnectResult {
-                connected: true,
-                session: SessionStatus {
-                    peer_id: "right-peer".to_string(),
-                    local_device_id: "windows-desktop".to_string(),
-                    address: address.to_string(),
-                    connected: true,
-                },
-            }
+            error.to_string(),
+            "managed peer session requires identity store before session.connect"
         );
-        assert_eq!(
-            build_daemon_status_with_peer_sessions(&state, &platform, &peer_sessions)
-                .expect("daemon status")
-                .peers,
-            vec![PeerStatus {
-                peer_id: "right-peer".to_string(),
-                display_name: "right-peer".to_string(),
-                connected: true,
-            }]
-        );
-
-        let session = server_thread
-            .join()
-            .expect("TCP peer session server thread")
-            .expect("TCP peer session");
-        assert_eq!(session.hello.device_id, DeviceId::new("windows-desktop"));
-        assert_eq!(session.hello.peer_id, PeerId::new("right-peer"));
-        assert!(session.commands.is_empty());
+        assert_eq!(peer_sessions.active_session(), Ok(None));
     }
 
     #[test]
@@ -3908,12 +4647,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_ipc_server_handles_session_connect_and_disconnect_requests() {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
-        let address = listener.local_addr().expect("loopback listener address");
-        let server_thread =
-            std::thread::spawn(move || serve_tcp_peer_transport_session(&listener, 0));
+    fn daemon_ipc_server_rejects_session_connect_without_identity_store() {
         let state = shared_runtime_state(RuntimeInputState::new());
         let platform = FakePlatformAdapter::default();
         let peer_sessions = ManagedPeerSessionTransport::new();
@@ -3933,7 +4667,7 @@ mod tests {
             SessionConnectParams {
                 peer_id: "right-peer".to_string(),
                 local_device_id: "windows-desktop".to_string(),
-                address: address.to_string(),
+                address: "127.0.0.1:24888".to_string(),
             },
         );
         let connect_line = match to_json_line(&connect_request) {
@@ -3945,40 +4679,18 @@ mod tests {
             Ok(line) => line,
             Err(error) => panic!("expected connect response: {error}"),
         };
-        let connect_response: JsonRpcSuccess<SessionConnectResult> =
-            match serde_json::from_str(&connect_response_line) {
-                Ok(response) => response,
-                Err(error) => panic!("expected connect response JSON: {error}"),
-            };
+        let connect_response: JsonRpcFailure = match serde_json::from_str(&connect_response_line) {
+            Ok(response) => response,
+            Err(error) => panic!("expected connect failure JSON: {error}"),
+        };
 
-        assert_eq!(connect_response.id, "req_connect");
-        assert_eq!(connect_response.result.session.peer_id, "right-peer");
-
-        let disconnect_request = JsonRpcRequest::new(
-            "req_disconnect",
-            METHOD_SESSION_DISCONNECT,
-            SessionDisconnectParams::default(),
+        assert_eq!(connect_response.id, Some("req_connect".to_string()));
+        assert_eq!(connect_response.error.code, JSONRPC_DAEMON_ERROR);
+        assert_eq!(
+            connect_response.error.message,
+            "session connect unavailable: managed peer session requires identity store before session.connect"
         );
-        let disconnect_line = match to_json_line(&disconnect_request) {
-            Ok(line) => line,
-            Err(error) => panic!("expected disconnect request serialization: {error}"),
-        };
-
-        let disconnect_response_line = match server.handle_request_line(&disconnect_line) {
-            Ok(line) => line,
-            Err(error) => panic!("expected disconnect response: {error}"),
-        };
-        let disconnect_response: JsonRpcSuccess<SessionDisconnectResult> =
-            match serde_json::from_str(&disconnect_response_line) {
-                Ok(response) => response,
-                Err(error) => panic!("expected disconnect response JSON: {error}"),
-            };
-
-        assert_eq!(disconnect_response.id, "req_disconnect");
-        assert!(disconnect_response.result.disconnected);
         assert_eq!(peer_sessions.active_session(), Ok(None));
-
-        assert!(server_thread.join().expect("server thread").is_ok());
     }
 
     #[test]

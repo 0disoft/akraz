@@ -24,5 +24,6 @@ akraz-identity = { path = "../akraz-identity" }
 akraz-ipc = { path = "../akraz-ipc" }
 akraz-protocol = { path = "../akraz-protocol" }
 akraz-platform = { path = "../akraz-platform" }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

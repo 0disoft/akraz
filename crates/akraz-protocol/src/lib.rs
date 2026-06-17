@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_MAJOR: u16 = 1;
 
 /// Current protocol minor version.
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 4;
 
 /// Label included in the signed v1 session authentication transcript.
 pub const AUTH_TRANSCRIPT_LABEL: &str = "akraz-auth-v1";
@@ -528,12 +528,12 @@ mod tests {
                 major: 1,
                 minor: 99
             }),
-            Ok(ProtocolVersion { major: 1, minor: 2 })
+            Ok(ProtocolVersion { major: 1, minor: 4 })
         );
         assert_eq!(
             ProtocolVersion { major: 1, minor: 7 }
-                .negotiate(ProtocolVersion { major: 1, minor: 3 }),
-            Ok(ProtocolVersion { major: 1, minor: 3 })
+                .negotiate(ProtocolVersion { major: 1, minor: 4 }),
+            Ok(ProtocolVersion { major: 1, minor: 4 })
         );
     }
 
@@ -581,7 +581,7 @@ mod tests {
             value,
             json!({
                 "kind": "hello",
-                "protocol": { "major": 1, "minor": 2 },
+                "protocol": { "major": 1, "minor": 4 },
                 "deviceId": "device-a",
                 "displayName": "Device A",
                 "buildVersion": "0.4.20",
@@ -665,7 +665,7 @@ mod tests {
                 "0101010101010101010101010101010101010101010101010101010101010101",
                 "0202020202020202020202020202020202020202020202020202020202020202",
                 "0001",
-                "0002",
+                "0004",
                 "00000001",
                 "00000003",
                 "01",
