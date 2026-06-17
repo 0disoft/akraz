@@ -315,9 +315,28 @@ h2 {
   min-height: 34px;
 }
 
-.capability-row span,
-.peer-list span {
+.capability-row span {
   min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.peer-main {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.peer-name {
+  min-width: 0;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.peer-id {
+  min-width: 0;
+  color: #687280;
+  font-size: 0.78rem;
+  line-height: 1.35;
   overflow-wrap: anywhere;
 }
 

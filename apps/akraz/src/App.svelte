@@ -9,6 +9,7 @@
     PlatformCapabilities,
     ScreenEdge,
     SessionConnectParams,
+    PeerStatus,
   } from './lib/api/types';
 
   const modeLabels: Record<ControlMode, string> = {
@@ -79,8 +80,25 @@
     return '저장 전';
   }
 
+  function connectedPeers() {
+    return daemonState.status?.peers.filter((peer) => peer.connected) ?? [];
+  }
+
   function connectedPeerCount() {
-    return daemonState.status?.peers.filter((peer) => peer.connected).length ?? 0;
+    return connectedPeers().length;
+  }
+
+  function firstConnectedPeer() {
+    return connectedPeers()[0] ?? null;
+  }
+
+  function peerDisplayName(peer: PeerStatus) {
+    const displayName = peer.displayName.trim();
+    return displayName.length > 0 ? displayName : peer.peerId;
+  }
+
+  function peerConnectionLabel(peer: PeerStatus) {
+    return peer.connected ? '연결됨' : '대기 중';
   }
 
   function hasConnectedPeer() {
@@ -119,7 +137,8 @@
 
     const count = connectedPeerCount();
     if (count > 0) {
-      return `${count}대 연결됨`;
+      const peer = firstConnectedPeer();
+      return count === 1 && peer ? `${peerDisplayName(peer)} 연결됨` : `${count}대 연결됨`;
     }
 
     return '대기 중';
@@ -204,10 +223,13 @@
             <p class="muted">아직 연결된 기기가 없어.</p>
           {:else}
             <ul class="peer-list">
-              {#each daemonState.status.peers as peer}
+              {#each daemonState.status.peers as peer (peer.peerId)}
                 <li>
-                  <span>{peer.displayName}</span>
-                  <strong>{peer.connected ? '연결됨' : '대기 중'}</strong>
+                  <span class="peer-main">
+                    <span class="peer-name">{peerDisplayName(peer)}</span>
+                    <code class="peer-id">{peer.peerId}</code>
+                  </span>
+                  <strong>{peerConnectionLabel(peer)}</strong>
                 </li>
               {/each}
             </ul>
