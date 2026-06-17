@@ -616,6 +616,23 @@ impl ManagedPeerSessionTransport {
             .map(|session| session.as_ref().map(ManagedPeerSessionSnapshot::from))
     }
 
+    /// Return the trusted display name for a paired peer, when the manager has pairing storage.
+    fn trusted_peer_display_name(&self, peer_id: &PeerId) -> Result<Option<String>, PlatformError> {
+        let Some(auth_config) = &self.auth_config else {
+            return Ok(None);
+        };
+        let store = FileIdentityStore::new(&auth_config.identity_store);
+        let trusted_peer = store.load_trusted_peer(peer_id.as_str()).map_err(|error| {
+            PlatformError::new(format!(
+                "failed to load trusted peer {} from {}: {error}",
+                peer_id.as_str(),
+                auth_config.identity_store.display()
+            ))
+        })?;
+
+        Ok(Some(trusted_peer.identity().display_name().to_string()))
+    }
+
     /// Attach an already connected TCP peer session.
     pub fn attach_session(&self, session: TcpPeerSessionTransport) -> Result<(), PlatformError> {
         let mut active_session = self
@@ -2496,15 +2513,20 @@ pub fn disconnect_peer_session(
 fn active_peer_statuses(
     peer_sessions: &ManagedPeerSessionTransport,
 ) -> Result<Vec<PeerStatus>, PlatformError> {
-    Ok(peer_sessions
-        .active_session()?
-        .into_iter()
-        .map(|session| PeerStatus {
-            display_name: session.peer_id.as_str().to_string(),
+    let mut statuses = Vec::new();
+    if let Some(session) = peer_sessions.active_session()? {
+        let display_name = peer_sessions
+            .trusted_peer_display_name(&session.peer_id)?
+            .unwrap_or_else(|| session.peer_id.as_str().to_string());
+
+        statuses.push(PeerStatus {
+            display_name,
             peer_id: session.peer_id.as_str().to_string(),
             connected: true,
-        })
-        .collect())
+        });
+    }
+
+    Ok(statuses)
 }
 
 fn session_status_from_snapshot(
@@ -2650,15 +2672,15 @@ mod tests {
         ScreenEdgeBinding, ScreenLayout, SessionId,
     };
     use akraz_identity::{
-        DeviceIdentity, Ed25519IdentityKey, Ed25519PublicKey, LocalIdentity, TrustedPeer,
-        TrustedPeerIdentity, fingerprint_for_public_key,
+        DeviceIdentity, Ed25519IdentityKey, Ed25519PublicKey, FileIdentityStore, LocalIdentity,
+        TrustedPeer, TrustedPeerIdentity, fingerprint_for_public_key,
     };
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, DaemonStatusParams, InputReleaseAllParams,
         InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities, JsonRpcFailure,
         JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_STATUS,
-        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, OsLocalIpcClient, SessionConnectParams,
-        SessionDisconnectResult, SessionStatus, call_json_rpc, to_json_line,
+        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, OsLocalIpcClient, PeerStatus,
+        SessionConnectParams, SessionDisconnectResult, SessionStatus, call_json_rpc, to_json_line,
     };
     use akraz_platform::{
         DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, InputCapturePolicy,
@@ -2679,8 +2701,9 @@ mod tests {
         PeerTransportInputEvent, PeerTransportMessage, PeerTransportProtocolVersion,
         PeerTransportSessionFrame, TcpPeerSessionTransport, TcpPeerTransport,
         TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
-        build_permissions_probe, connect_peer_session, disconnect_peer_session,
-        drain_capture_events, execute_authenticated_peer_transport_session_stream_until_closed,
+        build_daemon_status_with_peer_sessions, build_permissions_probe, connect_peer_session,
+        disconnect_peer_session, drain_capture_events,
+        execute_authenticated_peer_transport_session_stream_until_closed,
         execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
         execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
         handle_ipc_request_line, input_capture_policy_for_control_mode,
@@ -2876,6 +2899,18 @@ mod tests {
         }
     }
 
+    fn unique_identity_store_path(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+
+        std::env::temp_dir().join(format!(
+            "akraz-daemon-{label}-{}-{nanos}.json",
+            std::process::id()
+        ))
+    }
+
     #[cfg(unix)]
     fn unique_os_endpoint() -> IpcEndpoint {
         let nanos = std::time::SystemTime::now()
@@ -2986,6 +3021,64 @@ mod tests {
                 can_inject_keyboard: true,
             }
         );
+    }
+
+    #[test]
+    fn daemon_status_uses_trusted_peer_display_name_for_active_session() {
+        let identity_store_path = unique_identity_store_path("trusted-peer-display-name");
+        let _ = std::fs::remove_file(&identity_store_path);
+        let identity_store = FileIdentityStore::new(&identity_store_path);
+        identity_store
+            .load_or_create("Windows Desktop")
+            .expect("create local identity store");
+        let (_, trusted_target, _) = peer_session_pair_auth_fixture();
+        identity_store
+            .save_trusted_peer(trusted_target.identity())
+            .expect("save trusted target peer");
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread =
+            std::thread::spawn(move || serve_tcp_peer_transport_session(&listener, 0));
+        let peer_sessions = ManagedPeerSessionTransport::with_identity_store(
+            &identity_store_path,
+            "Windows Desktop",
+        );
+        let session = TcpPeerSessionTransport::connect(
+            PeerId::new("right-peer"),
+            DeviceId::new("windows-desktop"),
+            address,
+        )
+        .expect("connect TCP peer session");
+        peer_sessions
+            .attach_session(session)
+            .expect("attach managed peer session");
+
+        let status = build_daemon_status_with_peer_sessions(
+            &RuntimeInputState::new(),
+            &FakePlatformAdapter::default(),
+            &peer_sessions,
+        )
+        .expect("daemon status with trusted peer display name");
+
+        assert_eq!(
+            status.peers,
+            vec![PeerStatus {
+                display_name: "Right Peer".to_string(),
+                peer_id: "right-peer".to_string(),
+                connected: true,
+            }]
+        );
+
+        drop(peer_sessions);
+        assert!(
+            server_thread
+                .join()
+                .expect("TCP peer session server")
+                .is_ok()
+        );
+        let _ = std::fs::remove_file(&identity_store_path);
     }
 
     #[test]

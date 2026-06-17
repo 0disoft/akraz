@@ -105,7 +105,12 @@ try {
   const afterConnect = runCtlJsonRpc(["status", "--endpoint", sourceEndpoint]);
   assertStatusMode(afterConnect, "Local", "source connected status");
   assertPeerCount(afterConnect, 1, "source connected status");
-  assertPeer(afterConnect.result.peers[0], targetIdentity.deviceId, true);
+  assertPeer(
+    afterConnect.result.peers[0],
+    targetIdentity.deviceId,
+    targetIdentity.displayName,
+    true,
+  );
 
   const disconnectedResponse = runCtlJsonRpc([
     "session",
@@ -281,8 +286,8 @@ function assertPeerCount(response, expected, label) {
   }
 }
 
-function assertPeer(peer, peerId, connected) {
-  if (peer?.peerId !== peerId || peer.displayName !== peerId || peer.connected !== connected) {
+function assertPeer(peer, peerId, displayName, connected) {
+  if (peer?.peerId !== peerId || peer.displayName !== displayName || peer.connected !== connected) {
     throw new Error("session connect lifecycle smoke reported unexpected peer status");
   }
 }
