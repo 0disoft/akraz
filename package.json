@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.4.63",
+  "version": "0.4.64",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -22,6 +22,7 @@
     "smoke:session-connect-lifecycle": "bun run --cwd apps/akraz smoke:session-connect-lifecycle",
     "smoke:settings-start": "bun run --cwd apps/akraz smoke:settings-start",
     "smoke:tcp-transport": "bun run --cwd apps/akraz smoke:tcp-transport",
+    "smoke:windows-mvp-soak": "bun run --cwd apps/akraz smoke:windows-mvp-soak",
     "test": "bun test"
   },
   "devDependencies": {

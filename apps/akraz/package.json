@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.4.63",
+  "version": "0.4.64",
   "private": true,
   "type": "module",
   "scripts": {
@@ -17,6 +17,7 @@
     "smoke:session-connect-lifecycle": "bun scripts/smoke-session-connect-lifecycle.mjs",
     "smoke:settings-start": "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
     "smoke:tcp-transport": "bun scripts/smoke-tcp-transport.mjs",
+    "smoke:windows-mvp-soak": "bun scripts/smoke-windows-mvp-soak.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
