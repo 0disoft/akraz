@@ -5,6 +5,7 @@ import {
   diagnosticsCardStatusClass,
   diagnosticsCardStatusLabel,
 } from "../src/lib/diagnostics/diagnosticsCards";
+import type { LayoutMismatchReport } from "../src/lib/layout/layoutMismatch";
 import type { PermissionsProbe } from "../src/lib/api/types";
 
 function permissionsFixture(overrides: Partial<PermissionsProbe> = {}): PermissionsProbe {
@@ -99,6 +100,69 @@ describe("diagnostics capability cards", () => {
     expect(cards.find((card) => card.id === "screenLayout")).toMatchObject({
       status: "NeedsAction",
       summary: "배치 필요",
+    });
+  });
+
+  test("uses layout mismatch details for the screen layout card", () => {
+    const layoutMismatch: LayoutMismatchReport = {
+      status: "needs-action",
+      issues: [
+        {
+          code: "unknown-peer",
+          status: "needs-action",
+          message: "신뢰 목록에 없는 기기가 배치에 남아 있어.",
+        },
+        {
+          code: "duplicate-local-edge",
+          status: "needs-action",
+          message: "같은 화면 끝에 여러 기기가 붙어 있어.",
+        },
+      ],
+      validBindingCount: 0,
+      bindingCount: 2,
+      trustedPeerCount: 1,
+      hasUsableTopology: true,
+    };
+
+    const cards = diagnosticsCards({
+      snapshot: null,
+      permissions: permissionsFixture(),
+      hasLocalIdentity: true,
+      trustedPeerCount: 1,
+      layoutBindingCount: 2,
+      hasScreenTopology: true,
+      layoutMismatch,
+    });
+
+    expect(cards.find((card) => card.id === "screenLayout")).toMatchObject({
+      status: "NeedsAction",
+      summary: "2개 조치 필요",
+      detail: "신뢰 목록에 없는 기기가 배치에 남아 있어.",
+    });
+  });
+
+  test("reports ready layout mismatch as confirmed", () => {
+    const cards = diagnosticsCards({
+      snapshot: null,
+      permissions: permissionsFixture(),
+      hasLocalIdentity: true,
+      trustedPeerCount: 1,
+      layoutBindingCount: 1,
+      hasScreenTopology: true,
+      layoutMismatch: {
+        status: "ready",
+        issues: [],
+        validBindingCount: 1,
+        bindingCount: 1,
+        trustedPeerCount: 1,
+        hasUsableTopology: true,
+      },
+    });
+
+    expect(cards.find((card) => card.id === "screenLayout")).toMatchObject({
+      status: "OK",
+      summary: "1개 경계 확인됨",
+      detail: "신뢰한 기기와 현재 화면 범위가 맞아.",
     });
   });
 

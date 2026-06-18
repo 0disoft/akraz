@@ -4,6 +4,7 @@ import type {
   ScreenEdge,
   ScreenEdgeBinding,
 } from "../api/types";
+import { isUsableScreenTopology } from "./layoutMismatch";
 
 export interface LayoutCrossingPreview {
   peerId: string;
@@ -26,7 +27,7 @@ export function previewEdgeCrossing(
   topology: DiagnosticsScreenTopology,
 ): LayoutCrossingPreview | null {
   const peerId = binding.peerId.trim();
-  if (peerId.length === 0) {
+  if (peerId.length === 0 || !isUsableScreenTopology(topology)) {
     return null;
   }
 

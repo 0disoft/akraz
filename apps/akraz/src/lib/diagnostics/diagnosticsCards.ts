@@ -4,6 +4,7 @@ import type {
   PermissionsProbe,
   PlatformCapabilities,
 } from "../api/types";
+import type { LayoutMismatchReport } from "../layout/layoutMismatch";
 
 export type DiagnosticsCardStatus = "OK" | "NeedsAction" | "Limited" | "Error";
 
@@ -31,6 +32,7 @@ export interface DiagnosticsCardsInput {
   trustedPeerCount: number;
   layoutBindingCount: number;
   hasScreenTopology: boolean;
+  layoutMismatch?: LayoutMismatchReport;
 }
 
 type PermissionFacts = {
@@ -62,7 +64,7 @@ export function diagnosticsCards(input: DiagnosticsCardsInput): DiagnosticsCard[
     inputInjectionCard(permissions),
     networkDiscoveryCard(),
     pairingAuthCard(input.hasLocalIdentity, input.trustedPeerCount),
-    screenLayoutCard(input.layoutBindingCount, hasScreenTopology),
+    screenLayoutCard(input.layoutBindingCount, hasScreenTopology, input.layoutMismatch),
     clipboardCard(),
     updatesCard(),
   ];
@@ -176,7 +178,42 @@ function pairingAuthCard(hasLocalIdentity: boolean, trustedPeerCount: number): D
   };
 }
 
-function screenLayoutCard(layoutBindingCount: number, hasScreenTopology: boolean): DiagnosticsCard {
+function screenLayoutCard(
+  layoutBindingCount: number,
+  hasScreenTopology: boolean,
+  layoutMismatch?: LayoutMismatchReport,
+): DiagnosticsCard {
+  if (layoutMismatch) {
+    const firstIssue = layoutMismatch.issues[0];
+    if (layoutMismatch.status === "needs-action") {
+      return {
+        id: "screenLayout",
+        title: "화면 배치",
+        status: "NeedsAction",
+        summary: `${layoutMismatch.issues.filter((issue) => issue.status === "needs-action").length}개 조치 필요`,
+        detail: firstIssue?.message ?? "화면 배치를 다시 확인해.",
+      };
+    }
+
+    if (layoutMismatch.status === "limited") {
+      return {
+        id: "screenLayout",
+        title: "화면 배치",
+        status: "Limited",
+        summary: `${layoutMismatch.bindingCount}개 경계`,
+        detail: firstIssue?.message ?? "데몬이 실행 중이면 현재 화면 범위까지 함께 확인할 수 있어.",
+      };
+    }
+
+    return {
+      id: "screenLayout",
+      title: "화면 배치",
+      status: "OK",
+      summary: `${layoutMismatch.validBindingCount}개 경계 확인됨`,
+      detail: "신뢰한 기기와 현재 화면 범위가 맞아.",
+    };
+  }
+
   if (layoutBindingCount === 0) {
     return {
       id: "screenLayout",

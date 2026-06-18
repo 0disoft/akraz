@@ -23,6 +23,7 @@
     diagnosticsCardStatusLabel,
   } from './lib/diagnostics/diagnosticsCards';
   import { previewEdgeCrossing } from './lib/layout/crossingTest';
+  import { analyzeLayoutMismatch, isUsableScreenTopology } from './lib/layout/layoutMismatch';
   import { selectTrustedPeerSessionDraft } from './lib/session/sessionDraft';
   import type {
     ControlMode,
@@ -293,14 +294,32 @@
   }
 
   function diagnosticsCardsForView() {
+    const layoutMismatch = layoutMismatchReportForView();
     return diagnosticsCards({
       snapshot: diagnosticsState.snapshot,
       permissions: permissionState.probe,
       hasLocalIdentity: identityState.local !== null,
       trustedPeerCount: identityState.trustedPeers.length,
-      layoutBindingCount: layoutState.layout.edgeBindings.length,
-      hasScreenTopology: layoutState.topology !== null,
+      layoutBindingCount: layoutMismatch.bindingCount,
+      hasScreenTopology: layoutMismatch.hasUsableTopology,
+      layoutMismatch,
     });
+  }
+
+  function layoutMismatchReportForView() {
+    return analyzeLayoutMismatch({
+      layout: layoutState.layout,
+      trustedPeers: identityState.trustedPeers,
+      topology: layoutState.topology,
+    });
+  }
+
+  function layoutMismatchIssuesForView() {
+    return layoutMismatchReportForView().issues;
+  }
+
+  function layoutMismatchStatusForView() {
+    return layoutMismatchReportForView().status;
   }
 
   async function generateDiagnostics() {
@@ -496,14 +515,28 @@
       layoutTestMessage = '테스트할 경계가 없어.';
       return;
     }
+
+    const peerId = binding.peerId.trim();
+    if (peerId.length === 0) {
+      layoutTestMessage = '기기 ID가 필요해.';
+      return;
+    }
+    if (!identityState.trustedPeers.some((peer) => peer.peerId === peerId)) {
+      layoutTestMessage = '신뢰 목록에 없는 기기야.';
+      return;
+    }
     if (!layoutState.topology) {
       layoutTestMessage = '먼저 화면을 확인해야 해.';
+      return;
+    }
+    if (!isUsableScreenTopology(layoutState.topology)) {
+      layoutTestMessage = '현재 화면 범위를 다시 확인해야 해.';
       return;
     }
 
     const preview = previewEdgeCrossing(binding, layoutState.topology);
     if (!preview) {
-      layoutTestMessage = '기기 ID가 필요해.';
+      layoutTestMessage = '화면 배치를 다시 확인해야 해.';
       return;
     }
 
@@ -1076,6 +1109,14 @@
           <p class="muted">데몬이 실행 중이면 현재 화면 범위를 확인할 수 있어.</p>
         {/if}
       </div>
+
+      {#if layoutMismatchIssuesForView().length > 0}
+        <ul class={`layout-mismatch-list ${layoutMismatchStatusForView()}`} aria-label="화면 배치 확인">
+          {#each layoutMismatchIssuesForView() as issue (issue.code)}
+            <li>{issue.message}</li>
+          {/each}
+        </ul>
+      {/if}
 
       {#if layoutTestMessage}
         <p class="layout-test-result" aria-live="polite">{layoutTestMessage}</p>

@@ -205,6 +205,35 @@ h2 {
   margin-bottom: 0;
 }
 
+.layout-mismatch-list {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border: 1px solid #e0d4be;
+  border-left: 4px solid #8b7a5a;
+  border-radius: 8px;
+  background: #fff9ed;
+  list-style: none;
+}
+
+.layout-mismatch-list.needs-action {
+  border-left-color: #b35b45;
+}
+
+.layout-mismatch-list.limited {
+  border-left-color: #8b7a5a;
+}
+
+.layout-mismatch-list li {
+  min-width: 0;
+  color: #4f4638;
+  font-size: 0.88rem;
+  font-weight: 700;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .layout-test-result {
   margin-top: 12px;
   padding: 10px 12px;

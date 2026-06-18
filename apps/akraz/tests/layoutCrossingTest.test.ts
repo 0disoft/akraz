@@ -49,4 +49,13 @@ describe("layout crossing preview", () => {
       ),
     ).toBeNull();
   });
+
+  test("rejects unusable screen topology", () => {
+    expect(
+      previewEdgeCrossing(binding("right"), {
+        pointerPosition: { x: 0, y: 0 },
+        virtualScreenBounds: { x: 0, y: 0, width: -1, height: 1080 },
+      }),
+    ).toBeNull();
+  });
 });
