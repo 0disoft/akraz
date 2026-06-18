@@ -100,12 +100,28 @@ export interface IdentityTrustParams {
   peerDocumentJson: string;
 }
 
-export interface IdentityTrustResult {
-  trusted: boolean;
+export interface IdentityTrustedPeer {
   peerId: string;
   displayName: string;
   fingerprint: string;
   capabilities: number;
+}
+
+export interface IdentityTrustedPeersResult {
+  peers: IdentityTrustedPeer[];
+}
+
+export interface IdentityTrustResult extends IdentityTrustedPeer {
+  trusted: boolean;
+}
+
+export interface IdentityForgetTrustedParams {
+  peerId: string;
+}
+
+export interface IdentityForgetTrustedResult {
+  forgotten: boolean;
+  peerId: string;
 }
 
 export interface AppSettings {

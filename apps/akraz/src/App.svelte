@@ -95,6 +95,9 @@
     if (identityState.operation === 'trust') {
       return '등록 중';
     }
+    if (identityState.operation === 'forget') {
+      return '삭제 중';
+    }
     if (identityState.lastError) {
       return identityState.lastError;
     }
@@ -106,6 +109,14 @@
 
   function canTrustIdentity() {
     return identityState.local !== null && !identityState.isBusy && identityState.peerDocumentReady;
+  }
+
+  function canForgetIdentity() {
+    return identityState.local !== null && !identityState.isBusy;
+  }
+
+  function isForgettingIdentity(peerId: string) {
+    return identityState.operation === 'forget' && identityState.forgettingPeerId === peerId;
   }
 
   function capabilityLabel(capabilities: number) {
@@ -367,6 +378,34 @@
             </button>
           </div>
         </div>
+      </div>
+
+      <div class="trusted-peer-panel">
+        <h3>등록된 기기</h3>
+        {#if identityState.trustedPeers.length > 0}
+          <ul class="trusted-peer-list">
+            {#each identityState.trustedPeers as peer (peer.peerId)}
+              <li>
+                <span class="trusted-peer-main">
+                  <strong>{peer.displayName}</strong>
+                  <code>{peer.peerId}</code>
+                  <code>{peer.fingerprint}</code>
+                  <span>{capabilityLabel(peer.capabilities)}</span>
+                </span>
+                <button
+                  type="button"
+                  class="control-button danger compact"
+                  disabled={!canForgetIdentity()}
+                  onclick={() => identityState.forget(peer.peerId)}
+                >
+                  {isForgettingIdentity(peer.peerId) ? '삭제 중' : '삭제'}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {:else}
+          <p class="muted">등록된 기기가 없어.</p>
+        {/if}
       </div>
     </section>
 

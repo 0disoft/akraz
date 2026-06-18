@@ -276,6 +276,19 @@ impl FileIdentityStore {
         self.write_stored_file(&stored)
     }
 
+    /// List trusted peer metadata saved in the fallback identity file.
+    pub fn list_trusted_peers(&self) -> Result<Vec<TrustedPeerIdentity>, IdentityStoreError> {
+        let stored = self.read_stored_file()?;
+        stored
+            .trusted_peers
+            .into_iter()
+            .map(|peer| {
+                peer.into_trusted_peer(&self.path)
+                    .map(|trusted| trusted.into_parts().0)
+            })
+            .collect()
+    }
+
     /// Load a trusted peer verifier by stable peer id.
     pub fn load_trusted_peer(
         &self,
@@ -292,6 +305,22 @@ impl FileIdentityStore {
             })?;
 
         stored_peer.into_trusted_peer(&self.path)
+    }
+
+    /// Remove one trusted peer identity by stable peer id.
+    pub fn remove_trusted_peer(&self, peer_id: &str) -> Result<(), IdentityStoreError> {
+        let mut stored = self.read_stored_file()?;
+        let index = stored
+            .trusted_peers
+            .iter()
+            .position(|peer| peer.peer_id == peer_id)
+            .ok_or_else(|| IdentityStoreError::TrustedPeerNotFound {
+                path: self.path.clone(),
+                peer_id: peer_id.to_string(),
+            })?;
+        stored.trusted_peers.remove(index);
+
+        self.write_stored_file(&stored)
     }
 
     fn load_existing(&self) -> Result<StoredLocalIdentity, IdentityStoreError> {
@@ -1315,6 +1344,122 @@ mod tests {
             loaded.identity().capabilities(),
             CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
         );
+
+        remove_identity_path(path);
+    }
+
+    #[test]
+    fn file_identity_store_lists_trusted_peers() {
+        let path = unique_identity_path("trusted-peer-list");
+        let store = FileIdentityStore::new(&path);
+        store
+            .load_or_create("Device A")
+            .expect("created local identity");
+        let peer_b_secret = Ed25519IdentityKey::generate();
+        let peer_b_public = peer_b_secret.public_key_bytes();
+        let peer_b = TrustedPeerIdentity::new(
+            "device-b",
+            "Device B",
+            peer_b_public,
+            fingerprint_for_public_key(&peer_b_public),
+            CapabilityFlags::POINTER,
+        );
+        let peer_c_secret = Ed25519IdentityKey::generate();
+        let peer_c_public = peer_c_secret.public_key_bytes();
+        let peer_c = TrustedPeerIdentity::new(
+            "device-c",
+            "Device C",
+            peer_c_public,
+            fingerprint_for_public_key(&peer_c_public),
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+
+        store.save_trusted_peer(&peer_b).expect("saved peer b");
+        store.save_trusted_peer(&peer_c).expect("saved peer c");
+
+        let peers = store.list_trusted_peers().expect("listed trusted peers");
+
+        assert_eq!(
+            peers.iter().map(|peer| peer.peer_id()).collect::<Vec<_>>(),
+            vec!["device-b", "device-c"]
+        );
+        assert_eq!(peers[1].display_name(), "Device C");
+        assert_eq!(
+            peers[1].capabilities(),
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+        );
+
+        remove_identity_path(path);
+    }
+
+    #[test]
+    fn file_identity_store_removes_trusted_peer() {
+        let path = unique_identity_path("remove-trusted-peer");
+        let store = FileIdentityStore::new(&path);
+        store
+            .load_or_create("Device A")
+            .expect("created local identity");
+        let peer_b_secret = Ed25519IdentityKey::generate();
+        let peer_b_public = peer_b_secret.public_key_bytes();
+        let peer_b = TrustedPeerIdentity::new(
+            "device-b",
+            "Device B",
+            peer_b_public,
+            fingerprint_for_public_key(&peer_b_public),
+            CapabilityFlags::POINTER,
+        );
+        let peer_c_secret = Ed25519IdentityKey::generate();
+        let peer_c_public = peer_c_secret.public_key_bytes();
+        let peer_c = TrustedPeerIdentity::new(
+            "device-c",
+            "Device C",
+            peer_c_public,
+            fingerprint_for_public_key(&peer_c_public),
+            CapabilityFlags::KEYBOARD,
+        );
+
+        store.save_trusted_peer(&peer_b).expect("saved peer b");
+        store.save_trusted_peer(&peer_c).expect("saved peer c");
+        store
+            .remove_trusted_peer("device-b")
+            .expect("removed peer b");
+
+        let peers = store.list_trusted_peers().expect("listed trusted peers");
+        assert_eq!(
+            peers.iter().map(|peer| peer.peer_id()).collect::<Vec<_>>(),
+            vec!["device-c"]
+        );
+        assert!(store.load_trusted_peer("device-b").is_err());
+        assert_eq!(
+            store
+                .load_trusted_peer("device-c")
+                .expect("peer c remains")
+                .identity()
+                .display_name(),
+            "Device C"
+        );
+
+        remove_identity_path(path);
+    }
+
+    #[test]
+    fn file_identity_store_rejects_missing_trusted_peer_removal() {
+        let path = unique_identity_path("remove-missing-trusted-peer");
+        let store = FileIdentityStore::new(&path);
+        store
+            .load_or_create("Device A")
+            .expect("created local identity");
+
+        let error = store
+            .remove_trusted_peer("device-b")
+            .expect_err("missing trusted peer removal should fail");
+
+        match error {
+            IdentityStoreError::TrustedPeerNotFound { peer_id, .. } => {
+                assert_eq!(peer_id, "device-b");
+            }
+            other => panic!("expected missing trusted peer error, got {other:?}"),
+        }
 
         remove_identity_path(path);
     }

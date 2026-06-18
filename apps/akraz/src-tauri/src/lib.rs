@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use akraz_identity::{FileIdentityStore, PairingIdentityDocument};
+use akraz_identity::{FileIdentityStore, PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_ipc::{
     DaemonStatus, DaemonStatusParams, IpcCallError, IpcEndpoint, IpcTransportError,
     JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient,
@@ -73,7 +73,9 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
             session_connect,
             session_disconnect,
             identity_show,
+            identity_list_trusted,
             identity_trust,
+            identity_forget_trusted,
             settings_load,
             settings_save
         ])
@@ -291,6 +293,15 @@ async fn identity_show(app: tauri::AppHandle) -> Result<IdentityShowResult, Stri
 }
 
 #[tauri::command]
+async fn identity_list_trusted(
+    app: tauri::AppHandle,
+) -> Result<IdentityTrustedPeersResult, String> {
+    tauri::async_runtime::spawn_blocking(move || list_trusted_identities(&app))
+        .await
+        .map_err(|error| format!("identity trusted peers task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn identity_trust(
     app: tauri::AppHandle,
     params: IdentityTrustOptions,
@@ -298,6 +309,16 @@ async fn identity_trust(
     tauri::async_runtime::spawn_blocking(move || trust_identity_document(&app, params))
         .await
         .map_err(|error| format!("identity trust task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn identity_forget_trusted(
+    app: tauri::AppHandle,
+    params: IdentityForgetTrustedOptions,
+) -> Result<IdentityForgetTrustedResult, String> {
+    tauri::async_runtime::spawn_blocking(move || forget_trusted_identity(&app, params))
+        .await
+        .map_err(|error| format!("identity forget trusted task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -403,6 +424,21 @@ struct IdentityShowResult {
     document_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityTrustedPeer {
+    peer_id: String,
+    display_name: String,
+    fingerprint: String,
+    capabilities: CapabilityFlags,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityTrustedPeersResult {
+    peers: Vec<IdentityTrustedPeer>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct IdentityTrustOptions {
@@ -417,6 +453,19 @@ struct IdentityTrustResult {
     display_name: String,
     fingerprint: String,
     capabilities: CapabilityFlags,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IdentityForgetTrustedOptions {
+    peer_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityForgetTrustedResult {
+    forgotten: bool,
+    peer_id: String,
 }
 
 impl From<AppSettings> for DaemonStartOptions {
@@ -729,6 +778,11 @@ fn load_identity_document(app: &tauri::AppHandle) -> Result<IdentityShowResult, 
     build_identity_show_result_from_path(&path, DAEMON_IDENTITY_DISPLAY_NAME)
 }
 
+fn list_trusted_identities(app: &tauri::AppHandle) -> Result<IdentityTrustedPeersResult, String> {
+    let path = daemon_identity_store_path(app)?;
+    list_trusted_identities_from_path(&path, DAEMON_IDENTITY_DISPLAY_NAME)
+}
+
 fn trust_identity_document(
     app: &tauri::AppHandle,
     params: IdentityTrustOptions,
@@ -739,6 +793,14 @@ fn trust_identity_document(
         DAEMON_IDENTITY_DISPLAY_NAME,
         &params.peer_document_json,
     )
+}
+
+fn forget_trusted_identity(
+    app: &tauri::AppHandle,
+    params: IdentityForgetTrustedOptions,
+) -> Result<IdentityForgetTrustedResult, String> {
+    let path = daemon_identity_store_path(app)?;
+    forget_trusted_identity_from_path(&path, DAEMON_IDENTITY_DISPLAY_NAME, &params.peer_id)
 }
 
 fn app_settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -790,6 +852,23 @@ fn build_identity_show_result_from_path(
     })
 }
 
+fn list_trusted_identities_from_path(
+    path: &Path,
+    display_name: &str,
+) -> Result<IdentityTrustedPeersResult, String> {
+    let store = FileIdentityStore::new(path);
+    store.load_or_create(display_name).map_err(|source| {
+        format_identity_store_error("failed to load Akraz identity", path, &source)
+    })?;
+    let peers = store.list_trusted_peers().map_err(|source| {
+        format_identity_store_error("failed to list trusted peers", path, &source)
+    })?;
+
+    Ok(IdentityTrustedPeersResult {
+        peers: peers.into_iter().map(IdentityTrustedPeer::from).collect(),
+    })
+}
+
 fn trust_identity_document_from_json(
     path: &Path,
     display_name: &str,
@@ -823,8 +902,43 @@ fn trust_identity_document_from_json(
     })
 }
 
+fn forget_trusted_identity_from_path(
+    path: &Path,
+    display_name: &str,
+    peer_id: &str,
+) -> Result<IdentityForgetTrustedResult, String> {
+    let peer_id = peer_id.trim();
+    if peer_id.is_empty() {
+        return Err("trusted peer id is required.".to_string());
+    }
+
+    let store = FileIdentityStore::new(path);
+    store.load_or_create(display_name).map_err(|source| {
+        format_identity_store_error("failed to load Akraz identity", path, &source)
+    })?;
+    store.remove_trusted_peer(peer_id).map_err(|source| {
+        format_identity_store_error("failed to remove trusted peer", path, &source)
+    })?;
+
+    Ok(IdentityForgetTrustedResult {
+        forgotten: true,
+        peer_id: peer_id.to_string(),
+    })
+}
+
 fn default_pairing_capabilities() -> CapabilityFlags {
     CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+}
+
+impl From<TrustedPeerIdentity> for IdentityTrustedPeer {
+    fn from(peer: TrustedPeerIdentity) -> Self {
+        Self {
+            peer_id: peer.peer_id().to_string(),
+            display_name: peer.display_name().to_string(),
+            fingerprint: peer.fingerprint().to_string(),
+            capabilities: peer.capabilities(),
+        }
+    }
 }
 
 fn format_identity_store_error(
@@ -1257,11 +1371,11 @@ mod tests {
         DaemonStartOptions, IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME,
         build_identity_show_result_from_path, classify_daemon_call_error,
         daemon_capture_input_enabled_from, daemon_executable_name, daemon_spawn_args_from,
-        default_pairing_capabilities, format_edge_binding_arg, has_exact_arg,
-        identity_store_path_from_config_dir, load_settings_from_path,
-        normalize_session_connect_options, parse_daemon_status_response, parse_json_rpc_response,
-        resolve_env_daemon_executable_from, save_settings_to_path, settings_start_smoke_settings,
-        trust_identity_document_from_json,
+        default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
+        has_exact_arg, identity_store_path_from_config_dir, list_trusted_identities_from_path,
+        load_settings_from_path, normalize_session_connect_options, parse_daemon_status_response,
+        parse_json_rpc_response, resolve_env_daemon_executable_from, save_settings_to_path,
+        settings_start_smoke_settings, trust_identity_document_from_json,
     };
 
     fn status_fixture() -> DaemonStatus {
@@ -1546,6 +1660,67 @@ mod tests {
 
         remove_identity_path(source_path);
         remove_identity_path(target_path);
+    }
+
+    #[test]
+    fn identity_list_trusted_returns_saved_peers() {
+        let source_path = unique_identity_path("source-list");
+        let target_path = unique_identity_path("target-list");
+        let source = build_identity_show_result_from_path(&source_path, "Source Laptop")
+            .expect("source identity");
+
+        trust_identity_document_from_json(&target_path, "Target Desktop", &source.document_json)
+            .expect("trusted peer");
+
+        let result = list_trusted_identities_from_path(&target_path, "Target Desktop")
+            .expect("trusted peers");
+
+        assert_eq!(result.peers.len(), 1);
+        assert_eq!(result.peers[0].peer_id, source.device_id);
+        assert_eq!(result.peers[0].display_name, "Source Laptop");
+        assert_eq!(result.peers[0].fingerprint, source.fingerprint);
+        assert_eq!(result.peers[0].capabilities, default_pairing_capabilities());
+
+        remove_identity_path(source_path);
+        remove_identity_path(target_path);
+    }
+
+    #[test]
+    fn identity_forget_trusted_removes_saved_peer() {
+        let source_path = unique_identity_path("source-forget");
+        let target_path = unique_identity_path("target-forget");
+        let source = build_identity_show_result_from_path(&source_path, "Source Laptop")
+            .expect("source identity");
+        trust_identity_document_from_json(&target_path, "Target Desktop", &source.document_json)
+            .expect("trusted peer");
+
+        let result =
+            forget_trusted_identity_from_path(&target_path, "Target Desktop", &source.device_id)
+                .expect("forgot trusted peer");
+
+        assert!(result.forgotten);
+        assert_eq!(result.peer_id, source.device_id);
+        assert!(
+            list_trusted_identities_from_path(&target_path, "Target Desktop")
+                .expect("trusted peers")
+                .peers
+                .is_empty()
+        );
+
+        remove_identity_path(source_path);
+        remove_identity_path(target_path);
+    }
+
+    #[test]
+    fn identity_forget_trusted_rejects_empty_peer_id() {
+        let path = unique_identity_path("empty-forget-peer");
+
+        assert_eq!(
+            forget_trusted_identity_from_path(&path, "Target Desktop", " "),
+            Err("trusted peer id is required.".to_string())
+        );
+
+        remove_identity_path(path);
     }
 
     #[test]

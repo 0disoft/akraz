@@ -1,13 +1,15 @@
 import { identityClient } from "../api/identityClient";
-import type { IdentityShowResult, IdentityTrustResult } from "../api/types";
+import type { IdentityShowResult, IdentityTrustedPeer, IdentityTrustResult } from "../api/types";
 
-type IdentityOperation = "load" | "trust";
+type IdentityOperation = "load" | "trust" | "forget";
 
 export class IdentityState {
   local = $state<IdentityShowResult | null>(null);
   trusted = $state<IdentityTrustResult | null>(null);
+  trustedPeers = $state<IdentityTrustedPeer[]>([]);
   peerDocumentJson = $state("");
   operation = $state<IdentityOperation | null>(null);
+  forgettingPeerId = $state<string | null>(null);
   lastError = $state<string | null>(null);
 
   get isBusy(): boolean {
@@ -25,6 +27,7 @@ export class IdentityState {
   async load() {
     await this.run("load", async () => {
       this.local = await identityClient.show();
+      this.trustedPeers = (await identityClient.listTrusted()).peers;
     });
   }
 
@@ -33,8 +36,21 @@ export class IdentityState {
       this.trusted = await identityClient.trust({
         peerDocumentJson: this.peerDocumentJson,
       });
+      this.trustedPeers = upsertTrustedPeer(this.trustedPeers, this.trusted);
       this.peerDocumentJson = "";
     });
+  }
+
+  async forget(peerId: string) {
+    this.forgettingPeerId = peerId;
+    await this.run("forget", async () => {
+      const result = await identityClient.forgetTrusted({ peerId });
+      this.trustedPeers = this.trustedPeers.filter((peer) => peer.peerId !== result.peerId);
+      if (this.trusted?.peerId === result.peerId) {
+        this.trusted = null;
+      }
+    });
+    this.forgettingPeerId = null;
   }
 
   private async run(operation: IdentityOperation, action: () => Promise<void>) {
@@ -48,6 +64,15 @@ export class IdentityState {
       this.operation = null;
     }
   }
+}
+
+function upsertTrustedPeer(
+  peers: IdentityTrustedPeer[],
+  peer: IdentityTrustedPeer,
+): IdentityTrustedPeer[] {
+  const next = peers.filter((existing) => existing.peerId !== peer.peerId);
+  next.push(peer);
+  return next;
 }
 
 export const identityState = new IdentityState();
