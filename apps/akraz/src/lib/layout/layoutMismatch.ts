@@ -36,6 +36,12 @@ export interface AnalyzeLayoutMismatchInput {
   topology: DiagnosticsScreenTopology | null;
 }
 
+const daemonStartBlockingIssueCodes = new Set<LayoutMismatchIssueCode>([
+  "empty-peer-id",
+  "unknown-peer",
+  "duplicate-local-edge",
+]);
+
 const issueMessages: Record<LayoutMismatchIssueCode, string> = {
   "missing-binding": "화면 배치에서 넘어갈 경계를 추가해.",
   "empty-peer-id": "기기가 비어 있는 경계가 있어.",
@@ -111,6 +117,12 @@ export function analyzeLayoutMismatch(input: AnalyzeLayoutMismatchInput): Layout
     trustedPeerCount: input.trustedPeers.length,
     hasUsableTopology,
   };
+}
+
+export function firstLayoutDaemonStartBlockingIssue(
+  report: LayoutMismatchReport,
+): LayoutMismatchIssue | null {
+  return report.issues.find((issue) => daemonStartBlockingIssueCodes.has(issue.code)) ?? null;
 }
 
 function addIssue(

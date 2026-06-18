@@ -23,7 +23,11 @@
     diagnosticsCardStatusLabel,
   } from './lib/diagnostics/diagnosticsCards';
   import { previewEdgeCrossing } from './lib/layout/crossingTest';
-  import { analyzeLayoutMismatch, isUsableScreenTopology } from './lib/layout/layoutMismatch';
+  import {
+    analyzeLayoutMismatch,
+    firstLayoutDaemonStartBlockingIssue,
+    isUsableScreenTopology,
+  } from './lib/layout/layoutMismatch';
   import { selectTrustedPeerSessionDraft } from './lib/session/sessionDraft';
   import type {
     ControlMode,
@@ -90,9 +94,13 @@
     void loadLayout();
   });
 
-  function canStartDaemon() {
+  function canStartDaemonPhase() {
     const phase = daemonState.snapshot?.phase;
     return phase === undefined || phase === 'not_running';
+  }
+
+  function canStartDaemon() {
+    return canStartDaemonPhase() && layoutDaemonStartBlockingIssueForView() === null;
   }
 
   function canStopDaemon() {
@@ -102,6 +110,11 @@
   function statusMessage() {
     if (daemonState.lastError) {
       return daemonState.lastError;
+    }
+
+    const layoutStartIssue = layoutDaemonStartBlockingIssueForView();
+    if (canStartDaemonPhase() && layoutStartIssue) {
+      return layoutStartIssue.message;
     }
 
     return daemonState.snapshot?.detail ?? '백그라운드 연결을 시작할 수 있어.';
@@ -322,6 +335,10 @@
     return layoutMismatchReportForView().status;
   }
 
+  function layoutDaemonStartBlockingIssueForView() {
+    return firstLayoutDaemonStartBlockingIssue(layoutMismatchReportForView());
+  }
+
   async function generateDiagnostics() {
     diagnosticsCopyMessage = '';
     await diagnosticsState.refresh();
@@ -503,6 +520,12 @@
   }
 
   function startDaemon() {
+    const layoutStartIssue = layoutDaemonStartBlockingIssueForView();
+    if (layoutStartIssue) {
+      layoutTestMessage = layoutStartIssue.message;
+      return Promise.resolve();
+    }
+
     return daemonState.start({
       ...settingsState.startOptions,
       edgeBindings: layoutState.layout.edgeBindings,

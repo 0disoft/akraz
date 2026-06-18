@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { analyzeLayoutMismatch, isUsableScreenTopology } from "../src/lib/layout/layoutMismatch";
+import {
+  analyzeLayoutMismatch,
+  firstLayoutDaemonStartBlockingIssue,
+  isUsableScreenTopology,
+} from "../src/lib/layout/layoutMismatch";
 import type {
   DiagnosticsScreenTopology,
   IdentityTrustedPeer,
@@ -75,6 +79,38 @@ describe("layout mismatch analysis", () => {
       hasUsableTopology: false,
     });
     expect(report.issues.map((issue) => issue.code)).toEqual(["missing-topology"]);
+  });
+
+  test("allows daemon start for empty or topology-limited layouts", () => {
+    const emptyReport = analyzeLayoutMismatch({
+      layout: layout([]),
+      trustedPeers: [trustedPeer],
+      topology: null,
+    });
+    const limitedReport = analyzeLayoutMismatch({
+      layout: layout([{ localEdge: "right", peerId: trustedPeer.peerId, remoteEdge: "left" }]),
+      trustedPeers: [trustedPeer],
+      topology: null,
+    });
+
+    expect(firstLayoutDaemonStartBlockingIssue(emptyReport)).toBeNull();
+    expect(firstLayoutDaemonStartBlockingIssue(limitedReport)).toBeNull();
+  });
+
+  test("blocks daemon start when saved bindings cannot resolve to one trusted edge", () => {
+    const report = analyzeLayoutMismatch({
+      layout: layout([
+        { localEdge: "right", peerId: "unknown-peer", remoteEdge: "left" },
+        { localEdge: "right", peerId: trustedPeer.peerId, remoteEdge: "left" },
+      ]),
+      trustedPeers: [trustedPeer],
+      topology,
+    });
+
+    expect(firstLayoutDaemonStartBlockingIssue(report)).toMatchObject({
+      code: "unknown-peer",
+      message: "신뢰 목록에 없는 기기가 배치에 남아 있어.",
+    });
   });
 
   test("accepts trusted peer bindings with usable topology", () => {
