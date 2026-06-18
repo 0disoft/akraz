@@ -86,6 +86,8 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
             identity_list_trusted,
             identity_trust,
             identity_forget_trusted,
+            layout_get,
+            layout_set,
             settings_load,
             settings_save
         ])
@@ -392,6 +394,23 @@ async fn identity_forget_trusted(
 }
 
 #[tauri::command]
+async fn layout_get(app: tauri::AppHandle) -> Result<LayoutSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || load_app_layout(&app))
+        .await
+        .map_err(|error| format!("layout get task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn layout_set(
+    app: tauri::AppHandle,
+    layout: LayoutSettings,
+) -> Result<LayoutSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || save_app_layout(&app, layout))
+        .await
+        .map_err(|error| format!("layout set task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn settings_load(app: tauri::AppHandle) -> Result<AppSettings, String> {
     tauri::async_runtime::spawn_blocking(move || load_app_settings(&app))
         .await
@@ -469,6 +488,13 @@ struct AppSettings {
     edge_bindings: Vec<DaemonEdgeBindingOption>,
     #[serde(default)]
     manual_peer_addresses: Vec<ManualPeerAddressSetting>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LayoutSettings {
+    #[serde(default)]
+    edge_bindings: Vec<DaemonEdgeBindingOption>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -993,6 +1019,19 @@ fn save_app_settings(app: &tauri::AppHandle, settings: AppSettings) -> Result<Ap
     save_settings_to_path(&path, settings)
 }
 
+fn load_app_layout(app: &tauri::AppHandle) -> Result<LayoutSettings, String> {
+    let path = app_settings_path(app)?;
+    load_layout_from_path(&path)
+}
+
+fn save_app_layout(
+    app: &tauri::AppHandle,
+    layout: LayoutSettings,
+) -> Result<LayoutSettings, String> {
+    let path = app_settings_path(app)?;
+    save_layout_to_path(&path, layout)
+}
+
 fn load_identity_document(app: &tauri::AppHandle) -> Result<IdentityShowResult, String> {
     let path = daemon_identity_store_path(app)?;
     build_identity_show_result_from_path(&path, DAEMON_IDENTITY_DISPLAY_NAME)
@@ -1194,6 +1233,23 @@ fn save_settings_to_path(path: &PathBuf, settings: AppSettings) -> Result<AppSet
     fs::write(path, contents).map_err(|error| format!("failed to save Akraz settings: {error}"))?;
 
     Ok(settings)
+}
+
+fn load_layout_from_path(path: &PathBuf) -> Result<LayoutSettings, String> {
+    let settings = load_settings_from_path(path)?;
+    Ok(LayoutSettings {
+        edge_bindings: settings.edge_bindings,
+    })
+}
+
+fn save_layout_to_path(path: &PathBuf, layout: LayoutSettings) -> Result<LayoutSettings, String> {
+    let mut settings = load_settings_from_path(path)?;
+    settings.edge_bindings = layout.edge_bindings;
+    let saved = save_settings_to_path(path, settings)?;
+
+    Ok(LayoutSettings {
+        edge_bindings: saved.edge_bindings,
+    })
 }
 
 fn normalize_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
@@ -1663,13 +1719,14 @@ mod tests {
         DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_PEER_LISTEN_ARG, DAEMON_SERVE_ARG,
         DAEMON_SETTINGS_START_SMOKE_FLAG, DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption,
         DaemonLifecyclePhase, DaemonScreenEdgeOption, DaemonStartOptions, IDENTITY_STORE_DIR_NAME,
-        IDENTITY_STORE_FILE_NAME, ManualPeerAddressSetting, build_identity_show_result_from_path,
-        classify_daemon_call_error, daemon_capture_input_enabled_from, daemon_executable_name,
-        daemon_spawn_args_from, default_pairing_capabilities, forget_trusted_identity_from_path,
-        format_edge_binding_arg, has_exact_arg, identity_store_path_from_config_dir,
-        list_trusted_identities_from_path, load_settings_from_path,
-        normalize_session_connect_options, parse_daemon_status_response, parse_json_rpc_response,
-        resolve_env_daemon_executable_from, save_settings_to_path, settings_start_smoke_settings,
+        IDENTITY_STORE_FILE_NAME, LayoutSettings, ManualPeerAddressSetting,
+        build_identity_show_result_from_path, classify_daemon_call_error,
+        daemon_capture_input_enabled_from, daemon_executable_name, daemon_spawn_args_from,
+        default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
+        has_exact_arg, identity_store_path_from_config_dir, list_trusted_identities_from_path,
+        load_layout_from_path, load_settings_from_path, normalize_session_connect_options,
+        parse_daemon_status_response, parse_json_rpc_response, resolve_env_daemon_executable_from,
+        save_layout_to_path, save_settings_to_path, settings_start_smoke_settings,
         trust_identity_document_from_json,
     };
 
@@ -2180,6 +2237,75 @@ mod tests {
 
         assert_eq!(
             save_settings_to_path(&path, settings),
+            Err("edge binding peer id cannot contain ':'.".to_string())
+        );
+    }
+
+    #[test]
+    fn layout_set_updates_edge_bindings_without_replacing_other_settings() {
+        let path = unique_settings_path("layout-roundtrip");
+        let original = AppSettings {
+            capture_input: true,
+            peer_listen_address: "127.0.0.1:4455".to_string(),
+            edge_bindings: Vec::new(),
+            manual_peer_addresses: vec![ManualPeerAddressSetting {
+                peer_id: "linux-laptop".to_string(),
+                address: "127.0.0.1:4456".to_string(),
+            }],
+        };
+        save_settings_to_path(&path, original).expect("save original settings");
+
+        let layout = LayoutSettings {
+            edge_bindings: vec![DaemonEdgeBindingOption {
+                local_edge: DaemonScreenEdgeOption::Right,
+                peer_id: " linux-laptop ".to_string(),
+                remote_edge: DaemonScreenEdgeOption::Left,
+            }],
+        };
+        let saved_layout = save_layout_to_path(&path, layout).expect("save layout");
+
+        assert_eq!(
+            saved_layout,
+            LayoutSettings {
+                edge_bindings: vec![DaemonEdgeBindingOption {
+                    local_edge: DaemonScreenEdgeOption::Right,
+                    peer_id: "linux-laptop".to_string(),
+                    remote_edge: DaemonScreenEdgeOption::Left,
+                }],
+            }
+        );
+        assert_eq!(load_layout_from_path(&path), Ok(saved_layout.clone()));
+        assert_eq!(
+            load_settings_from_path(&path),
+            Ok(AppSettings {
+                capture_input: true,
+                peer_listen_address: "127.0.0.1:4455".to_string(),
+                edge_bindings: saved_layout.edge_bindings,
+                manual_peer_addresses: vec![ManualPeerAddressSetting {
+                    peer_id: "linux-laptop".to_string(),
+                    address: "127.0.0.1:4456".to_string(),
+                }],
+            })
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn layout_set_rejects_edge_bindings_that_break_daemon_cli_contract() {
+        let path = unique_settings_path("layout-invalid");
+
+        assert_eq!(
+            save_layout_to_path(
+                &path,
+                LayoutSettings {
+                    edge_bindings: vec![DaemonEdgeBindingOption {
+                        local_edge: DaemonScreenEdgeOption::Right,
+                        peer_id: "linux:laptop".to_string(),
+                        remote_edge: DaemonScreenEdgeOption::Left,
+                    }],
+                }
+            ),
             Err("edge binding peer id cannot contain ':'.".to_string())
         );
     }

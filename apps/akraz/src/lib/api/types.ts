@@ -144,6 +144,10 @@ export interface ManualPeerAddressSetting {
   address: string;
 }
 
+export interface LayoutSettings {
+  edgeBindings: ScreenEdgeBinding[];
+}
+
 export interface DaemonStartOptions {
   captureInput?: boolean;
   peerListenAddress?: string;
