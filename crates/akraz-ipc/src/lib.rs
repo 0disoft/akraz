@@ -20,7 +20,7 @@ use std::path::Path;
 #[cfg(windows)]
 use std::ptr::{null, null_mut};
 
-use akraz_core::ControlMode;
+use akraz_core::{ControlMode, LogicalPoint, LogicalRect};
 use akraz_platform::PlatformCapabilities;
 use akraz_protocol::ProtocolVersion;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,9 @@ pub const METHOD_DAEMON_STATUS: &str = "daemon.status";
 
 /// JSON-RPC method for platform permission probing.
 pub const METHOD_PERMISSIONS_PROBE: &str = "permissions.probe";
+
+/// JSON-RPC method for sanitized diagnostic screen topology.
+pub const METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY: &str = "diagnostics.screenTopology";
 
 /// JSON-RPC method for emergency input release and local-control recovery.
 pub const METHOD_INPUT_RELEASE_ALL: &str = "input.releaseAll";
@@ -748,6 +751,7 @@ impl<P> JsonRpcRequest<P> {
 pub enum IpcRequest {
     DaemonStatus(JsonRpcRequest<DaemonStatusParams>),
     PermissionsProbe(JsonRpcRequest<PermissionsProbeParams>),
+    DiagnosticsScreenTopology(JsonRpcRequest<DiagnosticsScreenTopologyParams>),
     InputReleaseAll(JsonRpcRequest<InputReleaseAllParams>),
     SessionConnect(JsonRpcRequest<SessionConnectParams>),
     SessionDisconnect(JsonRpcRequest<SessionDisconnectParams>),
@@ -759,6 +763,7 @@ impl IpcRequest {
         match self {
             Self::DaemonStatus(request) => &request.id,
             Self::PermissionsProbe(request) => &request.id,
+            Self::DiagnosticsScreenTopology(request) => &request.id,
             Self::InputReleaseAll(request) => &request.id,
             Self::SessionConnect(request) => &request.id,
             Self::SessionDisconnect(request) => &request.id,
@@ -770,6 +775,7 @@ impl IpcRequest {
         match self {
             Self::DaemonStatus(request) => &request.method,
             Self::PermissionsProbe(request) => &request.method,
+            Self::DiagnosticsScreenTopology(request) => &request.method,
             Self::InputReleaseAll(request) => &request.method,
             Self::SessionConnect(request) => &request.method,
             Self::SessionDisconnect(request) => &request.method,
@@ -859,6 +865,11 @@ pub struct DaemonStatusParams {}
 #[serde(rename_all = "camelCase")]
 pub struct PermissionsProbeParams {}
 
+/// Empty params for `diagnostics.screenTopology`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsScreenTopologyParams {}
+
 /// Empty params for `input.releaseAll`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -938,6 +949,44 @@ impl From<PlatformCapabilities> for IpcPlatformCapabilities {
     }
 }
 
+/// Wire-safe logical point snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogicalPointSnapshot {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl From<LogicalPoint> for LogicalPointSnapshot {
+    fn from(point: LogicalPoint) -> Self {
+        Self {
+            x: point.x,
+            y: point.y,
+        }
+    }
+}
+
+/// Wire-safe logical rectangle snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogicalRectSnapshot {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl From<LogicalRect> for LogicalRectSnapshot {
+    fn from(rect: LogicalRect) -> Self {
+        Self {
+            x: rect.origin.x,
+            y: rect.origin.y,
+            width: rect.size.width,
+            height: rect.size.height,
+        }
+    }
+}
+
 /// Minimal peer status placeholder for the first status contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -965,6 +1014,14 @@ pub struct PermissionsProbe {
     pub adapter_name: String,
     pub capabilities: IpcPlatformCapabilities,
     pub issues: Vec<PermissionIssue>,
+}
+
+/// Sanitized screen topology facts for diagnostic snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsScreenTopology {
+    pub pointer_position: LogicalPointSnapshot,
+    pub virtual_screen_bounds: LogicalRectSnapshot,
 }
 
 /// `input.releaseAll` result.
@@ -1123,6 +1180,9 @@ pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
     match raw.method.as_str() {
         METHOD_DAEMON_STATUS => parse_typed_request(raw).map(IpcRequest::DaemonStatus),
         METHOD_PERMISSIONS_PROBE => parse_typed_request(raw).map(IpcRequest::PermissionsProbe),
+        METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY => {
+            parse_typed_request(raw).map(IpcRequest::DiagnosticsScreenTopology)
+        }
         METHOD_INPUT_RELEASE_ALL => parse_typed_request(raw).map(IpcRequest::InputReleaseAll),
         METHOD_SESSION_CONNECT => parse_typed_request(raw).map(IpcRequest::SessionConnect),
         METHOD_SESSION_DISCONNECT => parse_typed_request(raw).map(IpcRequest::SessionDisconnect),
@@ -1171,15 +1231,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlModeSnapshot, DaemonStatus, DaemonStatusParams, InProcessIpcClient, IpcEndpoint,
-        IpcEndpointEnvironment, IpcEndpointError, IpcEndpointKind, IpcOperatingSystem,
-        IpcPlatformCapabilities, IpcRequest, IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS,
-        JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess,
-        LocalIpcClient, LocalIpcServer, METHOD_DAEMON_STATUS, METHOD_INPUT_RELEASE_ALL,
-        METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
-        ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult,
-        SessionDisconnectParams, SessionDisconnectResult, SessionStatus, call_json_rpc,
-        parse_request_line, resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
+        ControlModeSnapshot, DaemonStatus, DaemonStatusParams, DiagnosticsScreenTopology,
+        DiagnosticsScreenTopologyParams, InProcessIpcClient, IpcEndpoint, IpcEndpointEnvironment,
+        IpcEndpointError, IpcEndpointKind, IpcOperatingSystem, IpcPlatformCapabilities, IpcRequest,
+        IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS, JSONRPC_ERROR_METHOD_NOT_FOUND,
+        JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient, LocalIpcServer,
+        LogicalPointSnapshot, LogicalRectSnapshot, METHOD_DAEMON_STATUS,
+        METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT,
+        METHOD_SESSION_DISCONNECT, OsLocalIpcClient, ProtocolVersionSnapshot, SessionConnectParams,
+        SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult, SessionStatus,
+        call_json_rpc, parse_request_line, resolve_default_endpoint, serve_os_local_ipc_once,
+        to_json_line,
     };
     use serde_json::json;
 
@@ -1323,6 +1385,44 @@ mod tests {
                         "canCaptureKeyboard": true,
                         "canInjectPointer": true,
                         "canInjectKeyboard": true
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn diagnostics_screen_topology_response_uses_camel_case_contract() {
+        let topology = DiagnosticsScreenTopology {
+            pointer_position: LogicalPointSnapshot { x: 1919, y: 540 },
+            virtual_screen_bounds: LogicalRectSnapshot {
+                x: -1920,
+                y: 0,
+                width: 3840,
+                height: 1080,
+            },
+        };
+        let response = JsonRpcSuccess::new("req_1", topology);
+        let line = match to_json_line(&response) {
+            Ok(line) => line,
+            Err(error) => panic!("expected response serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "result": {
+                    "pointerPosition": {
+                        "x": 1919,
+                        "y": 540
+                    },
+                    "virtualScreenBounds": {
+                        "x": -1920,
+                        "y": 0,
+                        "width": 3840,
+                        "height": 1080
                     }
                 }
             })
@@ -1530,6 +1630,24 @@ mod tests {
         assert_eq!(
             parse_request_line(&line),
             Ok(IpcRequest::DaemonStatus(request))
+        );
+    }
+
+    #[test]
+    fn parses_diagnostics_screen_topology_request_line() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+            DiagnosticsScreenTopologyParams::default(),
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(IpcRequest::DiagnosticsScreenTopology(request))
         );
     }
 

@@ -147,6 +147,7 @@ function assertDiagnosticsSnapshot(snapshot) {
   assertCapabilities(snapshot.daemon.capabilities, "daemon");
   assertCapabilities(snapshot.permissions?.capabilities, "permissions");
   assertPermissionIssues(snapshot.permissions);
+  assertScreenTopology(snapshot.screenTopology);
   assertPrivacy(snapshot.privacy);
   assertUnavailableSections(snapshot.unavailableSections);
   assertNoSensitiveFields(snapshot);
@@ -205,6 +206,26 @@ function assertPermissionIssues(permissions) {
   }
 }
 
+function assertScreenTopology(screenTopology) {
+  const pointerPosition = screenTopology?.pointerPosition;
+  if (typeof pointerPosition?.x !== "number" || typeof pointerPosition.y !== "number") {
+    throw new Error("diagnostics snapshot reported an invalid pointer position");
+  }
+
+  const bounds = screenTopology.virtualScreenBounds;
+  if (
+    typeof bounds?.x !== "number" ||
+    typeof bounds.y !== "number" ||
+    typeof bounds.width !== "number" ||
+    typeof bounds.height !== "number"
+  ) {
+    throw new Error("diagnostics snapshot reported invalid virtual screen bounds");
+  }
+  if (bounds.width <= 0 || bounds.height <= 0) {
+    throw new Error("diagnostics snapshot reported non-positive virtual screen bounds");
+  }
+}
+
 function assertPrivacy(privacy) {
   const expectedFalseKeys = [
     "includesActualKeyInput",
@@ -222,7 +243,7 @@ function assertPrivacy(privacy) {
 }
 
 function assertUnavailableSections(sections) {
-  const expected = ["recentLogs", "screenTopology", "latencyHistogram"];
+  const expected = ["recentLogs", "latencyHistogram"];
   if (!Array.isArray(sections) || sections.length !== expected.length) {
     throw new Error("diagnostics snapshot reported unexpected unavailable sections");
   }

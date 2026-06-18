@@ -21,9 +21,9 @@ use akraz_identity::{
     TrustedPeer,
 };
 use akraz_ipc::{
-    ControlModeSnapshot, DaemonStatus, InputReleaseAllResult, IpcCodecError,
-    IpcPlatformCapabilities, IpcRequest, IpcTransportError, JsonRpcError, JsonRpcFailure,
-    JsonRpcSuccess, LocalIpcServer, PeerStatus, PermissionIssue, PermissionsProbe,
+    ControlModeSnapshot, DaemonStatus, DiagnosticsScreenTopology, InputReleaseAllResult,
+    IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError, JsonRpcError,
+    JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PeerStatus, PermissionIssue, PermissionsProbe,
     ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult, SessionDisconnectResult,
     SessionStatus, parse_request_line, serve_os_local_ipc_once, to_json_line,
 };
@@ -2392,6 +2392,18 @@ pub fn build_daemon_status_with_peer_sessions(
     })
 }
 
+/// Build a sanitized `diagnostics.screenTopology` result from the selected platform adapter.
+pub fn build_diagnostics_screen_topology(
+    platform: &impl PlatformAdapter,
+) -> Result<DiagnosticsScreenTopology, PlatformError> {
+    let geometry = platform.read_desktop_geometry()?;
+
+    Ok(DiagnosticsScreenTopology {
+        pointer_position: geometry.pointer_position.into(),
+        virtual_screen_bounds: geometry.virtual_screen_bounds.into(),
+    })
+}
+
 /// Handle one local IPC JSON-RPC request line.
 pub fn handle_ipc_request_line(
     state: &mut RuntimeInputState,
@@ -2440,6 +2452,14 @@ fn handle_ipc_request(
             Ok(probe) => encode_response(&JsonRpcSuccess::new(request.id, probe)),
             Err(error) => encode_platform_error(request.id, "permissions probe unavailable", error),
         },
+        IpcRequest::DiagnosticsScreenTopology(request) => {
+            match build_diagnostics_screen_topology(platform) {
+                Ok(topology) => encode_response(&JsonRpcSuccess::new(request.id, topology)),
+                Err(error) => {
+                    encode_platform_error(request.id, "screen topology unavailable", error)
+                }
+            }
+        }
         IpcRequest::InputReleaseAll(request) => {
             match recover_local_control_and_release_inputs(state, dispatcher) {
                 Ok(result) => encode_response(&JsonRpcSuccess::new(request.id, result)),
@@ -2676,11 +2696,12 @@ mod tests {
         TrustedPeer, TrustedPeerIdentity, fingerprint_for_public_key,
     };
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonStatus, DaemonStatusParams, InputReleaseAllParams,
-        InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities, JsonRpcFailure,
-        JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_STATUS,
-        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, OsLocalIpcClient, PeerStatus,
-        SessionConnectParams, SessionDisconnectResult, SessionStatus, call_json_rpc, to_json_line,
+        ControlModeSnapshot, DaemonStatus, DaemonStatusParams, DiagnosticsScreenTopology,
+        DiagnosticsScreenTopologyParams, InputReleaseAllParams, InputReleaseAllResult, IpcEndpoint,
+        IpcPlatformCapabilities, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer,
+        METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL,
+        METHOD_SESSION_CONNECT, OsLocalIpcClient, PeerStatus, SessionConnectParams,
+        SessionDisconnectResult, SessionStatus, call_json_rpc, to_json_line,
     };
     use akraz_platform::{
         DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, InputCapturePolicy,
@@ -2701,9 +2722,9 @@ mod tests {
         PeerTransportInputEvent, PeerTransportMessage, PeerTransportProtocolVersion,
         PeerTransportSessionFrame, TcpPeerSessionTransport, TcpPeerTransport,
         TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
-        build_daemon_status_with_peer_sessions, build_permissions_probe, connect_peer_session,
-        disconnect_peer_session, drain_capture_events,
-        execute_authenticated_peer_transport_session_stream_until_closed,
+        build_daemon_status_with_peer_sessions, build_diagnostics_screen_topology,
+        build_permissions_probe, connect_peer_session, disconnect_peer_session,
+        drain_capture_events, execute_authenticated_peer_transport_session_stream_until_closed,
         execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
         execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
         handle_ipc_request_line, input_capture_policy_for_control_mode,
@@ -2731,6 +2752,13 @@ mod tests {
         match build_permissions_probe(platform) {
             Ok(probe) => probe,
             Err(error) => panic!("expected permission probe: {error}"),
+        }
+    }
+
+    fn topology_or_panic(platform: &FakePlatformAdapter) -> akraz_ipc::DiagnosticsScreenTopology {
+        match build_diagnostics_screen_topology(platform) {
+            Ok(topology) => topology,
+            Err(error) => panic!("expected screen topology: {error}"),
         }
     }
 
@@ -3096,6 +3124,29 @@ mod tests {
         assert_eq!(probe.issues.len(), 2);
         assert_eq!(probe.issues[0].code, "capture_keyboard_unavailable");
         assert_eq!(probe.issues[1].code, "inject_keyboard_unavailable");
+    }
+
+    #[test]
+    fn diagnostics_screen_topology_reflects_desktop_geometry() {
+        let platform = FakePlatformAdapter::default().with_desktop_geometry(DesktopGeometry {
+            pointer_position: LogicalPoint { x: 1919, y: 540 },
+            virtual_screen_bounds: LogicalRect {
+                origin: LogicalPoint { x: -1920, y: 0 },
+                size: LogicalSize {
+                    width: 3840,
+                    height: 1080,
+                },
+            },
+        });
+
+        let topology = topology_or_panic(&platform);
+
+        assert_eq!(topology.pointer_position.x, 1919);
+        assert_eq!(topology.pointer_position.y, 540);
+        assert_eq!(topology.virtual_screen_bounds.x, -1920);
+        assert_eq!(topology.virtual_screen_bounds.y, 0);
+        assert_eq!(topology.virtual_screen_bounds.width, 3840);
+        assert_eq!(topology.virtual_screen_bounds.height, 1080);
     }
 
     #[test]
@@ -4547,6 +4598,51 @@ mod tests {
         assert_eq!(response.id, "req_1");
         assert_eq!(response.result.daemon_version, DAEMON_VERSION);
         assert_eq!(response.result.mode, ControlModeSnapshot::Local);
+    }
+
+    #[test]
+    fn ipc_dispatch_handles_diagnostics_screen_topology_request() {
+        let mut state = RuntimeInputState::new();
+        let platform = FakePlatformAdapter::default().with_desktop_geometry(DesktopGeometry {
+            pointer_position: LogicalPoint { x: 1919, y: 540 },
+            virtual_screen_bounds: LogicalRect {
+                origin: LogicalPoint { x: -1920, y: 0 },
+                size: LogicalSize {
+                    width: 3840,
+                    height: 1080,
+                },
+            },
+        });
+        let dispatcher =
+            LocalPlatformCoreActionDispatcher::new(platform.clone(), NoopCoreActionDispatcher);
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+            DiagnosticsScreenTopologyParams::default(),
+        );
+        let request_line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        let response_line =
+            match handle_ipc_request_line(&mut state, &platform, &dispatcher, &request_line) {
+                Ok(line) => line,
+                Err(error) => panic!("expected daemon IPC response: {error}"),
+            };
+        let response: JsonRpcSuccess<DiagnosticsScreenTopology> =
+            match serde_json::from_str(&response_line) {
+                Ok(response) => response,
+                Err(error) => panic!("expected screen topology response JSON: {error}"),
+            };
+
+        assert_eq!(response.id, "req_1");
+        assert_eq!(response.result.pointer_position.x, 1919);
+        assert_eq!(response.result.pointer_position.y, 540);
+        assert_eq!(response.result.virtual_screen_bounds.x, -1920);
+        assert_eq!(response.result.virtual_screen_bounds.y, 0);
+        assert_eq!(response.result.virtual_screen_bounds.width, 3840);
+        assert_eq!(response.result.virtual_screen_bounds.height, 1080);
     }
 
     #[test]
