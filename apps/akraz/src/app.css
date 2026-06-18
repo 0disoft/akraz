@@ -205,6 +205,17 @@ h2 {
   margin-bottom: 0;
 }
 
+.layout-test-result {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #bdd4b8;
+  border-radius: 8px;
+  color: #2e3a32;
+  background: #eef8ed;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
 .session-block {
   margin-top: 18px;
 }

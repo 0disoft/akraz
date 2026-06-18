@@ -17,6 +17,7 @@
     screenTopologySummary,
     unavailableSectionsSummary,
   } from './lib/diagnostics/diagnosticsSnapshot';
+  import { previewEdgeCrossing } from './lib/layout/crossingTest';
   import { selectTrustedPeerSessionDraft } from './lib/session/sessionDraft';
   import type {
     ControlMode,
@@ -74,6 +75,7 @@
   let diagnosticsCopyMessage = $state('');
   let selectedLayoutBindingIndex = $state(0);
   let draggedLayoutBindingIndex = $state<number | null>(null);
+  let layoutTestMessage = $state('');
 
   onMount(() => {
     void daemonState.refresh();
@@ -178,17 +180,20 @@
 
   function selectLayoutBinding(index: number) {
     selectedLayoutBindingIndex = Math.max(0, Math.min(index, layoutState.layout.edgeBindings.length - 1));
+    layoutTestMessage = '';
   }
 
   function addLayoutBinding() {
     const nextIndex = layoutState.layout.edgeBindings.length;
     layoutState.addEdgeBinding();
     selectedLayoutBindingIndex = nextIndex;
+    layoutTestMessage = '';
   }
 
   function removeLayoutBinding(index: number) {
     layoutState.removeEdgeBinding(index);
     selectedLayoutBindingIndex = Math.max(0, Math.min(selectedLayoutBindingIndex, layoutState.layout.edgeBindings.length - 2));
+    layoutTestMessage = '';
   }
 
   function moveSelectedLayoutBinding(localEdge: ScreenEdge) {
@@ -198,6 +203,7 @@
     }
 
     layoutState.moveEdgeBinding(selectedLayoutBindingIndex, localEdge, oppositeEdge(localEdge));
+    layoutTestMessage = '';
   }
 
   function startLayoutDrag(index: number) {
@@ -215,6 +221,7 @@
     selectedLayoutBindingIndex = bindingIndex;
     layoutState.moveEdgeBinding(bindingIndex, localEdge, oppositeEdge(localEdge));
     draggedLayoutBindingIndex = null;
+    layoutTestMessage = '';
   }
 
   function endLayoutDrag() {
@@ -448,6 +455,8 @@
     const layout = await layoutState.load();
     if (layout) {
       settingsState.replaceEdgeBindings(layout.edgeBindings);
+      selectedLayoutBindingIndex = 0;
+      layoutTestMessage = '';
     }
   }
 
@@ -463,6 +472,26 @@
       ...settingsState.startOptions,
       edgeBindings: layoutState.layout.edgeBindings,
     });
+  }
+
+  function testSelectedLayoutBinding() {
+    const binding = selectedLayoutBinding();
+    if (!binding) {
+      layoutTestMessage = '테스트할 경계가 없어.';
+      return;
+    }
+    if (!layoutState.topology) {
+      layoutTestMessage = '먼저 화면을 확인해야 해.';
+      return;
+    }
+
+    const preview = previewEdgeCrossing(binding, layoutState.topology);
+    if (!preview) {
+      layoutTestMessage = '기기 ID가 필요해.';
+      return;
+    }
+
+    layoutTestMessage = `${edgeLabels[preview.localEdge]} 끝으로 밀면 ${preview.peerId} ${edgeLabels[preview.remoteEdge]}으로 넘어가.`;
   }
 </script>
 
@@ -1019,6 +1048,10 @@
         {/if}
       </div>
 
+      {#if layoutTestMessage}
+        <p class="layout-test-result" aria-live="polite">{layoutTestMessage}</p>
+      {/if}
+
       <div class="settings-actions">
         <button
           type="button"
@@ -1035,6 +1068,14 @@
           onclick={() => layoutState.refreshTopology()}
         >
           {layoutState.topologyOperation === 'probe' ? '확인 중' : '화면 확인'}
+        </button>
+        <button
+          type="button"
+          class="control-button secondary"
+          disabled={layoutState.layout.edgeBindings.length === 0}
+          onclick={testSelectedLayoutBinding}
+        >
+          테스트
         </button>
         <button
           type="button"
