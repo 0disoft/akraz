@@ -55,6 +55,7 @@ export interface ManualPeerAddressSetting {
 
 export interface DaemonStartOptions {
   captureInput?: boolean;
+  peerListenAddress?: string;
   edgeBindings?: ScreenEdgeBinding[];
 }
 
@@ -131,6 +132,7 @@ export interface IdentityForgetTrustedResult {
 
 export interface AppSettings {
   captureInput: boolean;
+  peerListenAddress: string;
   edgeBindings: ScreenEdgeBinding[];
   manualPeerAddresses: ManualPeerAddressSetting[];
 }

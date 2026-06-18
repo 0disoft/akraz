@@ -232,6 +232,19 @@ h3 {
   accent-color: #2e3a32;
 }
 
+.peer-listen-row {
+  display: grid;
+  max-width: 360px;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.peer-listen-row span {
+  color: #687280;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
 .edge-list {
   display: grid;
   gap: 10px;
@@ -292,6 +305,7 @@ h3 {
 .edge-row select,
 .session-row input,
 .session-row select,
+.peer-listen-row input,
 .manual-address-row input,
 .document-field textarea {
   width: 100%;
@@ -316,6 +330,7 @@ h3 {
 .edge-row select:focus-visible,
 .session-row input:focus-visible,
 .session-row select:focus-visible,
+.peer-listen-row input:focus-visible,
 .manual-address-row input:focus-visible,
 .document-field textarea:focus-visible,
 .toggle-row input:focus-visible {

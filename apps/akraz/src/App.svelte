@@ -527,6 +527,18 @@
         <span>입력 잡기</span>
       </label>
 
+      <label class="peer-listen-row">
+        <span>받는 주소</span>
+        <input
+          type="text"
+          value={settingsState.settings.peerListenAddress}
+          placeholder="0.0.0.0:4455"
+          spellcheck="false"
+          disabled={settingsState.isBusy}
+          oninput={(event) => settingsState.updatePeerListenAddress(event.currentTarget.value)}
+        />
+      </label>
+
       <div class="edge-list" aria-label="화면 끝 연결">
         {#each settingsState.settings.edgeBindings as binding, index}
           <div class="edge-row">

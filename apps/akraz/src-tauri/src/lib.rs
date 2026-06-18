@@ -31,6 +31,7 @@ const DAEMON_SIDECAR_NAME: &str = "akraz-daemon";
 const DAEMON_SERVE_ARG: &str = "--serve";
 const DAEMON_CAPTURE_INPUT_ARG: &str = "--capture-input";
 const DAEMON_EDGE_BINDING_ARG: &str = "--edge-binding";
+const DAEMON_PEER_LISTEN_ARG: &str = "--peer-listen";
 const DAEMON_IDENTITY_STORE_ARG: &str = "--identity-store";
 const DAEMON_IDENTITY_DISPLAY_NAME_ARG: &str = "--identity-display-name";
 const DAEMON_IDENTITY_DISPLAY_NAME: &str = "Akraz Desktop";
@@ -187,6 +188,7 @@ fn run_daemon_settings_start_smoke() -> Result<(), String> {
 fn settings_start_smoke_settings() -> AppSettings {
     AppSettings {
         capture_input: true,
+        peer_listen_address: String::new(),
         edge_bindings: vec![DaemonEdgeBindingOption {
             local_edge: DaemonScreenEdgeOption::Right,
             peer_id: "linux-laptop".to_string(),
@@ -398,6 +400,8 @@ struct AppSettings {
     #[serde(default)]
     capture_input: bool,
     #[serde(default)]
+    peer_listen_address: String,
+    #[serde(default)]
     edge_bindings: Vec<DaemonEdgeBindingOption>,
     #[serde(default)]
     manual_peer_addresses: Vec<ManualPeerAddressSetting>,
@@ -407,6 +411,7 @@ struct AppSettings {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DaemonStartOptions {
     capture_input: Option<bool>,
+    peer_listen_address: Option<String>,
     #[serde(default)]
     edge_bindings: Vec<DaemonEdgeBindingOption>,
 }
@@ -478,6 +483,7 @@ impl From<AppSettings> for DaemonStartOptions {
     fn from(settings: AppSettings) -> Self {
         Self {
             capture_input: Some(settings.capture_input),
+            peer_listen_address: non_empty_string(settings.peer_listen_address),
             edge_bindings: settings.edge_bindings,
         }
     }
@@ -990,6 +996,8 @@ fn save_settings_to_path(path: &PathBuf, settings: AppSettings) -> Result<AppSet
 }
 
 fn normalize_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
+    settings.peer_listen_address =
+        normalize_optional_session_address(&settings.peer_listen_address)?;
     settings.edge_bindings = settings
         .edge_bindings
         .into_iter()
@@ -1050,6 +1058,15 @@ fn normalize_manual_peer_address_peer_id(peer_id: &str) -> Result<&str, String> 
     }
 
     Ok(peer_id)
+}
+
+fn normalize_optional_session_address(address: &str) -> Result<String, String> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Ok(String::new());
+    }
+
+    Ok(normalize_session_address(address)?.to_string())
 }
 
 fn normalize_session_connect_options(
@@ -1250,6 +1267,16 @@ fn daemon_spawn_args_from(
     {
         args.push(DAEMON_CAPTURE_INPUT_ARG.to_string());
     }
+    if let Some(peer_listen_address) = &options.peer_listen_address {
+        let peer_listen_address = normalize_optional_session_address(peer_listen_address)?;
+        if !peer_listen_address.is_empty() {
+            if identity_store_path.is_none() {
+                return Err("peer listener requires an identity store.".to_string());
+            }
+            args.push(DAEMON_PEER_LISTEN_ARG.to_string());
+            args.push(peer_listen_address);
+        }
+    }
     for binding in &options.edge_bindings {
         args.push(DAEMON_EDGE_BINDING_ARG.to_string());
         args.push(format_edge_binding_arg(binding)?);
@@ -1285,6 +1312,11 @@ fn normalize_peer_id(peer_id: &str) -> Result<&str, String> {
     }
 
     Ok(peer_id)
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn daemon_capture_input_enabled_from(value: Option<OsString>) -> bool {
@@ -1425,16 +1457,17 @@ mod tests {
     use super::{
         AppSettings, DAEMON_CAPTURE_INPUT_ARG, DAEMON_EDGE_BINDING_ARG,
         DAEMON_IDENTITY_DISPLAY_NAME, DAEMON_IDENTITY_DISPLAY_NAME_ARG, DAEMON_IDENTITY_STORE_ARG,
-        DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_SERVE_ARG, DAEMON_SETTINGS_START_SMOKE_FLAG,
-        DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase, DaemonScreenEdgeOption,
-        DaemonStartOptions, IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME,
-        ManualPeerAddressSetting, build_identity_show_result_from_path, classify_daemon_call_error,
-        daemon_capture_input_enabled_from, daemon_executable_name, daemon_spawn_args_from,
-        default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
-        has_exact_arg, identity_store_path_from_config_dir, list_trusted_identities_from_path,
-        load_settings_from_path, normalize_session_connect_options, parse_daemon_status_response,
-        parse_json_rpc_response, resolve_env_daemon_executable_from, save_settings_to_path,
-        settings_start_smoke_settings, trust_identity_document_from_json,
+        DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_PEER_LISTEN_ARG, DAEMON_SERVE_ARG,
+        DAEMON_SETTINGS_START_SMOKE_FLAG, DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption,
+        DaemonLifecyclePhase, DaemonScreenEdgeOption, DaemonStartOptions, IDENTITY_STORE_DIR_NAME,
+        IDENTITY_STORE_FILE_NAME, ManualPeerAddressSetting, build_identity_show_result_from_path,
+        classify_daemon_call_error, daemon_capture_input_enabled_from, daemon_executable_name,
+        daemon_spawn_args_from, default_pairing_capabilities, forget_trusted_identity_from_path,
+        format_edge_binding_arg, has_exact_arg, identity_store_path_from_config_dir,
+        list_trusted_identities_from_path, load_settings_from_path,
+        normalize_session_connect_options, parse_daemon_status_response, parse_json_rpc_response,
+        resolve_env_daemon_executable_from, save_settings_to_path, settings_start_smoke_settings,
+        trust_identity_document_from_json,
     };
 
     fn status_fixture() -> DaemonStatus {
@@ -1608,6 +1641,7 @@ mod tests {
             daemon_spawn_args_from(
                 &DaemonStartOptions {
                     capture_input: Some(false),
+                    peer_listen_address: None,
                     edge_bindings: Vec::new(),
                 },
                 Some(OsString::from("1")),
@@ -1641,6 +1675,7 @@ mod tests {
     fn daemon_spawn_args_include_configured_edge_bindings() {
         let options = DaemonStartOptions {
             capture_input: Some(true),
+            peer_listen_address: None,
             edge_bindings: vec![DaemonEdgeBindingOption {
                 local_edge: DaemonScreenEdgeOption::Right,
                 peer_id: " linux-laptop ".to_string(),
@@ -1656,6 +1691,33 @@ mod tests {
                 DAEMON_EDGE_BINDING_ARG.to_string(),
                 "right:linux-laptop:left".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn daemon_spawn_args_include_configured_peer_listener() {
+        let identity_store_path = PathBuf::from("akraz-identity.json");
+        let options = DaemonStartOptions {
+            capture_input: Some(false),
+            peer_listen_address: Some(" 127.0.0.1:4455 ".to_string()),
+            edge_bindings: Vec::new(),
+        };
+
+        assert_eq!(
+            daemon_spawn_args_from(&options, None, Some(&identity_store_path)),
+            Ok(vec![
+                DAEMON_SERVE_ARG.to_string(),
+                DAEMON_IDENTITY_STORE_ARG.to_string(),
+                "akraz-identity.json".to_string(),
+                DAEMON_IDENTITY_DISPLAY_NAME_ARG.to_string(),
+                DAEMON_IDENTITY_DISPLAY_NAME.to_string(),
+                DAEMON_PEER_LISTEN_ARG.to_string(),
+                "127.0.0.1:4455".to_string()
+            ])
+        );
+        assert_eq!(
+            daemon_spawn_args_from(&options, None, None),
+            Err("peer listener requires an identity store.".to_string())
         );
     }
 
@@ -1806,6 +1868,7 @@ mod tests {
         let path = unique_settings_path("roundtrip");
         let settings = AppSettings {
             capture_input: true,
+            peer_listen_address: " 127.0.0.1:4455 ".to_string(),
             edge_bindings: vec![DaemonEdgeBindingOption {
                 local_edge: DaemonScreenEdgeOption::Right,
                 peer_id: " linux-laptop ".to_string(),
@@ -1833,6 +1896,7 @@ mod tests {
             saved,
             AppSettings {
                 capture_input: true,
+                peer_listen_address: "127.0.0.1:4455".to_string(),
                 edge_bindings: vec![DaemonEdgeBindingOption {
                     local_edge: DaemonScreenEdgeOption::Right,
                     peer_id: "linux-laptop".to_string(),
@@ -1854,6 +1918,7 @@ mod tests {
         let path = unique_settings_path("invalid");
         let settings = AppSettings {
             capture_input: true,
+            peer_listen_address: String::new(),
             edge_bindings: vec![DaemonEdgeBindingOption {
                 local_edge: DaemonScreenEdgeOption::Right,
                 peer_id: "linux:laptop".to_string(),
@@ -1877,6 +1942,7 @@ mod tests {
                 &path,
                 AppSettings {
                     capture_input: false,
+                    peer_listen_address: String::new(),
                     edge_bindings: Vec::new(),
                     manual_peer_addresses: vec![ManualPeerAddressSetting {
                         peer_id: "linux:laptop".to_string(),
@@ -1891,6 +1957,7 @@ mod tests {
                 &path,
                 AppSettings {
                     capture_input: false,
+                    peer_listen_address: String::new(),
                     edge_bindings: Vec::new(),
                     manual_peer_addresses: vec![ManualPeerAddressSetting {
                         peer_id: "linux-laptop".to_string(),

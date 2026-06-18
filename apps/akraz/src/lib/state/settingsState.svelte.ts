@@ -1,11 +1,12 @@
 import { settingsClient } from "../api/settingsClient";
-import type { AppSettings, ScreenEdge, ScreenEdgeBinding } from "../api/types";
+import type { AppSettings, DaemonStartOptions, ScreenEdge, ScreenEdgeBinding } from "../api/types";
 
 type SettingsOperation = "load" | "save";
 
 function defaultSettings(): AppSettings {
   return {
     captureInput: false,
+    peerListenAddress: "",
     edgeBindings: [],
     manualPeerAddresses: [],
   };
@@ -29,11 +30,17 @@ export class SettingsState {
     return this.operation !== null;
   }
 
-  get startOptions() {
-    return {
+  get startOptions(): DaemonStartOptions {
+    const peerListenAddress = this.settings.peerListenAddress.trim();
+    const options: DaemonStartOptions = {
       captureInput: this.settings.captureInput,
       edgeBindings: this.settings.edgeBindings,
     };
+    if (peerListenAddress.length > 0) {
+      options.peerListenAddress = peerListenAddress;
+    }
+
+    return options;
   }
 
   addEdgeBinding() {
@@ -50,6 +57,11 @@ export class SettingsState {
 
   updateCaptureInput(captureInput: boolean) {
     this.settings.captureInput = captureInput;
+    this.saved = false;
+  }
+
+  updatePeerListenAddress(peerListenAddress: string) {
+    this.settings.peerListenAddress = peerListenAddress;
     this.saved = false;
   }
 
