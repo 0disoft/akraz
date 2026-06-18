@@ -3,6 +3,7 @@
 
   import { daemonState } from './lib/state/daemonState.svelte';
   import { identityState } from './lib/state/identityState.svelte';
+  import { permissionState } from './lib/state/permissionState.svelte';
   import { settingsState } from './lib/state/settingsState.svelte';
   import { selectTrustedPeerSessionDraft } from './lib/session/sessionDraft';
   import type {
@@ -107,6 +108,19 @@
       return `${identityState.trusted.displayName} 등록됨`;
     }
     return identityState.local ? '준비됨' : '대기 중';
+  }
+
+  function permissionMessage() {
+    if (permissionState.operation === 'probe') {
+      return '확인 중';
+    }
+    if (permissionState.lastError) {
+      return permissionState.lastError;
+    }
+    if (permissionState.probe) {
+      return permissionState.probe.issues.length === 0 ? '정상' : `${permissionState.probe.issues.length}개 필요`;
+    }
+    return '대기 중';
   }
 
   function canTrustIdentity() {
@@ -299,7 +313,10 @@
 
       <div class="grid">
         <section class="section-block" aria-labelledby="capabilities-title">
-          <h2 id="capabilities-title">입출력 권한</h2>
+          <div class="section-heading-row">
+            <h2 id="capabilities-title">입출력 권한</h2>
+            <span class:error-text={permissionState.lastError}>{permissionMessage()}</span>
+          </div>
           <div class="capability-list">
             {#each capabilityRows as row}
               <div class="capability-row">
@@ -309,6 +326,36 @@
                 </strong>
               </div>
             {/each}
+          </div>
+
+          {#if permissionState.probe}
+            <div class="permission-summary">
+              <span>어댑터</span>
+              <strong>{permissionState.probe.adapterName}</strong>
+            </div>
+            {#if permissionState.probe.issues.length === 0}
+              <p class="muted permission-note">막힌 권한이 없어.</p>
+            {:else}
+              <ul class="permission-issue-list" aria-label="권한 문제">
+                {#each permissionState.probe.issues as issue (issue.code)}
+                  <li>
+                    <code>{issue.code}</code>
+                    <span>{issue.message}</span>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          {/if}
+
+          <div class="settings-actions">
+            <button
+              type="button"
+              class="control-button secondary compact"
+              disabled={permissionState.isBusy || daemonState.isBusy}
+              onclick={() => permissionState.refresh()}
+            >
+              {permissionState.operation === 'probe' ? '확인 중' : '권한 확인'}
+            </button>
           </div>
         </section>
 

@@ -12,9 +12,9 @@ use akraz_ipc::{
     DaemonStatus, DaemonStatusParams, InputReleaseAllParams, InputReleaseAllResult, IpcCallError,
     IpcEndpoint, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
     JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_STATUS, METHOD_INPUT_RELEASE_ALL,
-    METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, SessionConnectResult,
-    SessionDisconnectParams, SessionDisconnectResult, call_json_rpc,
-    resolve_current_default_endpoint,
+    METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
+    PermissionsProbe, PermissionsProbeParams, SessionConnectResult, SessionDisconnectParams,
+    SessionDisconnectResult, call_json_rpc, resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,7 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
         .manage(managed)
         .invoke_handler(tauri::generate_handler![
             daemon_status,
+            permissions_probe,
             daemon_start,
             daemon_stop,
             session_connect,
@@ -254,6 +255,13 @@ async fn daemon_status(
     tauri::async_runtime::spawn_blocking(move || refresh_daemon_snapshot(&managed))
         .await
         .map_err(|error| format!("daemon status task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn permissions_probe() -> Result<PermissionsProbe, String> {
+    tauri::async_runtime::spawn_blocking(call_daemon_permissions_probe)
+        .await
+        .map_err(|error| format!("permissions probe task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -742,6 +750,19 @@ fn call_daemon_status_result() -> Result<DaemonStatus, DaemonCallFailure> {
 
     parse_json_rpc_response::<DaemonStatus>(&response_line, "status")
         .map_err(DaemonCallFailure::Failed)
+}
+
+fn call_daemon_permissions_probe() -> Result<PermissionsProbe, String> {
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    let request = JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_PERMISSIONS_PROBE,
+        PermissionsProbeParams::default(),
+    );
+    let response_line = call_json_rpc(&client, &request)
+        .map_err(|error| classify_daemon_call_error(&error, client.endpoint()).to_user_message())?;
+
+    parse_json_rpc_response::<PermissionsProbe>(&response_line, "permissions probe")
 }
 
 fn connect_daemon_session(
@@ -1481,7 +1502,8 @@ mod tests {
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, InputReleaseAllResult, IpcEndpoint,
         IpcPlatformCapabilities, IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcSuccess,
-        ProtocolVersionSnapshot, SessionConnectResult, SessionStatus, to_json_line,
+        PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectResult,
+        SessionStatus, to_json_line,
     };
 
     use super::{
@@ -1538,6 +1560,32 @@ mod tests {
         assert_eq!(
             parse_daemon_status_response(&line),
             Err("daemon status unavailable".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_permissions_probe_success_response() {
+        let probe = PermissionsProbe {
+            adapter_name: "fake".to_string(),
+            capabilities: IpcPlatformCapabilities {
+                can_capture_pointer: true,
+                can_capture_keyboard: false,
+                can_inject_pointer: true,
+                can_inject_keyboard: false,
+            },
+            issues: vec![PermissionIssue {
+                code: "capture_keyboard_unavailable".to_string(),
+                message: "Keyboard capture is not available.".to_string(),
+            }],
+        };
+        let line = match to_json_line(&JsonRpcSuccess::new("tauri", probe.clone())) {
+            Ok(line) => line,
+            Err(error) => panic!("expected permissions probe JSON: {error}"),
+        };
+
+        assert_eq!(
+            parse_json_rpc_response::<PermissionsProbe>(&line, "permissions probe"),
+            Ok(probe)
         );
     }
 

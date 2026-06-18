@@ -1,10 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
 
-import type { DaemonLifecycleSnapshot, DaemonStartOptions, SessionConnectParams } from "./types";
+import type {
+  DaemonLifecycleSnapshot,
+  DaemonStartOptions,
+  PermissionsProbe,
+  SessionConnectParams,
+} from "./types";
 
 export const daemonClient = {
   status(): Promise<DaemonLifecycleSnapshot> {
     return invoke<DaemonLifecycleSnapshot>("daemon_status");
+  },
+
+  probePermissions(): Promise<PermissionsProbe> {
+    return invoke<PermissionsProbe>("permissions_probe");
   },
 
   start(options: DaemonStartOptions = {}): Promise<DaemonLifecycleSnapshot> {

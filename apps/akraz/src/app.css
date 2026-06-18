@@ -521,6 +521,57 @@ h3 {
   overflow-wrap: anywhere;
 }
 
+.permission-summary {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #e0d4be;
+}
+
+.permission-summary span {
+  color: #687280;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.permission-summary strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.permission-note {
+  margin-top: 8px;
+}
+
+.permission-issue-list {
+  display: grid;
+  gap: 8px;
+  padding: 0;
+  margin: 10px 0 0;
+  list-style: none;
+}
+
+.permission-issue-list li {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.permission-issue-list code {
+  color: #9b3f27;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.permission-issue-list span {
+  color: #4d5560;
+  font-size: 0.88rem;
+  overflow-wrap: anywhere;
+}
+
 .peer-main {
   display: grid;
   min-width: 0;

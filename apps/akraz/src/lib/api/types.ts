@@ -26,6 +26,17 @@ export interface DaemonStatus {
   capabilities: PlatformCapabilities;
 }
 
+export interface PermissionIssue {
+  code: string;
+  message: string;
+}
+
+export interface PermissionsProbe {
+  adapterName: string;
+  capabilities: PlatformCapabilities;
+  issues: PermissionIssue[];
+}
+
 export type DaemonLifecyclePhase =
   | "not_running"
   | "starting"
