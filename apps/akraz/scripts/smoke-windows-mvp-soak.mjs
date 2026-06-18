@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const DEFAULT_DURATION_MS = 120 * 60 * 1000;
 const DEFAULT_CYCLE_DELAY_MS = 1000;
+const DEFAULT_SCENARIO_TIMEOUT_MS = 10 * 60 * 1000;
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const appRoot = dirname(scriptDir);
@@ -76,6 +77,8 @@ while (completedCycles < options.maxCycles && (completedCycles === 0 || Date.now
     const result = spawnSync("bun", [join(scriptDir, scenario.script)], {
       cwd: appRoot,
       encoding: "utf8",
+      killSignal: "SIGTERM",
+      timeout: options.scenarioTimeoutMs,
     });
 
     if (result.stdout) {
@@ -84,18 +87,31 @@ while (completedCycles < options.maxCycles && (completedCycles === 0 || Date.now
     if (result.stderr) {
       process.stderr.write(result.stderr);
     }
+    completedRuns += 1;
     if (result.error) {
-      throw result.error;
+      const timedOut = result.error.code === "ETIMEDOUT";
+      failures.push({
+        cycle: completedCycles,
+        scenario: scenario.name,
+        exitCode: result.status,
+        signal: result.signal,
+        elapsedMs: Date.now() - started,
+        timedOut,
+        errorCode: result.error.code,
+        errorMessage: result.error.message,
+      });
+      break;
     }
 
-    completedRuns += 1;
     const elapsedMs = Date.now() - started;
     if (result.status !== 0) {
       failures.push({
         cycle: completedCycles,
         scenario: scenario.name,
         exitCode: result.status,
+        signal: result.signal,
         elapsedMs,
+        timedOut: false,
       });
       break;
     }
@@ -119,6 +135,7 @@ const summary = {
   durationMs: options.durationMs,
   maxCycles: Number.isFinite(options.maxCycles) ? options.maxCycles : null,
   cycleDelayMs: options.cycleDelayMs,
+  scenarioTimeoutMs: options.scenarioTimeoutMs,
   scenarios: selectedScenarios.map((scenario) => scenario.name),
   completedCycles,
   completedRuns,
@@ -141,6 +158,7 @@ function parseOptions(args) {
     durationMs: DEFAULT_DURATION_MS,
     list: false,
     maxCycles: Number.POSITIVE_INFINITY,
+    scenarioTimeoutMs: DEFAULT_SCENARIO_TIMEOUT_MS,
     scenarios: new Set(),
   };
 
@@ -165,6 +183,9 @@ function parseOptions(args) {
         break;
       case "--scenario":
         parsedOptions.scenarios.add(readValue(args, ++index, arg));
+        break;
+      case "--scenario-timeout-ms":
+        parsedOptions.scenarioTimeoutMs = parsePositiveInteger(readValue(args, ++index, arg), arg);
         break;
       default:
         throw new Error(`unknown soak option: ${arg}`);
