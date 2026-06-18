@@ -1489,6 +1489,8 @@ mod tests {
     };
     use serde_json::json;
 
+    const CURRENT_TEST_VERSION: &str = env!("CARGO_PKG_VERSION");
+
     #[derive(Debug, Clone)]
     struct EchoServer;
 
@@ -1767,7 +1769,7 @@ mod tests {
             can_inject_keyboard: true,
         };
         let status = DaemonStatus {
-            daemon_version: "0.4.51".to_string(),
+            daemon_version: CURRENT_TEST_VERSION.to_string(),
             mode: ControlModeSnapshot::Local,
             protocol: ProtocolVersionSnapshot { major: 1, minor: 4 },
             peers: vec![PeerStatus {
@@ -1798,7 +1800,7 @@ mod tests {
             Some(topology),
             build_diagnostics_latency_histogram(&[100, 200, 800]),
             "akrazctl",
-            "0.4.51",
+            CURRENT_TEST_VERSION,
         );
         let bundle = build_diagnostics_support_bundle(
             snapshot,
@@ -1809,13 +1811,13 @@ mod tests {
                 message: "Peer session connect failed.".to_string(),
             }],
             "akrazctl",
-            "0.4.51",
+            CURRENT_TEST_VERSION,
         );
         let encoded = serde_json::to_string(&bundle).expect("support bundle JSON");
 
         assert_eq!(bundle.schema_version, "akraz.diagnostics.supportBundle/v1");
         assert_eq!(bundle.generated_by, "akrazctl");
-        assert_eq!(bundle.tool_version, "0.4.51");
+        assert_eq!(bundle.tool_version, CURRENT_TEST_VERSION);
         assert_eq!(
             bundle.included_sections,
             vec![

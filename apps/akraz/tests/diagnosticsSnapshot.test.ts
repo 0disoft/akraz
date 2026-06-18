@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, test } from "bun:test";
 
 import {
@@ -12,13 +14,19 @@ import {
 } from "../src/lib/diagnostics/diagnosticsSnapshot";
 import type { DiagnosticsSnapshot, DiagnosticsSupportBundle } from "../src/lib/api/types";
 
+const appPackage = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+) as {
+  version: string;
+};
+
 function snapshotFixture(): DiagnosticsSnapshot {
   return {
     schemaVersion: "akraz.diagnostics.snapshot/v1",
     generatedBy: "akraz-app",
-    toolVersion: "0.4.52",
+    toolVersion: appPackage.version,
     daemon: {
-      daemonVersion: "0.4.52",
+      daemonVersion: appPackage.version,
       mode: "Local",
       protocol: { major: 1, minor: 4 },
       peerCount: 0,
@@ -67,7 +75,7 @@ function bundleFixture(): DiagnosticsSupportBundle {
   return {
     schemaVersion: "akraz.diagnostics.supportBundle/v1",
     generatedBy: "akraz-app",
-    toolVersion: "0.4.52",
+    toolVersion: appPackage.version,
     snapshot,
     recentLogs: [
       {
