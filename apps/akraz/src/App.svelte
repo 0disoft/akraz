@@ -2,9 +2,15 @@
   import { onMount } from 'svelte';
 
   import { daemonState } from './lib/state/daemonState.svelte';
+  import { diagnosticsState } from './lib/state/diagnosticsState.svelte';
   import { identityState } from './lib/state/identityState.svelte';
   import { permissionState } from './lib/state/permissionState.svelte';
   import { settingsState } from './lib/state/settingsState.svelte';
+  import {
+    formatDiagnosticsSnapshot,
+    screenTopologySummary,
+    unavailableSectionsSummary,
+  } from './lib/diagnostics/diagnosticsSnapshot';
   import { selectTrustedPeerSessionDraft } from './lib/session/sessionDraft';
   import type {
     ControlMode,
@@ -57,6 +63,7 @@
   let sessionPeerId = $state('');
   let sessionLocalDeviceId = $state('');
   let sessionAddress = $state('');
+  let diagnosticsCopyMessage = $state('');
 
   onMount(() => {
     void daemonState.refresh();
@@ -121,6 +128,42 @@
       return permissionState.probe.issues.length === 0 ? '정상' : `${permissionState.probe.issues.length}개 필요`;
     }
     return '대기 중';
+  }
+
+  function diagnosticsMessage() {
+    if (diagnosticsState.operation === 'snapshot') {
+      return '생성 중';
+    }
+    if (diagnosticsCopyMessage) {
+      return diagnosticsCopyMessage;
+    }
+    if (diagnosticsState.lastError) {
+      return diagnosticsState.lastError;
+    }
+    return diagnosticsState.snapshot ? '준비됨' : '대기 중';
+  }
+
+  function diagnosticsJson() {
+    return diagnosticsState.snapshot ? formatDiagnosticsSnapshot(diagnosticsState.snapshot) : '';
+  }
+
+  async function generateDiagnostics() {
+    diagnosticsCopyMessage = '';
+    await diagnosticsState.refresh();
+  }
+
+  async function copyDiagnostics() {
+    const json = diagnosticsJson();
+    if (!json) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(json);
+      diagnosticsCopyMessage = '복사됨';
+    } catch (error) {
+      diagnosticsCopyMessage = error instanceof Error ? error.message : '복사 실패';
+    }
   }
 
   function canTrustIdentity() {
@@ -389,6 +432,69 @@
         </div>
       </div>
     {/if}
+
+    <section class="section-block diagnostics-block" aria-labelledby="diagnostics-title">
+      <div class="section-heading-row">
+        <h2 id="diagnostics-title">진단</h2>
+        <span class:error-text={diagnosticsState.lastError}>{diagnosticsMessage()}</span>
+      </div>
+
+      {#if diagnosticsState.snapshot}
+        <dl class="diagnostics-facts">
+          <div>
+            <dt>생성</dt>
+            <dd>{diagnosticsState.snapshot.generatedBy} · v{diagnosticsState.snapshot.toolVersion}</dd>
+          </div>
+          <div>
+            <dt>데몬</dt>
+            <dd>
+              {modeLabels[diagnosticsState.snapshot.daemon.mode]} ·
+              {diagnosticsState.snapshot.daemon.connectedPeerCount}/{diagnosticsState.snapshot.daemon.peerCount}
+            </dd>
+          </div>
+          <div>
+            <dt>화면</dt>
+            <dd>{screenTopologySummary(diagnosticsState.snapshot)}</dd>
+          </div>
+          <div>
+            <dt>미포함</dt>
+            <dd>{unavailableSectionsSummary(diagnosticsState.snapshot)}</dd>
+          </div>
+        </dl>
+
+        <label class="document-field diagnostics-json">
+          <span>진단 JSON</span>
+          <textarea
+            readonly
+            rows="12"
+            value={diagnosticsJson()}
+            aria-label="진단 JSON"
+            spellcheck="false"
+          ></textarea>
+        </label>
+      {:else}
+        <p class="muted">진단 자료를 만들 수 있어.</p>
+      {/if}
+
+      <div class="settings-actions">
+        <button
+          type="button"
+          class="control-button secondary"
+          disabled={diagnosticsState.isBusy}
+          onclick={generateDiagnostics}
+        >
+          {diagnosticsState.operation === 'snapshot' ? '생성 중' : '생성'}
+        </button>
+        <button
+          type="button"
+          class="control-button"
+          disabled={diagnosticsState.isBusy || diagnosticsState.snapshot === null}
+          onclick={copyDiagnostics}
+        >
+          복사
+        </button>
+      </div>
+    </section>
 
     <section class="section-block identity-block" aria-labelledby="identity-title">
       <div class="section-heading-row">
