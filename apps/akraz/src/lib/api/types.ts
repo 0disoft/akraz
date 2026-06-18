@@ -89,6 +89,16 @@ export interface DiagnosticsSnapshot {
   unavailableSections: string[];
 }
 
+export interface DiagnosticsSupportBundle {
+  schemaVersion: string;
+  generatedBy: string;
+  toolVersion: string;
+  snapshot: DiagnosticsSnapshot;
+  includedSections: string[];
+  unavailableSections: string[];
+  privacy: DiagnosticsPrivacySnapshot;
+}
+
 export type DaemonLifecyclePhase =
   | "not_running"
   | "starting"

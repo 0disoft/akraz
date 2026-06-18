@@ -1,19 +1,21 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  formatDiagnosticsSupportBundle,
+  includedSectionsSummary,
   formatDiagnosticsSnapshot,
   screenTopologySummary,
   unavailableSectionsSummary,
 } from "../src/lib/diagnostics/diagnosticsSnapshot";
-import type { DiagnosticsSnapshot } from "../src/lib/api/types";
+import type { DiagnosticsSnapshot, DiagnosticsSupportBundle } from "../src/lib/api/types";
 
 function snapshotFixture(): DiagnosticsSnapshot {
   return {
     schemaVersion: "akraz.diagnostics.snapshot/v1",
     generatedBy: "akraz-app",
-    toolVersion: "0.4.48",
+    toolVersion: "0.4.49",
     daemon: {
-      daemonVersion: "0.4.48",
+      daemonVersion: "0.4.49",
       mode: "Local",
       protocol: { major: 1, minor: 4 },
       peerCount: 0,
@@ -51,6 +53,19 @@ function snapshotFixture(): DiagnosticsSnapshot {
   };
 }
 
+function bundleFixture(): DiagnosticsSupportBundle {
+  const snapshot = snapshotFixture();
+  return {
+    schemaVersion: "akraz.diagnostics.supportBundle/v1",
+    generatedBy: "akraz-app",
+    toolVersion: "0.4.49",
+    snapshot,
+    includedSections: ["daemon", "permissions", "screenTopology"],
+    unavailableSections: snapshot.unavailableSections,
+    privacy: snapshot.privacy,
+  };
+}
+
 describe("diagnostics snapshot helpers", () => {
   test("formats stable pretty JSON", () => {
     const formatted = formatDiagnosticsSnapshot(snapshotFixture());
@@ -62,6 +77,7 @@ describe("diagnostics snapshot helpers", () => {
   test("summarizes screen topology and unavailable sections", () => {
     expect(screenTopologySummary(snapshotFixture())).toBe("1920x1080 @ 0,0");
     expect(unavailableSectionsSummary(snapshotFixture())).toBe("recentLogs, latencyHistogram");
+    expect(includedSectionsSummary(bundleFixture())).toBe("daemon, permissions, screenTopology");
   });
 
   test("summarizes missing optional data", () => {
@@ -71,5 +87,16 @@ describe("diagnostics snapshot helpers", () => {
 
     expect(screenTopologySummary(snapshot)).toBe("확인 안 됨");
     expect(unavailableSectionsSummary(snapshot)).toBe("없음");
+  });
+
+  test("formats support bundle without adding sensitive fields", () => {
+    const formatted = formatDiagnosticsSupportBundle(bundleFixture());
+
+    expect(formatted).toContain('"schemaVersion": "akraz.diagnostics.supportBundle/v1"');
+    expect(formatted).toContain('"snapshot": {');
+    expect(formatted).not.toContain("privateKey");
+    expect(formatted).not.toContain("identitySecretKey");
+    expect(formatted).not.toContain("actualKeyInput");
+    expect(formatted).not.toContain("textInput");
   });
 });

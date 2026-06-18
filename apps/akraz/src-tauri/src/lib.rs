@@ -10,13 +10,14 @@ use std::time::Duration;
 use akraz_identity::{FileIdentityStore, PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_ipc::{
     DaemonStatus, DaemonStatusParams, DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams,
-    DiagnosticsSnapshot, InputReleaseAllParams, InputReleaseAllResult, IpcCallError, IpcEndpoint,
-    IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess,
-    LocalIpcClient, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+    DiagnosticsSnapshot, DiagnosticsSupportBundle, InputReleaseAllParams, InputReleaseAllResult,
+    IpcCallError, IpcEndpoint, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
+    JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
     METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
     METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe, PermissionsProbeParams,
     SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
-    build_diagnostics_snapshot, call_json_rpc, resolve_current_default_endpoint,
+    build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
+    resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,7 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
             daemon_status,
             permissions_probe,
             diagnostics_snapshot,
+            diagnostics_support_bundle,
             daemon_start,
             daemon_stop,
             session_connect,
@@ -299,6 +301,13 @@ async fn diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
     tauri::async_runtime::spawn_blocking(call_daemon_diagnostics_snapshot)
         .await
         .map_err(|error| format!("diagnostics snapshot task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn diagnostics_support_bundle() -> Result<DiagnosticsSupportBundle, String> {
+    tauri::async_runtime::spawn_blocking(call_daemon_diagnostics_support_bundle)
+        .await
+        .map_err(|error| format!("diagnostics support bundle task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -837,6 +846,16 @@ fn call_daemon_diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
         status,
         permissions,
         screen_topology,
+        "akraz-app",
+        env!("CARGO_PKG_VERSION"),
+    ))
+}
+
+fn call_daemon_diagnostics_support_bundle() -> Result<DiagnosticsSupportBundle, String> {
+    let snapshot = call_daemon_diagnostics_snapshot()?;
+
+    Ok(build_diagnostics_support_bundle(
+        snapshot,
         "akraz-app",
         env!("CARGO_PKG_VERSION"),
     ))

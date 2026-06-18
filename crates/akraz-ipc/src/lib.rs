@@ -46,7 +46,11 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// Diagnostics snapshot schema marker emitted by clients.
 pub const DIAGNOSTICS_SNAPSHOT_SCHEMA_VERSION: &str = "akraz.diagnostics.snapshot/v1";
 
+/// Diagnostics support bundle schema marker emitted by clients.
+pub const DIAGNOSTICS_SUPPORT_BUNDLE_SCHEMA_VERSION: &str = "akraz.diagnostics.supportBundle/v1";
+
 const DIAGNOSTICS_ALWAYS_UNAVAILABLE_SECTIONS: &[&str] = &["recentLogs", "latencyHistogram"];
+const DIAGNOSTICS_BASE_INCLUDED_SECTIONS: &[&str] = &["daemon", "permissions"];
 
 /// JSON-RPC method for daemon status.
 pub const METHOD_DAEMON_STATUS: &str = "daemon.status";
@@ -1044,6 +1048,19 @@ pub struct DiagnosticsSnapshot {
     pub unavailable_sections: Vec<String>,
 }
 
+/// Sanitized support bundle assembled for bug reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsSupportBundle {
+    pub schema_version: String,
+    pub generated_by: String,
+    pub tool_version: String,
+    pub snapshot: DiagnosticsSnapshot,
+    pub included_sections: Vec<String>,
+    pub unavailable_sections: Vec<String>,
+    pub privacy: DiagnosticsPrivacySnapshot,
+}
+
 /// Sanitized daemon facts inside a diagnostics snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1158,6 +1175,31 @@ pub fn build_diagnostics_snapshot(
         screen_topology,
         privacy: DiagnosticsPrivacySnapshot::default(),
         unavailable_sections,
+    }
+}
+
+/// Build a sanitized support bundle from a diagnostics snapshot.
+pub fn build_diagnostics_support_bundle(
+    snapshot: DiagnosticsSnapshot,
+    generated_by: impl Into<String>,
+    tool_version: impl Into<String>,
+) -> DiagnosticsSupportBundle {
+    let mut included_sections = DIAGNOSTICS_BASE_INCLUDED_SECTIONS
+        .iter()
+        .map(|section| (*section).to_string())
+        .collect::<Vec<_>>();
+    if snapshot.screen_topology.is_some() {
+        included_sections.push("screenTopology".to_string());
+    }
+
+    DiagnosticsSupportBundle {
+        schema_version: DIAGNOSTICS_SUPPORT_BUNDLE_SCHEMA_VERSION.to_string(),
+        generated_by: generated_by.into(),
+        tool_version: tool_version.into(),
+        included_sections,
+        unavailable_sections: snapshot.unavailable_sections.clone(),
+        privacy: snapshot.privacy.clone(),
+        snapshot,
     }
 }
 
@@ -1335,8 +1377,8 @@ mod tests {
         METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PeerStatus,
         PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectParams,
         SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult, SessionStatus,
-        build_diagnostics_snapshot, call_json_rpc, parse_request_line, resolve_default_endpoint,
-        serve_os_local_ipc_once, to_json_line,
+        build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
+        parse_request_line, resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
     };
     use serde_json::json;
 
@@ -1601,6 +1643,71 @@ mod tests {
         assert!(!encoded.contains("Windows Desktop"));
         assert!(!encoded.contains("privateKey"));
         assert!(!encoded.contains("clipboard"));
+    }
+
+    #[test]
+    fn diagnostics_support_bundle_wraps_snapshot_without_sensitive_fields() {
+        let capabilities = IpcPlatformCapabilities {
+            can_capture_pointer: true,
+            can_capture_keyboard: true,
+            can_inject_pointer: true,
+            can_inject_keyboard: true,
+        };
+        let status = DaemonStatus {
+            daemon_version: "0.4.49".to_string(),
+            mode: ControlModeSnapshot::Local,
+            protocol: ProtocolVersionSnapshot { major: 1, minor: 4 },
+            peers: vec![PeerStatus {
+                peer_id: "secret-peer-id".to_string(),
+                display_name: "Secret Peer".to_string(),
+                connected: true,
+            }],
+            capabilities: capabilities.clone(),
+        };
+        let permissions = PermissionsProbe {
+            adapter_name: "windows".to_string(),
+            capabilities,
+            issues: Vec::new(),
+        };
+        let topology = DiagnosticsScreenTopology {
+            pointer_position: LogicalPointSnapshot { x: 120, y: 80 },
+            virtual_screen_bounds: LogicalRectSnapshot {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        };
+
+        let snapshot =
+            build_diagnostics_snapshot(status, permissions, Some(topology), "akrazctl", "0.4.49");
+        let bundle = build_diagnostics_support_bundle(snapshot, "akrazctl", "0.4.49");
+        let encoded = serde_json::to_string(&bundle).expect("support bundle JSON");
+
+        assert_eq!(bundle.schema_version, "akraz.diagnostics.supportBundle/v1");
+        assert_eq!(bundle.generated_by, "akrazctl");
+        assert_eq!(bundle.tool_version, "0.4.49");
+        assert_eq!(
+            bundle.included_sections,
+            vec![
+                "daemon".to_string(),
+                "permissions".to_string(),
+                "screenTopology".to_string()
+            ]
+        );
+        assert_eq!(
+            bundle.unavailable_sections,
+            vec!["recentLogs".to_string(), "latencyHistogram".to_string()]
+        );
+        assert_eq!(bundle.privacy, DiagnosticsPrivacySnapshot::default());
+        assert_eq!(bundle.snapshot.daemon.peer_count, 1);
+        assert_eq!(bundle.snapshot.daemon.connected_peer_count, 1);
+        assert!(!encoded.contains("secret-peer-id"));
+        assert!(!encoded.contains("Secret Peer"));
+        assert!(!encoded.contains("privateKey"));
+        assert!(!encoded.contains("identitySecretKey"));
+        assert!(!encoded.contains("actualKeyInput"));
+        assert!(!encoded.contains("textInput"));
     }
 
     #[test]

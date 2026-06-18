@@ -11,12 +11,13 @@ use akraz_identity::{
 };
 use akraz_ipc::{
     DaemonStatus, DaemonStatusParams, DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams,
-    InputReleaseAllParams, IpcCallError, IpcEndpoint, IpcEndpointError, IpcTransportError,
-    JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, METHOD_DAEMON_STATUS,
-    METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
-    METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe,
-    PermissionsProbeParams, SessionConnectParams, SessionDisconnectParams,
-    build_diagnostics_snapshot, call_json_rpc, resolve_current_default_endpoint,
+    DiagnosticsSnapshot, InputReleaseAllParams, IpcCallError, IpcEndpoint, IpcEndpointError,
+    IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess,
+    METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL,
+    METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
+    PermissionsProbe, PermissionsProbeParams, SessionConnectParams, SessionDisconnectParams,
+    build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
+    resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 
@@ -41,6 +42,13 @@ fn main() -> ExitCode {
         Some("diagnostics") => match args.next().as_deref() {
             Some("snapshot") => match parse_endpoint_options(args) {
                 Ok(options) => print_diagnostics_snapshot(options),
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            },
+            Some("bundle") => match parse_endpoint_options(args) {
+                Ok(options) => print_diagnostics_bundle(options),
                 Err(error) => {
                     eprintln!("{error}");
                     ExitCode::from(2)
@@ -164,7 +172,7 @@ fn main() -> ExitCode {
         }
         None => {
             eprintln!(
-                "usage: akrazctl <status|diagnostics snapshot|permissions probe|input release-all|identity show|identity list|identity trust|identity forget|session connect|session disconnect|daemon-args|--version>"
+                "usage: akrazctl <status|diagnostics snapshot|diagnostics bundle|permissions probe|input release-all|identity show|identity list|identity trust|identity forget|session connect|session disconnect|daemon-args|--version>"
             );
             ExitCode::from(2)
         }
@@ -228,36 +236,57 @@ fn print_diagnostics_snapshot(options: EndpointOptions) -> ExitCode {
         }
     };
 
-    let status = match call_daemon_json_rpc::<DaemonStatus, _>(
-        &client,
-        &daemon_status_request(),
-        "status",
-    ) {
-        Ok(status) => status,
+    let snapshot = match collect_diagnostics_snapshot(&client) {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
-    let permissions = match call_daemon_json_rpc::<PermissionsProbe, _>(
-        &client,
+
+    print_json_pretty(&snapshot)
+}
+
+fn print_diagnostics_bundle(options: EndpointOptions) -> ExitCode {
+    let client = match build_daemon_client(options.endpoint) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let snapshot = match collect_diagnostics_snapshot(&client) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    print_json_pretty(&build_diagnostics_support_bundle(
+        snapshot,
+        "akrazctl",
+        env!("CARGO_PKG_VERSION"),
+    ))
+}
+
+fn collect_diagnostics_snapshot(client: &OsLocalIpcClient) -> Result<DiagnosticsSnapshot, String> {
+    let status =
+        call_daemon_json_rpc::<DaemonStatus, _>(client, &daemon_status_request(), "status")?;
+    let permissions = call_daemon_json_rpc::<PermissionsProbe, _>(
+        client,
         &permissions_probe_request(),
         "permissions probe",
-    ) {
-        Ok(permissions) => permissions,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    )?;
     let screen_topology = call_daemon_json_rpc::<DiagnosticsScreenTopology, _>(
-        &client,
+        client,
         &diagnostics_screen_topology_request(),
         "screen topology",
     )
     .ok();
 
-    print_json_pretty(&build_diagnostics_snapshot(
+    Ok(build_diagnostics_snapshot(
         status,
         permissions,
         screen_topology,

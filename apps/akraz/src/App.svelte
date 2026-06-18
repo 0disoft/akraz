@@ -8,6 +8,8 @@
   import { settingsState } from './lib/state/settingsState.svelte';
   import {
     formatDiagnosticsSnapshot,
+    formatDiagnosticsSupportBundle,
+    includedSectionsSummary,
     screenTopologySummary,
     unavailableSectionsSummary,
   } from './lib/diagnostics/diagnosticsSnapshot';
@@ -134,6 +136,9 @@
     if (diagnosticsState.operation === 'snapshot') {
       return '생성 중';
     }
+    if (diagnosticsState.operation === 'bundle') {
+      return '번들 생성 중';
+    }
     if (diagnosticsCopyMessage) {
       return diagnosticsCopyMessage;
     }
@@ -143,13 +148,25 @@
     return diagnosticsState.snapshot ? '준비됨' : '대기 중';
   }
 
+  function diagnosticsPayloadLabel() {
+    return diagnosticsState.bundle ? '진단 번들 JSON' : '진단 JSON';
+  }
+
   function diagnosticsJson() {
+    if (diagnosticsState.bundle) {
+      return formatDiagnosticsSupportBundle(diagnosticsState.bundle);
+    }
     return diagnosticsState.snapshot ? formatDiagnosticsSnapshot(diagnosticsState.snapshot) : '';
   }
 
   async function generateDiagnostics() {
     diagnosticsCopyMessage = '';
     await diagnosticsState.refresh();
+  }
+
+  async function generateDiagnosticsBundle() {
+    diagnosticsCopyMessage = '';
+    await diagnosticsState.refreshBundle();
   }
 
   async function copyDiagnostics() {
@@ -460,15 +477,21 @@
             <dt>미포함</dt>
             <dd>{unavailableSectionsSummary(diagnosticsState.snapshot)}</dd>
           </div>
+          {#if diagnosticsState.bundle}
+            <div>
+              <dt>포함</dt>
+              <dd>{includedSectionsSummary(diagnosticsState.bundle)}</dd>
+            </div>
+          {/if}
         </dl>
 
         <label class="document-field diagnostics-json">
-          <span>진단 JSON</span>
+          <span>{diagnosticsPayloadLabel()}</span>
           <textarea
             readonly
             rows="12"
             value={diagnosticsJson()}
-            aria-label="진단 JSON"
+            aria-label={diagnosticsPayloadLabel()}
             spellcheck="false"
           ></textarea>
         </label>
@@ -484,6 +507,14 @@
           onclick={generateDiagnostics}
         >
           {diagnosticsState.operation === 'snapshot' ? '생성 중' : '생성'}
+        </button>
+        <button
+          type="button"
+          class="control-button secondary"
+          disabled={diagnosticsState.isBusy}
+          onclick={generateDiagnosticsBundle}
+        >
+          {diagnosticsState.operation === 'bundle' ? '번들 생성 중' : '번들'}
         </button>
         <button
           type="button"

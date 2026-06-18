@@ -24,6 +24,8 @@ try {
   await waitForDaemonStatus(endpoint);
   const snapshot = runCtlJson(["diagnostics", "snapshot", "--endpoint", endpoint]);
   assertDiagnosticsSnapshot(snapshot);
+  const bundle = runCtlJson(["diagnostics", "bundle", "--endpoint", endpoint]);
+  assertDiagnosticsBundle(bundle, snapshot);
   console.log("Diagnostics snapshot smoke passed.");
 } finally {
   stopDaemon(daemon.process);
@@ -153,6 +155,32 @@ function assertDiagnosticsSnapshot(snapshot) {
   assertNoSensitiveFields(snapshot);
 }
 
+function assertDiagnosticsBundle(bundle, snapshot) {
+  if (bundle.schemaVersion !== "akraz.diagnostics.supportBundle/v1") {
+    throw new Error("diagnostics bundle reported an unexpected schema version");
+  }
+  if (bundle.generatedBy !== "akrazctl") {
+    throw new Error("diagnostics bundle reported an unexpected generator");
+  }
+  if (bundle.toolVersion !== appPackage.version) {
+    throw new Error(
+      `diagnostics bundle reported tool version ${bundle.toolVersion}, expected ${appPackage.version}`,
+    );
+  }
+  if (JSON.stringify(bundle.snapshot) !== JSON.stringify(snapshot)) {
+    throw new Error("diagnostics bundle snapshot does not match diagnostics snapshot output");
+  }
+  const expectedIncludedSections = ["daemon", "permissions", "screenTopology"];
+  assertStringList(bundle.includedSections, expectedIncludedSections, "included sections");
+  assertStringList(
+    bundle.unavailableSections,
+    snapshot.unavailableSections,
+    "unavailable sections",
+  );
+  assertPrivacy(bundle.privacy);
+  assertNoSensitiveFields(bundle);
+}
+
 function assertCapabilities(capabilities, label) {
   const keys = ["canCapturePointer", "canCaptureKeyboard", "canInjectPointer", "canInjectKeyboard"];
   for (const key of keys) {
@@ -244,12 +272,16 @@ function assertPrivacy(privacy) {
 
 function assertUnavailableSections(sections) {
   const expected = ["recentLogs", "latencyHistogram"];
+  assertStringList(sections, expected, "unavailable sections");
+}
+
+function assertStringList(sections, expected, label) {
   if (!Array.isArray(sections) || sections.length !== expected.length) {
     throw new Error("diagnostics snapshot reported unexpected unavailable sections");
   }
   for (const section of expected) {
     if (!sections.includes(section)) {
-      throw new Error(`diagnostics snapshot did not mark ${section} unavailable`);
+      throw new Error(`diagnostics snapshot did not report ${section} in ${label}`);
     }
   }
 }

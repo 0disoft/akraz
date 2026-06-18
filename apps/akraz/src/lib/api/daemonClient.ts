@@ -4,6 +4,7 @@ import type {
   DaemonLifecycleSnapshot,
   DaemonStartOptions,
   DiagnosticsSnapshot,
+  DiagnosticsSupportBundle,
   PermissionsProbe,
   SessionConnectParams,
 } from "./types";
@@ -19,6 +20,10 @@ export const daemonClient = {
 
   diagnosticsSnapshot(): Promise<DiagnosticsSnapshot> {
     return invoke<DiagnosticsSnapshot>("diagnostics_snapshot");
+  },
+
+  diagnosticsSupportBundle(): Promise<DiagnosticsSupportBundle> {
+    return invoke<DiagnosticsSupportBundle>("diagnostics_support_bundle");
   },
 
   start(options: DaemonStartOptions = {}): Promise<DaemonLifecycleSnapshot> {

@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.4.48",
+  "version": "0.4.49",
   "private": true,
   "workspaces": [
     "apps/*",
