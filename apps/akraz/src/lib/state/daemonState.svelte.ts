@@ -6,7 +6,13 @@ import type {
   SessionConnectParams,
 } from "../api/types";
 
-type DaemonOperation = "refresh" | "start" | "stop" | "connectSession" | "disconnectSession";
+type DaemonOperation =
+  | "refresh"
+  | "start"
+  | "stop"
+  | "connectSession"
+  | "disconnectSession"
+  | "releaseAllInputs";
 
 export class DaemonState {
   snapshot = $state<DaemonLifecycleSnapshot | null>(null);
@@ -39,6 +45,10 @@ export class DaemonState {
 
   async disconnectSession() {
     await this.run("disconnectSession", () => daemonClient.disconnectSession());
+  }
+
+  async releaseAllInputs() {
+    await this.run("releaseAllInputs", () => daemonClient.releaseAllInputs());
   }
 
   private async run(operation: DaemonOperation, action: () => Promise<DaemonLifecycleSnapshot>) {

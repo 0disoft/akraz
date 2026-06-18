@@ -209,12 +209,19 @@
     return daemonState.status !== null && !daemonState.isBusy && hasConnectedPeer();
   }
 
+  function canReleaseAllInputs() {
+    return daemonState.status !== null && !daemonState.isBusy;
+  }
+
   function sessionMessage() {
     if (daemonState.operation === 'connectSession') {
       return '연결 중';
     }
     if (daemonState.operation === 'disconnectSession') {
       return '해제 중';
+    }
+    if (daemonState.operation === 'releaseAllInputs') {
+      return '입력 해제 중';
     }
     if (daemonState.lastError) {
       return daemonState.lastError;
@@ -514,6 +521,14 @@
           onclick={() => daemonState.disconnectSession()}
         >
           {daemonState.operation === 'disconnectSession' ? '해제 중' : '해제'}
+        </button>
+        <button
+          type="button"
+          class="control-button danger"
+          disabled={!canReleaseAllInputs()}
+          onclick={() => daemonState.releaseAllInputs()}
+        >
+          {daemonState.operation === 'releaseAllInputs' ? '해제 중' : '입력 해제'}
         </button>
       </div>
     </section>

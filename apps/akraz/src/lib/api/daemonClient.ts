@@ -22,4 +22,8 @@ export const daemonClient = {
   disconnectSession(): Promise<DaemonLifecycleSnapshot> {
     return invoke<DaemonLifecycleSnapshot>("session_disconnect");
   },
+
+  releaseAllInputs(): Promise<DaemonLifecycleSnapshot> {
+    return invoke<DaemonLifecycleSnapshot>("input_release_all");
+  },
 };

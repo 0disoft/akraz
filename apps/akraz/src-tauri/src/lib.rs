@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use akraz_identity::{FileIdentityStore, PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_ipc::{
-    DaemonStatus, DaemonStatusParams, IpcCallError, IpcEndpoint, IpcTransportError,
-    JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient,
-    METHOD_DAEMON_STATUS, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
-    SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult, call_json_rpc,
+    DaemonStatus, DaemonStatusParams, InputReleaseAllParams, InputReleaseAllResult, IpcCallError,
+    IpcEndpoint, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
+    JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_STATUS, METHOD_INPUT_RELEASE_ALL,
+    METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, SessionConnectResult,
+    SessionDisconnectParams, SessionDisconnectResult, call_json_rpc,
     resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
@@ -73,6 +74,7 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
             daemon_stop,
             session_connect,
             session_disconnect,
+            input_release_all,
             identity_show,
             identity_list_trusted,
             identity_trust,
@@ -289,6 +291,13 @@ async fn session_disconnect() -> Result<DaemonLifecycleSnapshot, String> {
     tauri::async_runtime::spawn_blocking(disconnect_daemon_session)
         .await
         .map_err(|error| format!("session disconnect task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn input_release_all() -> Result<DaemonLifecycleSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(release_all_daemon_inputs)
+        .await
+        .map_err(|error| format!("input release task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -772,6 +781,27 @@ fn call_daemon_session_disconnect() -> Result<(), String> {
         .map_err(|error| classify_daemon_call_error(&error, client.endpoint()).to_user_message())?;
 
     parse_json_rpc_response::<SessionDisconnectResult>(&response_line, "session disconnect")
+        .map(|_| ())
+}
+
+fn release_all_daemon_inputs() -> Result<DaemonLifecycleSnapshot, String> {
+    call_daemon_input_release_all()?;
+    call_daemon_status_result()
+        .map(DaemonLifecycleSnapshot::running_without_managed_pid)
+        .map_err(|error| error.to_user_message())
+}
+
+fn call_daemon_input_release_all() -> Result<(), String> {
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    let request = JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_INPUT_RELEASE_ALL,
+        InputReleaseAllParams::default(),
+    );
+    let response_line = call_json_rpc(&client, &request)
+        .map_err(|error| classify_daemon_call_error(&error, client.endpoint()).to_user_message())?;
+
+    parse_json_rpc_response::<InputReleaseAllResult>(&response_line, "input release all")
         .map(|_| ())
 }
 
@@ -1449,9 +1479,9 @@ mod tests {
 
     use akraz_identity::FileIdentityStore;
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonStatus, IpcEndpoint, IpcPlatformCapabilities, IpcTransportError,
-        JsonRpcError, JsonRpcFailure, JsonRpcSuccess, ProtocolVersionSnapshot,
-        SessionConnectResult, SessionStatus, to_json_line,
+        ControlModeSnapshot, DaemonStatus, InputReleaseAllResult, IpcEndpoint,
+        IpcPlatformCapabilities, IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcSuccess,
+        ProtocolVersionSnapshot, SessionConnectResult, SessionStatus, to_json_line,
     };
 
     use super::{
@@ -2033,6 +2063,23 @@ mod tests {
 
         assert_eq!(
             parse_json_rpc_response::<SessionConnectResult>(&line, "session connect"),
+            Ok(result)
+        );
+    }
+
+    #[test]
+    fn parses_input_release_all_success_response() {
+        let result = InputReleaseAllResult {
+            released: true,
+            mode: ControlModeSnapshot::Local,
+        };
+        let line = match to_json_line(&JsonRpcSuccess::new("tauri", result.clone())) {
+            Ok(line) => line,
+            Err(error) => panic!("expected input release all JSON: {error}"),
+        };
+
+        assert_eq!(
+            parse_json_rpc_response::<InputReleaseAllResult>(&line, "input release all"),
             Ok(result)
         );
     }
