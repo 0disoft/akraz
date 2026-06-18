@@ -1,7 +1,14 @@
+import { daemonClient } from "../api/daemonClient";
 import { layoutClient } from "../api/layoutClient";
-import type { LayoutSettings, ScreenEdge, ScreenEdgeBinding } from "../api/types";
+import type {
+  DiagnosticsScreenTopology,
+  LayoutSettings,
+  ScreenEdge,
+  ScreenEdgeBinding,
+} from "../api/types";
 
 type LayoutOperation = "load" | "save";
+type TopologyOperation = "probe";
 
 function defaultLayout(): LayoutSettings {
   return {
@@ -19,17 +26,19 @@ function defaultEdgeBinding(): ScreenEdgeBinding {
 
 export class LayoutState {
   layout = $state<LayoutSettings>(defaultLayout());
+  topology = $state<DiagnosticsScreenTopology | null>(null);
   operation = $state<LayoutOperation | null>(null);
+  topologyOperation = $state<TopologyOperation | null>(null);
   lastError = $state<string | null>(null);
+  topologyError = $state<string | null>(null);
   saved = $state(false);
 
   get isBusy(): boolean {
     return this.operation !== null;
   }
 
-  replace(layout: LayoutSettings) {
-    this.layout = layout;
-    this.saved = false;
+  get isTopologyBusy(): boolean {
+    return this.topologyOperation !== null;
   }
 
   addEdgeBinding() {
@@ -78,6 +87,22 @@ export class LayoutState {
     });
 
     return savedLayout;
+  }
+
+  async refreshTopology(): Promise<DiagnosticsScreenTopology | null> {
+    let topology: DiagnosticsScreenTopology | null = null;
+    this.topologyOperation = "probe";
+    this.topologyError = null;
+    try {
+      topology = await daemonClient.screenTopology();
+      this.topology = topology;
+    } catch (error) {
+      this.topologyError = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.topologyOperation = null;
+    }
+
+    return topology;
   }
 
   private async run(operation: LayoutOperation, action: () => Promise<void>) {

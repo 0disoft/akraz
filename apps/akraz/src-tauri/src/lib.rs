@@ -75,6 +75,7 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             permissions_probe,
+            screen_topology_probe,
             diagnostics_snapshot,
             diagnostics_support_bundle,
             daemon_start,
@@ -297,6 +298,13 @@ async fn permissions_probe() -> Result<PermissionsProbe, String> {
     tauri::async_runtime::spawn_blocking(call_daemon_permissions_probe)
         .await
         .map_err(|error| format!("permissions probe task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn screen_topology_probe() -> Result<DiagnosticsScreenTopology, String> {
+    tauri::async_runtime::spawn_blocking(call_daemon_screen_topology)
+        .await
+        .map_err(|error| format!("screen topology task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -836,6 +844,19 @@ fn call_daemon_permissions_probe() -> Result<PermissionsProbe, String> {
         .map_err(|error| classify_daemon_call_error(&error, client.endpoint()).to_user_message())?;
 
     parse_json_rpc_response::<PermissionsProbe>(&response_line, "permissions probe")
+}
+
+fn call_daemon_screen_topology() -> Result<DiagnosticsScreenTopology, String> {
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    call_daemon_json_rpc::<DiagnosticsScreenTopology, _>(
+        &client,
+        &JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+            DiagnosticsScreenTopologyParams::default(),
+        ),
+        "screen topology",
+    )
 }
 
 fn call_daemon_diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {

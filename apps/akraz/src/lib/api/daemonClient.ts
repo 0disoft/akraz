@@ -4,6 +4,7 @@ import type {
   DaemonLifecycleSnapshot,
   DaemonStartOptions,
   DiagnosticsSnapshot,
+  DiagnosticsScreenTopology,
   DiagnosticsSupportBundle,
   PermissionsProbe,
   SessionConnectParams,
@@ -16,6 +17,10 @@ export const daemonClient = {
 
   probePermissions(): Promise<PermissionsProbe> {
     return invoke<PermissionsProbe>("permissions_probe");
+  },
+
+  screenTopology(): Promise<DiagnosticsScreenTopology> {
+    return invoke<DiagnosticsScreenTopology>("screen_topology_probe");
   },
 
   diagnosticsSnapshot(): Promise<DiagnosticsSnapshot> {

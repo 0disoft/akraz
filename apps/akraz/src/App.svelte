@@ -22,6 +22,8 @@
     ControlMode,
     DaemonLifecyclePhase,
     IdentityTrustedPeer,
+    LogicalPointSnapshot,
+    LogicalRectSnapshot,
     PlatformCapabilities,
     PeerStatus,
     ScreenEdge,
@@ -121,6 +123,24 @@
     return layoutState.layout.edgeBindings.length > 0
       ? `${layoutState.layout.edgeBindings.length}개 경계`
       : '경계 없음';
+  }
+
+  function layoutTopologyMessage() {
+    if (layoutState.topologyOperation === 'probe') {
+      return '확인 중';
+    }
+    if (layoutState.topologyError) {
+      return layoutState.topologyError;
+    }
+    return layoutState.topology ? '확인됨' : '데몬에서 확인';
+  }
+
+  function formatPoint(point: LogicalPointSnapshot) {
+    return `${Math.round(point.x)}, ${Math.round(point.y)}`;
+  }
+
+  function formatRect(rect: LogicalRectSnapshot) {
+    return `${Math.round(rect.width)}×${Math.round(rect.height)} @ ${Math.round(rect.x)}, ${Math.round(rect.y)}`;
   }
 
   function identityMessage() {
@@ -786,6 +806,28 @@
         </div>
       {/if}
 
+      <div class="layout-topology-panel">
+        <div class="diagnostics-subheading-row">
+          <h3>현재 화면</h3>
+          <span class:error-text={layoutState.topologyError}>{layoutTopologyMessage()}</span>
+        </div>
+
+        {#if layoutState.topology}
+          <dl class="diagnostics-facts layout-topology-facts">
+            <div>
+              <dt>포인터</dt>
+              <dd>{formatPoint(layoutState.topology.pointerPosition)}</dd>
+            </div>
+            <div>
+              <dt>범위</dt>
+              <dd>{formatRect(layoutState.topology.virtualScreenBounds)}</dd>
+            </div>
+          </dl>
+        {:else}
+          <p class="muted">데몬이 실행 중이면 현재 화면 범위를 확인할 수 있어.</p>
+        {/if}
+      </div>
+
       <div class="settings-actions">
         <button
           type="button"
@@ -794,6 +836,14 @@
           onclick={() => layoutState.addEdgeBinding()}
         >
           추가
+        </button>
+        <button
+          type="button"
+          class="control-button secondary"
+          disabled={layoutState.isTopologyBusy}
+          onclick={() => layoutState.refreshTopology()}
+        >
+          {layoutState.topologyOperation === 'probe' ? '확인 중' : '화면 확인'}
         </button>
         <button
           type="button"

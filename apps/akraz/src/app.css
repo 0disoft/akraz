@@ -193,6 +193,18 @@ h2 {
   margin-top: 18px;
 }
 
+.layout-topology-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #e0d4be;
+}
+
+.layout-topology-facts {
+  margin-bottom: 0;
+}
+
 .session-block {
   margin-top: 18px;
 }
