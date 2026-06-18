@@ -17,6 +17,11 @@
     screenTopologySummary,
     unavailableSectionsSummary,
   } from './lib/diagnostics/diagnosticsSnapshot';
+  import {
+    diagnosticsCards,
+    diagnosticsCardStatusClass,
+    diagnosticsCardStatusLabel,
+  } from './lib/diagnostics/diagnosticsCards';
   import { previewEdgeCrossing } from './lib/layout/crossingTest';
   import { selectTrustedPeerSessionDraft } from './lib/session/sessionDraft';
   import type {
@@ -285,6 +290,17 @@
       return formatDiagnosticsSupportBundle(diagnosticsState.bundle);
     }
     return diagnosticsState.snapshot ? formatDiagnosticsSnapshot(diagnosticsState.snapshot) : '';
+  }
+
+  function diagnosticsCardsForView() {
+    return diagnosticsCards({
+      snapshot: diagnosticsState.snapshot,
+      permissions: permissionState.probe,
+      hasLocalIdentity: identityState.local !== null,
+      trustedPeerCount: identityState.trustedPeers.length,
+      layoutBindingCount: layoutState.layout.edgeBindings.length,
+      hasScreenTopology: layoutState.topology !== null,
+    });
   }
 
   async function generateDiagnostics() {
@@ -625,6 +641,19 @@
       <div class="section-heading-row">
         <h2 id="diagnostics-title">진단</h2>
         <span class:error-text={diagnosticsState.lastError}>{diagnosticsMessage()}</span>
+      </div>
+
+      <div class="diagnostics-card-grid" aria-label="진단 항목">
+        {#each diagnosticsCardsForView() as card (card.id)}
+          <article class={`diagnostics-card ${diagnosticsCardStatusClass(card.status)}`}>
+            <div class="diagnostics-card-heading">
+              <h3>{card.title}</h3>
+              <span>{diagnosticsCardStatusLabel(card.status)}</span>
+            </div>
+            <strong>{card.summary}</strong>
+            <p>{card.detail}</p>
+          </article>
+        {/each}
       </div>
 
       {#if diagnosticsState.snapshot}
