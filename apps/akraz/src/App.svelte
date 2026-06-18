@@ -9,8 +9,10 @@
   import {
     formatDiagnosticsSnapshot,
     formatDiagnosticsSupportBundle,
+    formatRecentLogEntry,
     includedSectionsSummary,
     latencySummary,
+    recentLogsSummary,
     screenTopologySummary,
     unavailableSectionsSummary,
   } from './lib/diagnostics/diagnosticsSnapshot';
@@ -489,6 +491,28 @@
             </div>
           {/if}
         </dl>
+
+        {#if diagnosticsState.bundle}
+          <section class="diagnostics-log-panel" aria-labelledby="diagnostics-logs-title">
+            <div class="diagnostics-subheading-row">
+              <h3 id="diagnostics-logs-title">진단 로그</h3>
+              <span>{recentLogsSummary(diagnosticsState.bundle)}</span>
+            </div>
+            {#if diagnosticsState.bundle.recentLogs.length > 0}
+              <ol class="diagnostics-log-list">
+                {#each diagnosticsState.bundle.recentLogs as entry (entry.sequence)}
+                  <li class="diagnostics-log-entry" title={formatRecentLogEntry(entry)}>
+                    <span class="diagnostics-log-meta">#{entry.sequence} · {entry.level}</span>
+                    <span class="diagnostics-log-event">{entry.event}</span>
+                    <span class="diagnostics-log-message">{entry.message}</span>
+                  </li>
+                {/each}
+              </ol>
+            {:else}
+              <p class="muted">표시할 로그 없음</p>
+            {/if}
+          </section>
+        {/if}
 
         <label class="document-field diagnostics-json">
           <span>{diagnosticsPayloadLabel()}</span>

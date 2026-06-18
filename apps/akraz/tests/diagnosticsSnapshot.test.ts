@@ -4,7 +4,9 @@ import {
   formatDiagnosticsSupportBundle,
   includedSectionsSummary,
   formatDiagnosticsSnapshot,
+  formatRecentLogEntry,
   latencySummary,
+  recentLogsSummary,
   screenTopologySummary,
   unavailableSectionsSummary,
 } from "../src/lib/diagnostics/diagnosticsSnapshot";
@@ -14,9 +16,9 @@ function snapshotFixture(): DiagnosticsSnapshot {
   return {
     schemaVersion: "akraz.diagnostics.snapshot/v1",
     generatedBy: "akraz-app",
-    toolVersion: "0.4.51",
+    toolVersion: "0.4.52",
     daemon: {
-      daemonVersion: "0.4.51",
+      daemonVersion: "0.4.52",
       mode: "Local",
       protocol: { major: 1, minor: 4 },
       peerCount: 0,
@@ -65,7 +67,7 @@ function bundleFixture(): DiagnosticsSupportBundle {
   return {
     schemaVersion: "akraz.diagnostics.supportBundle/v1",
     generatedBy: "akraz-app",
-    toolVersion: "0.4.51",
+    toolVersion: "0.4.52",
     snapshot,
     recentLogs: [
       {
@@ -94,6 +96,10 @@ describe("diagnostics snapshot helpers", () => {
     expect(screenTopologySummary(snapshotFixture())).toBe("1920x1080 @ 0,0");
     expect(latencySummary(snapshotFixture())).toBe("평균 0.45ms · p95 0.90ms · p99 0.90ms");
     expect(unavailableSectionsSummary(snapshotFixture())).toBe("recentLogs");
+    expect(recentLogsSummary(bundleFixture())).toBe("1개");
+    expect(formatRecentLogEntry(bundleFixture().recentLogs[0])).toBe(
+      "#1 · Info · daemon.status · Daemon status requested.",
+    );
     expect(includedSectionsSummary(bundleFixture())).toBe(
       "daemon, permissions, screenTopology, latencyHistogram, recentLogs",
     );

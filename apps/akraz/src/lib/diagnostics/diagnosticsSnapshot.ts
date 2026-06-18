@@ -1,4 +1,4 @@
-import type { DiagnosticsSnapshot, DiagnosticsSupportBundle } from "../api/types";
+import type { DaemonLogEntry, DiagnosticsSnapshot, DiagnosticsSupportBundle } from "../api/types";
 
 export function formatDiagnosticsSnapshot(snapshot: DiagnosticsSnapshot): string {
   return JSON.stringify(snapshot, null, 2);
@@ -29,6 +29,14 @@ export function latencySummary(snapshot: DiagnosticsSnapshot): string {
 
 export function includedSectionsSummary(bundle: DiagnosticsSupportBundle): string {
   return bundle.includedSections.join(", ");
+}
+
+export function recentLogsSummary(bundle: DiagnosticsSupportBundle): string {
+  return `${bundle.recentLogs.length}개`;
+}
+
+export function formatRecentLogEntry(entry: DaemonLogEntry): string {
+  return `#${entry.sequence} · ${entry.level} · ${entry.event} · ${entry.message}`;
 }
 
 export function unavailableSectionsSummary(snapshot: DiagnosticsSnapshot): string {

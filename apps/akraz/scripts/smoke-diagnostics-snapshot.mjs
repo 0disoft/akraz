@@ -149,10 +149,10 @@ function assertDiagnosticsSnapshot(snapshot) {
   assertCapabilities(snapshot.daemon.capabilities, "daemon");
   assertCapabilities(snapshot.permissions?.capabilities, "permissions");
   assertPermissionIssues(snapshot.permissions);
-  assertScreenTopology(snapshot.screenTopology);
+  assertOptionalScreenTopology(snapshot);
   assertLatencyHistogram(snapshot.latencyHistogram);
   assertPrivacy(snapshot.privacy);
-  assertUnavailableSections(snapshot.unavailableSections);
+  assertUnavailableSections(snapshot);
   assertNoSensitiveFields(snapshot);
 }
 
@@ -169,15 +169,22 @@ function assertDiagnosticsBundle(bundle, snapshot) {
     );
   }
   assertBundleSnapshot(bundle.snapshot, snapshot);
-  const expectedIncludedSections = [
-    "daemon",
-    "permissions",
-    "screenTopology",
-    "latencyHistogram",
-    "recentLogs",
-  ];
+  const expectedIncludedSections = ["daemon", "permissions"];
+  if (bundle.snapshot.screenTopology) {
+    expectedIncludedSections.push("screenTopology");
+  }
+  if (bundle.snapshot.latencyHistogram) {
+    expectedIncludedSections.push("latencyHistogram");
+  }
+  if (bundle.recentLogs.length > 0) {
+    expectedIncludedSections.push("recentLogs");
+  }
   assertStringList(bundle.includedSections, expectedIncludedSections, "included sections");
-  assertStringList(bundle.unavailableSections, [], "unavailable sections");
+  assertStringList(
+    bundle.unavailableSections,
+    expectedUnavailableSections(bundle.snapshot, true),
+    "unavailable sections",
+  );
   assertRecentLogs(bundle.recentLogs);
   assertPrivacy(bundle.privacy);
   assertNoSensitiveFields(bundle);
@@ -213,7 +220,7 @@ function assertBundleSnapshot(bundleSnapshot, previousSnapshot) {
   }
   assertCapabilities(bundleSnapshot.daemon?.capabilities, "bundle daemon");
   assertCapabilities(bundleSnapshot.permissions?.capabilities, "bundle permissions");
-  assertScreenTopology(bundleSnapshot.screenTopology);
+  assertOptionalScreenTopology(bundleSnapshot);
   assertLatencyHistogram(bundleSnapshot.latencyHistogram);
 }
 
@@ -281,6 +288,19 @@ function assertScreenTopology(screenTopology) {
   }
 }
 
+function assertOptionalScreenTopology(snapshot) {
+  if (snapshot.screenTopology) {
+    assertScreenTopology(snapshot.screenTopology);
+    return;
+  }
+  if (
+    !Array.isArray(snapshot.unavailableSections) ||
+    !snapshot.unavailableSections.includes("screenTopology")
+  ) {
+    throw new Error("diagnostics snapshot omitted screen topology without marking it unavailable");
+  }
+}
+
 function assertPrivacy(privacy) {
   const expectedFalseKeys = [
     "includesActualKeyInput",
@@ -297,9 +317,12 @@ function assertPrivacy(privacy) {
   }
 }
 
-function assertUnavailableSections(sections) {
-  const expected = ["recentLogs"];
-  assertStringList(sections, expected, "unavailable sections");
+function assertUnavailableSections(snapshot) {
+  assertStringList(
+    snapshot.unavailableSections,
+    expectedUnavailableSections(snapshot, false),
+    "unavailable sections",
+  );
 }
 
 function assertLatencyHistogram(latency) {
@@ -352,6 +375,20 @@ function assertStringList(sections, expected, label) {
       throw new Error(`diagnostics snapshot did not report ${section} in ${label}`);
     }
   }
+}
+
+function expectedUnavailableSections(snapshot, hasRecentLogs) {
+  const expected = [];
+  if (!hasRecentLogs) {
+    expected.push("recentLogs");
+  }
+  if (!snapshot.screenTopology) {
+    expected.push("screenTopology");
+  }
+  if (!snapshot.latencyHistogram) {
+    expected.push("latencyHistogram");
+  }
+  return expected;
 }
 
 function assertNoSensitiveFields(snapshot) {
