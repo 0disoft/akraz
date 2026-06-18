@@ -49,6 +49,7 @@ const DEFAULT_DAEMON_LOG_CAPACITY: usize = 64;
 const DEFAULT_DAEMON_LOGS_TAIL_LIMIT: usize = 25;
 const DEFAULT_CAPTURE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_CAPTURE_WATCHDOG_IDLE_POLLS: u32 = 80;
+const DEFAULT_POWER_RESUME_POLL_GAP: Duration = Duration::from_secs(5);
 const DEFAULT_PEER_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_PEER_SESSION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_PEER_SESSION_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
@@ -897,11 +898,26 @@ impl DaemonPeerTransport for ManagedPeerSessionTransport {
         &self,
         command: DaemonTransportCommand,
     ) -> Result<(), PlatformError> {
-        if let Some(transport) = self.active_transport()? {
-            transport.dispatch_transport_command(command)?;
+        let should_disconnect = matches!(command, DaemonTransportCommand::StopRemoteSession { .. });
+        let Some(transport) = self.active_transport()? else {
+            return Ok(());
+        };
+        let dispatch_result = transport.dispatch_transport_command(command);
+        if should_disconnect || dispatch_result.is_err() {
+            match self.disconnect_session() {
+                Ok(_) => {}
+                Err(disconnect_error) => {
+                    return match dispatch_result {
+                        Ok(()) => Err(disconnect_error),
+                        Err(dispatch_error) => Err(PlatformError::new(format!(
+                            "{dispatch_error}; additionally failed to detach managed peer session: {disconnect_error}"
+                        ))),
+                    };
+                }
+            }
         }
 
-        Ok(())
+        dispatch_result
     }
 }
 
@@ -2412,13 +2428,22 @@ where
     let idle_poll_interval = config.bounded_idle_poll_interval();
     let mut idle_watchdog =
         InputCaptureIdleWatchdog::new(config.bounded_idle_watchdog_timeout(), Instant::now());
+    let mut power_resume_watchdog =
+        PowerResumeWatchdog::new(DEFAULT_POWER_RESUME_POLL_GAP, Instant::now());
     let mut router = CapturedInputRouter::new(routing);
 
     while running.load(Ordering::Acquire) {
         sync_capture_policy_with_state(&capture, &state)?;
         match capture.recv_timeout(idle_poll_interval) {
             Ok(event) => {
-                idle_watchdog.record_progress(Instant::now());
+                let now = Instant::now();
+                if power_resume_watchdog.record_poll(now) {
+                    dispatch_core_action_batch(
+                        &dispatcher,
+                        recover_runtime_after_system_resume(&state)?,
+                    )?;
+                }
+                idle_watchdog.record_progress(now);
                 dispatch_core_action_batch(
                     &dispatcher,
                     apply_routed_capture_event(&state, &mut router, event)?,
@@ -2436,8 +2461,17 @@ where
                 sync_capture_policy_with_state(&capture, &state)?;
             }
             Err(RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
                 sync_capture_policy_with_state(&capture, &state)?;
-                if let Some(action) = idle_watchdog.record_idle_poll(Instant::now()) {
+                if power_resume_watchdog.record_poll(now) {
+                    dispatch_core_action_batch(
+                        &dispatcher,
+                        recover_runtime_after_system_resume(&state)?,
+                    )?;
+                    idle_watchdog.record_progress(now);
+                    continue;
+                }
+                if let Some(action) = idle_watchdog.record_idle_poll(now) {
                     dispatch_core_action_batch(&dispatcher, vec![action])?;
                 }
             }
@@ -2446,6 +2480,27 @@ where
     }
 
     capture.stop()
+}
+
+#[derive(Debug, Clone)]
+struct PowerResumeWatchdog {
+    max_poll_gap: Duration,
+    last_poll_at: Instant,
+}
+
+impl PowerResumeWatchdog {
+    fn new(max_poll_gap: Duration, now: Instant) -> Self {
+        Self {
+            max_poll_gap,
+            last_poll_at: now,
+        }
+    }
+
+    fn record_poll(&mut self, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.last_poll_at);
+        self.last_poll_at = now;
+        elapsed >= self.max_poll_gap
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2477,6 +2532,22 @@ impl InputCaptureIdleWatchdog {
         self.idle_reported = true;
         Some(CoreAction::InputCaptureIdle)
     }
+}
+
+fn recover_runtime_after_system_resume(
+    state: &SharedRuntimeInputState,
+) -> Result<Vec<CoreAction>, PlatformError> {
+    let mut state = state
+        .lock()
+        .map_err(|_| PlatformError::new("daemon runtime state is unavailable"))?;
+
+    state
+        .apply_event(RuntimeEvent::SystemResumed)
+        .map_err(resume_transition_error)
+}
+
+fn resume_transition_error(error: CoreTransitionError) -> PlatformError {
+    PlatformError::new(format!("failed to recover after system resume: {error}"))
 }
 
 fn sync_capture_policy_with_state(
@@ -2875,8 +2946,11 @@ pub fn disconnect_peer_session(
     dispatcher: &impl CoreActionDispatcher,
     peer_sessions: &ManagedPeerSessionTransport,
 ) -> Result<SessionDisconnectResult, PlatformError> {
+    let active_session_before_recovery = peer_sessions.active_session()?;
     let recovery = recover_local_control_and_release_inputs(state, dispatcher)?;
-    let detached_session = peer_sessions.disconnect_session()?;
+    let detached_session = peer_sessions
+        .disconnect_session()?
+        .or(active_session_before_recovery);
 
     Ok(SessionDisconnectResult {
         disconnected: detached_session.is_some(),
@@ -3082,8 +3156,8 @@ mod tests {
         ManagedPeerSessionTransport, NoopCoreActionDispatcher, PeerSessionReconnectBackoff,
         PeerTransportCommandExecution, PeerTransportCommandPayload, PeerTransportInputEvent,
         PeerTransportMessage, PeerTransportProtocolVersion, PeerTransportSessionFrame,
-        TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher,
-        apply_routed_capture_event_to_state, build_daemon_status,
+        PowerResumeWatchdog, TcpPeerSessionTransport, TcpPeerTransport,
+        TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
         build_daemon_status_with_peer_sessions, build_diagnostics_screen_topology,
         build_permissions_probe, connect_peer_session, disconnect_peer_session,
         drain_capture_events, execute_authenticated_peer_transport_session_stream_until_closed,
@@ -3731,6 +3805,16 @@ mod tests {
     }
 
     #[test]
+    fn power_resume_watchdog_reports_only_long_poll_gaps() {
+        let now = Instant::now();
+        let mut watchdog = PowerResumeWatchdog::new(Duration::from_secs(5), now);
+
+        assert!(!watchdog.record_poll(now + Duration::from_secs(4)));
+        assert!(watchdog.record_poll(now + Duration::from_secs(9)));
+        assert!(!watchdog.record_poll(now + Duration::from_secs(10)));
+    }
+
+    #[test]
     fn capture_policy_sync_follows_shared_remote_state() {
         let platform = FakePlatformAdapter::default();
         let capture = platform
@@ -4219,6 +4303,45 @@ mod tests {
         assert_eq!(
             session.commands,
             vec![DaemonTransportCommand::ReleaseAllInputs]
+        );
+    }
+
+    #[test]
+    fn managed_peer_session_transport_detaches_when_stop_session_is_dispatched() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let server_thread =
+            std::thread::spawn(move || serve_tcp_peer_transport_session(&listener, 1));
+        let managed = ManagedPeerSessionTransport::new();
+        let session = TcpPeerSessionTransport::connect(
+            PeerId::new("right-peer"),
+            DeviceId::new("windows-desktop"),
+            address,
+        )
+        .expect("connect TCP peer session");
+
+        managed
+            .attach_session(session)
+            .expect("attach active session");
+        managed
+            .dispatch_transport_command(DaemonTransportCommand::StopRemoteSession {
+                session_id: Some(SessionId::new("session-resume")),
+            })
+            .expect("managed stop dispatch");
+
+        assert_eq!(managed.active_session(), Ok(None));
+        assert_eq!(managed.is_connected(), Ok(false));
+
+        let session = server_thread
+            .join()
+            .expect("TCP peer session server thread")
+            .expect("TCP peer session");
+        assert_eq!(
+            session.commands,
+            vec![DaemonTransportCommand::StopRemoteSession {
+                session_id: Some(SessionId::new("session-resume")),
+            }]
         );
     }
 

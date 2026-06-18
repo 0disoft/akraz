@@ -408,6 +408,7 @@ pub enum RuntimeEvent {
     RemoteLeaveRequested,
     LocalControlConfirmed,
     EmergencyRecoveryRequested,
+    SystemResumed,
     TransportLost,
     RecoveryCompleted,
 }
@@ -529,6 +530,7 @@ impl RuntimeInputState {
             RuntimeEvent::RemoteLeaveRequested => self.request_remote_leave(),
             RuntimeEvent::LocalControlConfirmed => self.confirm_local_control(),
             RuntimeEvent::EmergencyRecoveryRequested => Ok(self.handle_panic_hotkey()),
+            RuntimeEvent::SystemResumed => Ok(self.handle_system_resumed()),
             RuntimeEvent::TransportLost => Ok(self.handle_transport_lost()),
             RuntimeEvent::RecoveryCompleted => self.complete_recovery(),
         }
@@ -695,6 +697,10 @@ impl RuntimeInputState {
         }
 
         actions
+    }
+
+    fn handle_system_resumed(&mut self) -> Vec<CoreAction> {
+        self.handle_panic_hotkey()
     }
 
     fn confirm_local_control(&mut self) -> Result<Vec<CoreAction>, CoreTransitionError> {
@@ -1194,6 +1200,49 @@ mod tests {
         assert_eq!(result.state.mode(), ControlMode::Suspended);
         assert!(result.state.pressed_keys().is_empty());
         assert_eq!(result.state.modifiers(), Default::default());
+    }
+
+    #[test]
+    fn system_resume_recovers_local_control_and_stops_remote_session() {
+        let mut state = RuntimeInputState::new();
+
+        apply_ok(
+            &mut state,
+            RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            },
+        );
+        apply_ok(
+            &mut state,
+            RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-resume"),
+            },
+        );
+        apply_ok(
+            &mut state,
+            RuntimeEvent::Input(CapturedInputEvent::Key {
+                key: PhysicalKey::LeftShift,
+                state: PressState::Pressed,
+            }),
+        );
+
+        let actions = apply_ok(&mut state, RuntimeEvent::SystemResumed);
+
+        assert_eq!(
+            actions,
+            vec![
+                CoreAction::ReleaseLocalInputs,
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-resume")),
+                },
+            ]
+        );
+        assert_eq!(state.mode(), ControlMode::Local);
+        assert!(state.pressed_keys().is_empty());
+        assert_eq!(state.modifiers(), Default::default());
+        assert!(state.active_peer_id().is_none());
+        assert!(state.active_session_id().is_none());
     }
 
     #[test]
