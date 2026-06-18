@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.4.67",
+  "version": "0.4.68",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -14,11 +14,13 @@
     "format:check": "oxfmt --check .",
     "lint": "oxlint . --no-error-on-unmatched-pattern",
     "lint:fix": "oxlint --fix . --no-error-on-unmatched-pattern",
+    "release:signing-preflight": "bun run --cwd apps/akraz release:signing-preflight",
     "smoke:daemon-lifecycle": "bun run --cwd apps/akraz smoke:daemon-lifecycle",
     "smoke:diagnostics-snapshot": "bun run --cwd apps/akraz smoke:diagnostics-snapshot",
     "smoke:loopback-transport": "bun run --cwd apps/akraz smoke:loopback-transport",
     "smoke:peer-session": "bun run --cwd apps/akraz smoke:peer-session",
     "smoke:peer-session-executor": "bun run --cwd apps/akraz smoke:peer-session-executor",
+    "smoke:signing-preflight": "bun run --cwd apps/akraz smoke:signing-preflight",
     "smoke:session-connect-lifecycle": "bun run --cwd apps/akraz smoke:session-connect-lifecycle",
     "smoke:settings-start": "bun run --cwd apps/akraz smoke:settings-start",
     "smoke:tcp-transport": "bun run --cwd apps/akraz smoke:tcp-transport",
