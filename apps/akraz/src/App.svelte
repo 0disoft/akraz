@@ -2,14 +2,15 @@
   import { onMount } from 'svelte';
 
   import { daemonState } from './lib/state/daemonState.svelte';
+  import { identityState } from './lib/state/identityState.svelte';
   import { settingsState } from './lib/state/settingsState.svelte';
   import type {
     ControlMode,
     DaemonLifecyclePhase,
     PlatformCapabilities,
+    PeerStatus,
     ScreenEdge,
     SessionConnectParams,
-    PeerStatus,
   } from './lib/api/types';
 
   const modeLabels: Record<ControlMode, string> = {
@@ -43,6 +44,12 @@
   };
 
   const edgeOptions: ScreenEdge[] = ['left', 'right', 'top', 'bottom'];
+  const identityCapabilities: Array<{ bit: number; label: string }> = [
+    { bit: 1, label: '마우스' },
+    { bit: 2, label: '키보드' },
+    { bit: 4, label: '클립보드' },
+    { bit: 8, label: '화면 배치' },
+  ];
 
   let sessionPeerId = $state('');
   let sessionLocalDeviceId = $state('');
@@ -50,6 +57,7 @@
 
   onMount(() => {
     void daemonState.refresh();
+    void identityState.load();
     void settingsState.load();
   });
 
@@ -78,6 +86,34 @@
       return '저장됨';
     }
     return '저장 전';
+  }
+
+  function identityMessage() {
+    if (identityState.operation === 'load') {
+      return '불러오는 중';
+    }
+    if (identityState.operation === 'trust') {
+      return '등록 중';
+    }
+    if (identityState.lastError) {
+      return identityState.lastError;
+    }
+    if (identityState.trusted) {
+      return `${identityState.trusted.displayName} 등록됨`;
+    }
+    return identityState.local ? '준비됨' : '대기 중';
+  }
+
+  function canTrustIdentity() {
+    return identityState.local !== null && !identityState.isBusy && identityState.peerDocumentReady;
+  }
+
+  function capabilityLabel(capabilities: number) {
+    const labels = identityCapabilities
+      .filter((capability) => (capabilities & capability.bit) === capability.bit)
+      .map((capability) => capability.label);
+
+    return labels.length > 0 ? labels.join(' · ') : '없음';
   }
 
   function connectedPeers() {
@@ -247,6 +283,92 @@
         </div>
       </div>
     {/if}
+
+    <section class="section-block identity-block" aria-labelledby="identity-title">
+      <div class="section-heading-row">
+        <h2 id="identity-title">기기 등록</h2>
+        <span class:error-text={identityState.lastError}>{identityMessage()}</span>
+      </div>
+
+      <div class="identity-grid">
+        <div class="identity-column">
+          <div class="identity-heading">
+            <h3>내 기기</h3>
+            <button
+              type="button"
+              class="control-button secondary compact"
+              disabled={identityState.isBusy}
+              onclick={() => identityState.load()}
+            >
+              {identityState.operation === 'load' ? '확인 중' : '새로고침'}
+            </button>
+          </div>
+
+          {#if identityState.local}
+            <dl class="identity-facts">
+              <div>
+                <dt>이름</dt>
+                <dd>{identityState.local.displayName}</dd>
+              </div>
+              <div>
+                <dt>기기 ID</dt>
+                <dd><code>{identityState.local.deviceId}</code></dd>
+              </div>
+              <div>
+                <dt>Fingerprint</dt>
+                <dd><code>{identityState.local.fingerprint}</code></dd>
+              </div>
+              <div>
+                <dt>입력</dt>
+                <dd>{capabilityLabel(identityState.local.capabilities)}</dd>
+              </div>
+            </dl>
+            <label class="document-field">
+              <span>내 기기 코드</span>
+              <textarea
+                readonly
+                rows="8"
+                value={identityState.local.documentJson}
+                aria-label="내 기기 코드"
+                spellcheck="false"
+              ></textarea>
+            </label>
+          {:else}
+            <p class="muted">아직 내 기기 정보가 없어.</p>
+          {/if}
+        </div>
+
+        <div class="identity-column">
+          <h3>상대 기기</h3>
+          <label class="document-field">
+            <span>상대 기기 코드</span>
+            <textarea
+              rows="8"
+              value={identityState.peerDocumentJson}
+              placeholder="akraz.peerIdentity JSON"
+              aria-label="상대 기기 코드"
+              spellcheck="false"
+              disabled={identityState.isBusy}
+              oninput={(event) => identityState.updatePeerDocumentJson(event.currentTarget.value)}
+            ></textarea>
+          </label>
+
+          {#if identityState.trusted}
+            <div class="trust-result" aria-live="polite">
+              <strong>{identityState.trusted.displayName}</strong>
+              <code>{identityState.trusted.fingerprint}</code>
+              <span>{capabilityLabel(identityState.trusted.capabilities)}</span>
+            </div>
+          {/if}
+
+          <div class="settings-actions">
+            <button type="button" class="control-button" disabled={!canTrustIdentity()} onclick={() => identityState.trust()}>
+              {identityState.operation === 'trust' ? '등록 중' : '등록'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
 
     <section class="section-block session-block" aria-labelledby="session-title">
       <div class="section-heading-row">

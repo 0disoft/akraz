@@ -77,6 +77,37 @@ export interface SessionDisconnectResult {
   mode: ControlMode;
 }
 
+export interface PairingIdentityDocument {
+  kind: string;
+  version: number;
+  deviceId: string;
+  displayName: string;
+  identityPublicKey: string;
+  fingerprint: string;
+  capabilities: number;
+}
+
+export interface IdentityShowResult {
+  deviceId: string;
+  displayName: string;
+  fingerprint: string;
+  capabilities: number;
+  document: PairingIdentityDocument;
+  documentJson: string;
+}
+
+export interface IdentityTrustParams {
+  peerDocumentJson: string;
+}
+
+export interface IdentityTrustResult {
+  trusted: boolean;
+  peerId: string;
+  displayName: string;
+  fingerprint: string;
+  capabilities: number;
+}
+
 export interface AppSettings {
   captureInput: boolean;
   edgeBindings: ScreenEdgeBinding[];

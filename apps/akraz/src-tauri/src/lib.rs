@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use akraz_identity::{FileIdentityStore, PairingIdentityDocument};
 use akraz_ipc::{
     DaemonStatus, DaemonStatusParams, IpcCallError, IpcEndpoint, IpcTransportError,
     JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient,
@@ -14,6 +15,7 @@ use akraz_ipc::{
     SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult, call_json_rpc,
     resolve_current_default_endpoint,
 };
+use akraz_protocol::CapabilityFlags;
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tauri::async_runtime::Receiver;
@@ -70,6 +72,8 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
             daemon_stop,
             session_connect,
             session_disconnect,
+            identity_show,
+            identity_trust,
             settings_load,
             settings_save
         ])
@@ -280,6 +284,23 @@ async fn session_disconnect() -> Result<DaemonLifecycleSnapshot, String> {
 }
 
 #[tauri::command]
+async fn identity_show(app: tauri::AppHandle) -> Result<IdentityShowResult, String> {
+    tauri::async_runtime::spawn_blocking(move || load_identity_document(&app))
+        .await
+        .map_err(|error| format!("identity show task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn identity_trust(
+    app: tauri::AppHandle,
+    params: IdentityTrustOptions,
+) -> Result<IdentityTrustResult, String> {
+    tauri::async_runtime::spawn_blocking(move || trust_identity_document(&app, params))
+        .await
+        .map_err(|error| format!("identity trust task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn settings_load(app: tauri::AppHandle) -> Result<AppSettings, String> {
     tauri::async_runtime::spawn_blocking(move || load_app_settings(&app))
         .await
@@ -369,6 +390,33 @@ struct SessionConnectOptions {
     peer_id: String,
     local_device_id: String,
     address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityShowResult {
+    device_id: String,
+    display_name: String,
+    fingerprint: String,
+    capabilities: CapabilityFlags,
+    document: PairingIdentityDocument,
+    document_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IdentityTrustOptions {
+    peer_document_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityTrustResult {
+    trusted: bool,
+    peer_id: String,
+    display_name: String,
+    fingerprint: String,
+    capabilities: CapabilityFlags,
 }
 
 impl From<AppSettings> for DaemonStartOptions {
@@ -676,6 +724,23 @@ fn save_app_settings(app: &tauri::AppHandle, settings: AppSettings) -> Result<Ap
     save_settings_to_path(&path, settings)
 }
 
+fn load_identity_document(app: &tauri::AppHandle) -> Result<IdentityShowResult, String> {
+    let path = daemon_identity_store_path(app)?;
+    build_identity_show_result_from_path(&path, DAEMON_IDENTITY_DISPLAY_NAME)
+}
+
+fn trust_identity_document(
+    app: &tauri::AppHandle,
+    params: IdentityTrustOptions,
+) -> Result<IdentityTrustResult, String> {
+    let path = daemon_identity_store_path(app)?;
+    trust_identity_document_from_json(
+        &path,
+        DAEMON_IDENTITY_DISPLAY_NAME,
+        &params.peer_document_json,
+    )
+}
+
 fn app_settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .path()
@@ -698,6 +763,76 @@ fn identity_store_path_from_config_dir(config_dir: PathBuf) -> PathBuf {
     config_dir
         .join(IDENTITY_STORE_DIR_NAME)
         .join(IDENTITY_STORE_FILE_NAME)
+}
+
+fn build_identity_show_result_from_path(
+    path: &Path,
+    display_name: &str,
+) -> Result<IdentityShowResult, String> {
+    let store = FileIdentityStore::new(path);
+    let identity = store.load_or_create(display_name).map_err(|source| {
+        format_identity_store_error("failed to load Akraz identity", path, &source)
+    })?;
+    let document = PairingIdentityDocument::from_device_identity(
+        identity.identity(),
+        default_pairing_capabilities(),
+    );
+    let document_json = serde_json::to_string_pretty(&document)
+        .map_err(|error| format!("failed to encode Akraz identity: {error}"))?;
+
+    Ok(IdentityShowResult {
+        device_id: document.device_id().to_string(),
+        display_name: document.display_name().to_string(),
+        fingerprint: document.fingerprint().to_string(),
+        capabilities: document.capabilities(),
+        document,
+        document_json,
+    })
+}
+
+fn trust_identity_document_from_json(
+    path: &Path,
+    display_name: &str,
+    peer_document_json: &str,
+) -> Result<IdentityTrustResult, String> {
+    let peer_document_json = peer_document_json.trim();
+    if peer_document_json.is_empty() {
+        return Err("peer identity is required.".to_string());
+    }
+
+    let store = FileIdentityStore::new(path);
+    store.load_or_create(display_name).map_err(|source| {
+        format_identity_store_error("failed to load Akraz identity", path, &source)
+    })?;
+    let document: PairingIdentityDocument = serde_json::from_str(peer_document_json)
+        .map_err(|error| format!("failed to decode peer identity: {error}"))?;
+    let peer = document
+        .into_trusted_peer_identity()
+        .map_err(|error| format!("invalid peer identity: {error}"))?;
+
+    store.save_trusted_peer(&peer).map_err(|source| {
+        format_identity_store_error("failed to save trusted peer", path, &source)
+    })?;
+
+    Ok(IdentityTrustResult {
+        trusted: true,
+        peer_id: peer.peer_id().to_string(),
+        display_name: peer.display_name().to_string(),
+        fingerprint: peer.fingerprint().to_string(),
+        capabilities: peer.capabilities(),
+    })
+}
+
+fn default_pairing_capabilities() -> CapabilityFlags {
+    CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+}
+
+fn format_identity_store_error(
+    operation: &str,
+    path: &Path,
+    source: &(dyn std::error::Error + 'static),
+) -> String {
+    format!("{operation} at {}: {source}", path.display())
 }
 
 fn load_settings_from_path(path: &PathBuf) -> Result<AppSettings, String> {
@@ -1107,6 +1242,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
+    use akraz_identity::FileIdentityStore;
     use akraz_ipc::{
         ControlModeSnapshot, DaemonStatus, IpcEndpoint, IpcPlatformCapabilities, IpcTransportError,
         JsonRpcError, JsonRpcFailure, JsonRpcSuccess, ProtocolVersionSnapshot,
@@ -1119,11 +1255,13 @@ mod tests {
         DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_SERVE_ARG, DAEMON_SETTINGS_START_SMOKE_FLAG,
         DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase, DaemonScreenEdgeOption,
         DaemonStartOptions, IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME,
-        classify_daemon_call_error, daemon_capture_input_enabled_from, daemon_executable_name,
-        daemon_spawn_args_from, format_edge_binding_arg, has_exact_arg,
+        build_identity_show_result_from_path, classify_daemon_call_error,
+        daemon_capture_input_enabled_from, daemon_executable_name, daemon_spawn_args_from,
+        default_pairing_capabilities, format_edge_binding_arg, has_exact_arg,
         identity_store_path_from_config_dir, load_settings_from_path,
         normalize_session_connect_options, parse_daemon_status_response, parse_json_rpc_response,
         resolve_env_daemon_executable_from, save_settings_to_path, settings_start_smoke_settings,
+        trust_identity_document_from_json,
     };
 
     fn status_fixture() -> DaemonStatus {
@@ -1359,6 +1497,70 @@ mod tests {
     }
 
     #[test]
+    fn identity_show_exports_public_pairing_document_without_secret_key() {
+        let path = unique_identity_path("show");
+
+        let result =
+            build_identity_show_result_from_path(&path, " Windows Desktop ").expect("identity");
+
+        assert_eq!(result.display_name, "Windows Desktop");
+        assert_eq!(result.capabilities, default_pairing_capabilities());
+        assert!(
+            result
+                .document_json
+                .contains("\"kind\": \"akraz.peerIdentity\"")
+        );
+        assert!(result.document_json.contains(&result.device_id));
+        assert!(result.document_json.contains(&result.fingerprint));
+        assert!(!result.document_json.contains("identitySecretKey"));
+
+        remove_identity_path(path);
+    }
+
+    #[test]
+    fn identity_trust_saves_valid_peer_document() {
+        let source_path = unique_identity_path("source");
+        let target_path = unique_identity_path("target");
+        let source = build_identity_show_result_from_path(&source_path, "Source Laptop")
+            .expect("source identity");
+
+        let result = trust_identity_document_from_json(
+            &target_path,
+            "Target Desktop",
+            &source.document_json,
+        )
+        .expect("trusted peer");
+
+        assert!(result.trusted);
+        assert_eq!(result.peer_id, source.device_id);
+        assert_eq!(result.display_name, "Source Laptop");
+        assert_eq!(result.fingerprint, source.fingerprint);
+        assert_eq!(result.capabilities, default_pairing_capabilities());
+
+        let loaded = FileIdentityStore::new(&target_path)
+            .load_trusted_peer(&result.peer_id)
+            .expect("loaded trusted peer");
+        assert_eq!(loaded.identity().peer_id(), result.peer_id);
+        assert_eq!(loaded.identity().display_name(), result.display_name);
+        assert_eq!(loaded.identity().fingerprint(), result.fingerprint);
+
+        remove_identity_path(source_path);
+        remove_identity_path(target_path);
+    }
+
+    #[test]
+    fn identity_trust_rejects_empty_peer_document() {
+        let path = unique_identity_path("empty-peer");
+
+        assert_eq!(
+            trust_identity_document_from_json(&path, "Target Desktop", " "),
+            Err("peer identity is required.".to_string())
+        );
+
+        remove_identity_path(path);
+    }
+
+    #[test]
     fn settings_load_defaults_when_file_is_missing() {
         let path = unique_settings_path("missing");
 
@@ -1528,5 +1730,26 @@ mod tests {
                 std::process::id()
             ))
             .join(format!("{nanos}.json"))
+    }
+
+    fn unique_identity_path(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+
+        std::env::temp_dir()
+            .join(format!(
+                "akraz-app-identity-test-{label}-{}",
+                std::process::id()
+            ))
+            .join(format!("{nanos}.json"))
+    }
+
+    fn remove_identity_path(path: PathBuf) {
+        let _ = std::fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
     }
 }

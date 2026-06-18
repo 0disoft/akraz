@@ -20,7 +20,9 @@ name = "akraz"
 path = "src/main.rs"
 
 [dependencies]
+akraz-identity = { path = "../../../crates/akraz-identity" }
 akraz-ipc = { path = "../../../crates/akraz-ipc" }
+akraz-protocol = { path = "../../../crates/akraz-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2.11.2", features = [] }
