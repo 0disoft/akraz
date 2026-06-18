@@ -6,6 +6,14 @@ import type { DiagnosticsScreenTopology, ScreenEdgeBinding } from "../src/lib/ap
 const topology: DiagnosticsScreenTopology = {
   pointerPosition: { x: 960, y: 540 },
   virtualScreenBounds: { x: 0, y: 0, width: 1920, height: 1080 },
+  monitors: [
+    {
+      id: "primary",
+      bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+      scaleFactorPercent: 100,
+      isPrimary: true,
+    },
+  ],
 };
 
 function binding(localEdge: ScreenEdgeBinding["localEdge"]): ScreenEdgeBinding {
@@ -55,6 +63,7 @@ describe("layout crossing preview", () => {
       previewEdgeCrossing(binding("right"), {
         pointerPosition: { x: 0, y: 0 },
         virtualScreenBounds: { x: 0, y: 0, width: -1, height: 1080 },
+        monitors: [],
       }),
     ).toBeNull();
   });

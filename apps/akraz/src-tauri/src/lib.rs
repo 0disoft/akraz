@@ -1727,11 +1727,11 @@ mod tests {
 
     use akraz_identity::FileIdentityStore;
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonStatus, DiagnosticsScreenTopology, InputReleaseAllResult,
-        IpcEndpoint, IpcPlatformCapabilities, IpcTransportError, JsonRpcError, JsonRpcFailure,
-        JsonRpcSuccess, LogicalPointSnapshot, LogicalRectSnapshot, PermissionIssue,
-        PermissionsProbe, ProtocolVersionSnapshot, SessionConnectResult, SessionStatus,
-        to_json_line,
+        ControlModeSnapshot, DaemonStatus, DiagnosticsMonitorSnapshot, DiagnosticsScreenTopology,
+        InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities, IpcTransportError,
+        JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LogicalPointSnapshot, LogicalRectSnapshot,
+        PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectResult,
+        SessionStatus, to_json_line,
     };
 
     use super::{
@@ -1750,6 +1750,20 @@ mod tests {
         save_layout_to_path, save_settings_to_path, settings_start_smoke_settings,
         trust_identity_document_from_json,
     };
+
+    fn monitor_snapshots() -> Vec<DiagnosticsMonitorSnapshot> {
+        vec![DiagnosticsMonitorSnapshot {
+            id: "primary".to_string(),
+            bounds: LogicalRectSnapshot {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            scale_factor_percent: Some(100),
+            is_primary: true,
+        }]
+    }
 
     fn status_fixture() -> DaemonStatus {
         DaemonStatus {
@@ -1828,6 +1842,7 @@ mod tests {
                 width: 3840,
                 height: 1080,
             },
+            monitors: monitor_snapshots(),
         };
         let line = match to_json_line(&JsonRpcSuccess::new("tauri", topology.clone())) {
             Ok(line) => line,

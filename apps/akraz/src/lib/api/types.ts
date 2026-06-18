@@ -49,9 +49,17 @@ export interface LogicalRectSnapshot {
   height: number;
 }
 
+export interface DiagnosticsMonitorSnapshot {
+  id: string;
+  bounds: LogicalRectSnapshot;
+  scaleFactorPercent: number | null;
+  isPrimary: boolean;
+}
+
 export interface DiagnosticsScreenTopology {
   pointerPosition: LogicalPointSnapshot;
   virtualScreenBounds: LogicalRectSnapshot;
+  monitors: DiagnosticsMonitorSnapshot[];
 }
 
 export interface DiagnosticsLatencyHistogram {

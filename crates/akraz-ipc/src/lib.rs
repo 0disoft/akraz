@@ -21,7 +21,7 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use akraz_core::{ControlMode, LogicalPoint, LogicalRect};
-use akraz_platform::PlatformCapabilities;
+use akraz_platform::{DesktopMonitor, PlatformCapabilities};
 use akraz_protocol::ProtocolVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1010,6 +1010,27 @@ impl From<LogicalRect> for LogicalRectSnapshot {
     }
 }
 
+/// Wire-safe per-monitor screen snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsMonitorSnapshot {
+    pub id: String,
+    pub bounds: LogicalRectSnapshot,
+    pub scale_factor_percent: Option<u32>,
+    pub is_primary: bool,
+}
+
+impl From<DesktopMonitor> for DiagnosticsMonitorSnapshot {
+    fn from(monitor: DesktopMonitor) -> Self {
+        Self {
+            id: monitor.id,
+            bounds: monitor.bounds.into(),
+            scale_factor_percent: monitor.scale_factor_percent,
+            is_primary: monitor.is_primary,
+        }
+    }
+}
+
 /// Minimal peer status placeholder for the first status contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1045,6 +1066,8 @@ pub struct PermissionsProbe {
 pub struct DiagnosticsScreenTopology {
     pub pointer_position: LogicalPointSnapshot,
     pub virtual_screen_bounds: LogicalRectSnapshot,
+    #[serde(default)]
+    pub monitors: Vec<DiagnosticsMonitorSnapshot>,
 }
 
 /// Sanitized daemon event level used by recent diagnostics logs.
@@ -1473,23 +1496,50 @@ where
 mod tests {
     use super::{
         ControlModeSnapshot, DaemonLogEntry, DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams,
-        DaemonStatus, DaemonStatusParams, DiagnosticsPrivacySnapshot, DiagnosticsScreenTopology,
-        DiagnosticsScreenTopologyParams, InProcessIpcClient, IpcEndpoint, IpcEndpointEnvironment,
-        IpcEndpointError, IpcEndpointKind, IpcOperatingSystem, IpcPlatformCapabilities, IpcRequest,
-        IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS, JSONRPC_ERROR_METHOD_NOT_FOUND,
-        JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient, LocalIpcServer,
-        LogicalPointSnapshot, LogicalRectSnapshot, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
-        METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT,
-        METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PeerStatus, PermissionIssue, PermissionsProbe,
-        ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult,
-        SessionDisconnectParams, SessionDisconnectResult, SessionStatus,
-        build_diagnostics_latency_histogram, build_diagnostics_snapshot,
-        build_diagnostics_support_bundle, call_json_rpc, parse_request_line,
-        resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
+        DaemonStatus, DaemonStatusParams, DiagnosticsMonitorSnapshot, DiagnosticsPrivacySnapshot,
+        DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, InProcessIpcClient,
+        IpcEndpoint, IpcEndpointEnvironment, IpcEndpointError, IpcEndpointKind, IpcOperatingSystem,
+        IpcPlatformCapabilities, IpcRequest, IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS,
+        JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess,
+        LocalIpcClient, LocalIpcServer, LogicalPointSnapshot, LogicalRectSnapshot,
+        METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
+        OsLocalIpcClient, PeerStatus, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
+        SessionConnectParams, SessionConnectResult, SessionDisconnectParams,
+        SessionDisconnectResult, SessionStatus, build_diagnostics_latency_histogram,
+        build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
+        parse_request_line, resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
     };
     use serde_json::json;
 
     const CURRENT_TEST_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+    fn monitor_snapshots() -> Vec<DiagnosticsMonitorSnapshot> {
+        vec![
+            DiagnosticsMonitorSnapshot {
+                id: "left".to_string(),
+                bounds: LogicalRectSnapshot {
+                    x: -1920,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                scale_factor_percent: Some(125),
+                is_primary: false,
+            },
+            DiagnosticsMonitorSnapshot {
+                id: "primary".to_string(),
+                bounds: LogicalRectSnapshot {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                scale_factor_percent: Some(100),
+                is_primary: true,
+            },
+        ]
+    }
 
     #[derive(Debug, Clone)]
     struct EchoServer;
@@ -1647,6 +1697,7 @@ mod tests {
                 width: 3840,
                 height: 1080,
             },
+            monitors: monitor_snapshots(),
         };
         let response = JsonRpcSuccess::new("req_1", topology);
         let line = match to_json_line(&response) {
@@ -1669,7 +1720,31 @@ mod tests {
                         "y": 0,
                         "width": 3840,
                         "height": 1080
-                    }
+                    },
+                    "monitors": [
+                        {
+                            "id": "left",
+                            "bounds": {
+                                "x": -1920,
+                                "y": 0,
+                                "width": 1920,
+                                "height": 1080
+                            },
+                            "scaleFactorPercent": 125,
+                            "isPrimary": false
+                        },
+                        {
+                            "id": "primary",
+                            "bounds": {
+                                "x": 0,
+                                "y": 0,
+                                "width": 1920,
+                                "height": 1080
+                            },
+                            "scaleFactorPercent": 100,
+                            "isPrimary": true
+                        }
+                    ]
                 }
             })
         );
@@ -1717,6 +1792,7 @@ mod tests {
                 width: 3840,
                 height: 1080,
             },
+            monitors: monitor_snapshots(),
         };
 
         let snapshot = build_diagnostics_snapshot(
@@ -1745,6 +1821,7 @@ mod tests {
                     width: 3840,
                     height: 1080,
                 },
+                monitors: monitor_snapshots(),
             })
         );
         assert_eq!(snapshot.privacy, DiagnosticsPrivacySnapshot::default());
@@ -1792,6 +1869,17 @@ mod tests {
                 width: 1920,
                 height: 1080,
             },
+            monitors: vec![DiagnosticsMonitorSnapshot {
+                id: "primary".to_string(),
+                bounds: LogicalRectSnapshot {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                scale_factor_percent: Some(100),
+                is_primary: true,
+            }],
         };
 
         let snapshot = build_diagnostics_snapshot(

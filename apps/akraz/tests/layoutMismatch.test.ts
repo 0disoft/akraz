@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   analyzeLayoutMismatch,
   firstLayoutDaemonStartBlockingIssue,
+  hasMixedDpi,
   isUsableScreenTopology,
 } from "../src/lib/layout/layoutMismatch";
 import type {
@@ -14,6 +15,14 @@ import type {
 const topology: DiagnosticsScreenTopology = {
   pointerPosition: { x: 960, y: 540 },
   virtualScreenBounds: { x: 0, y: 0, width: 1920, height: 1080 },
+  monitors: [
+    {
+      id: "primary",
+      bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+      scaleFactorPercent: 100,
+      isPrimary: true,
+    },
+  ],
 };
 
 const trustedPeer: IdentityTrustedPeer = {
@@ -130,18 +139,66 @@ describe("layout mismatch analysis", () => {
     expect(report.issues).toEqual([]);
   });
 
+  test("reports mixed DPI as limited without blocking daemon start", () => {
+    const mixedDpiTopology: DiagnosticsScreenTopology = {
+      ...topology,
+      virtualScreenBounds: { x: -1920, y: 0, width: 3840, height: 1080 },
+      monitors: [
+        {
+          id: "left",
+          bounds: { x: -1920, y: 0, width: 1920, height: 1080 },
+          scaleFactorPercent: 125,
+          isPrimary: false,
+        },
+        {
+          id: "primary",
+          bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+          scaleFactorPercent: 100,
+          isPrimary: true,
+        },
+      ],
+    };
+
+    const report = analyzeLayoutMismatch({
+      layout: layout([{ localEdge: "right", peerId: trustedPeer.peerId, remoteEdge: "left" }]),
+      trustedPeers: [trustedPeer],
+      topology: mixedDpiTopology,
+    });
+
+    expect(hasMixedDpi(mixedDpiTopology)).toBe(true);
+    expect(report.status).toBe("limited");
+    expect(report.issues).toEqual([
+      {
+        code: "mixed-dpi",
+        status: "limited",
+        message: "서로 다른 배율의 화면이 있어. 경계 이동을 한 번 확인해.",
+      },
+    ]);
+    expect(firstLayoutDaemonStartBlockingIssue(report)).toBeNull();
+  });
+
   test("rejects non-finite or empty screen bounds", () => {
     expect(isUsableScreenTopology(topology)).toBe(true);
+    expect(hasMixedDpi(topology)).toBe(false);
     expect(
       isUsableScreenTopology({
         pointerPosition: { x: 0, y: 0 },
         virtualScreenBounds: { x: 0, y: 0, width: 0, height: 1080 },
+        monitors: [],
       }),
     ).toBe(false);
     expect(
       isUsableScreenTopology({
         pointerPosition: { x: 0, y: 0 },
         virtualScreenBounds: { x: Number.NaN, y: 0, width: 1920, height: 1080 },
+        monitors: [
+          {
+            id: "primary",
+            bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+            scaleFactorPercent: null,
+            isPrimary: true,
+          },
+        ],
       }),
     ).toBe(false);
   });

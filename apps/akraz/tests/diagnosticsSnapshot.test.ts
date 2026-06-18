@@ -51,6 +51,14 @@ function snapshotFixture(): DiagnosticsSnapshot {
     screenTopology: {
       pointerPosition: { x: 120, y: 80 },
       virtualScreenBounds: { x: 0, y: 0, width: 1920, height: 1080 },
+      monitors: [
+        {
+          id: "primary",
+          bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+          scaleFactorPercent: 100,
+          isPrimary: true,
+        },
+      ],
     },
     latencyHistogram: {
       sampleCount: 3,

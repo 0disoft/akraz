@@ -32,7 +32,11 @@ use std::thread;
 use std::thread::JoinHandle;
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
+#[cfg(windows)]
+use windows_sys::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(windows)]
@@ -41,6 +45,8 @@ use windows_sys::Win32::System::StationsAndDesktops::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+#[cfg(windows)]
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
@@ -52,14 +58,16 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetCursorPos, GetMessageW, GetSystemMetrics, HHOOK, KBDLLHOOKSTRUCT,
-    LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSG,
-    MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetWindowsHookExW,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOWS_HOOK_ID, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    XBUTTON1, XBUTTON2,
+    LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED,
+    MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOWS_HOOK_ID,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, XBUTTON1, XBUTTON2,
 };
+#[cfg(windows)]
+use windows_sys::core::BOOL;
 
 /// Capabilities reported by a platform adapter.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -71,10 +79,20 @@ pub struct PlatformCapabilities {
 }
 
 /// Local desktop geometry facts reported by a platform adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopGeometry {
     pub pointer_position: LogicalPoint,
     pub virtual_screen_bounds: LogicalRect,
+    pub monitors: Vec<DesktopMonitor>,
+}
+
+/// Per-monitor geometry facts reported by a platform adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopMonitor {
+    pub id: String,
+    pub bounds: LogicalRect,
+    pub scale_factor_percent: Option<u32>,
+    pub is_primary: bool,
 }
 
 impl PlatformCapabilities {
@@ -488,10 +506,12 @@ fn windows_capabilities_from_probe_results(results: WindowsProbeResults) -> Plat
 fn read_windows_desktop_geometry() -> Result<DesktopGeometry, PlatformError> {
     let pointer_position = read_windows_pointer_position()?;
     let virtual_screen_bounds = read_windows_virtual_screen_bounds()?;
+    let monitors = read_windows_monitor_snapshots();
 
     Ok(DesktopGeometry {
         pointer_position,
         virtual_screen_bounds,
+        monitors,
     })
 }
 
@@ -532,6 +552,103 @@ fn read_windows_virtual_screen_bounds() -> Result<LogicalRect, PlatformError> {
     }
 
     Ok(bounds)
+}
+
+#[cfg(windows)]
+fn read_windows_monitor_snapshots() -> Vec<DesktopMonitor> {
+    let mut monitors = Vec::new();
+    let monitors_ptr = &mut monitors as *mut Vec<DesktopMonitor>;
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            null_mut(),
+            null(),
+            Some(enum_windows_monitor_snapshot),
+            monitors_ptr as LPARAM,
+        )
+    };
+
+    if ok == 0 { Vec::new() } else { monitors }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn enum_windows_monitor_snapshot(
+    monitor: HMONITOR,
+    _dc: HDC,
+    _rect: *mut RECT,
+    monitors_ptr: LPARAM,
+) -> BOOL {
+    let monitors = unsafe { &mut *(monitors_ptr as *mut Vec<DesktopMonitor>) };
+    if let Some(snapshot) = read_windows_monitor_snapshot(monitor, monitors.len()) {
+        monitors.push(snapshot);
+    }
+
+    1
+}
+
+#[cfg(windows)]
+fn read_windows_monitor_snapshot(
+    monitor: HMONITOR,
+    fallback_index: usize,
+) -> Option<DesktopMonitor> {
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+
+    let ok = unsafe { GetMonitorInfoW(monitor, &mut info as *mut _ as *mut MONITORINFO) };
+    if ok == 0 {
+        return None;
+    }
+
+    let bounds = rect_to_logical_rect(info.monitorInfo.rcMonitor);
+    if !bounds.is_valid() {
+        return None;
+    }
+
+    Some(DesktopMonitor {
+        id: monitor_device_id(&info).unwrap_or_else(|| format!("monitor-{}", fallback_index + 1)),
+        bounds,
+        scale_factor_percent: read_monitor_scale_factor_percent(monitor),
+        is_primary: (info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0,
+    })
+}
+
+#[cfg(windows)]
+fn rect_to_logical_rect(rect: RECT) -> LogicalRect {
+    LogicalRect {
+        origin: LogicalPoint {
+            x: rect.left,
+            y: rect.top,
+        },
+        size: LogicalSize {
+            width: rect.right - rect.left,
+            height: rect.bottom - rect.top,
+        },
+    }
+}
+
+#[cfg(windows)]
+fn monitor_device_id(info: &MONITORINFOEXW) -> Option<String> {
+    let end = info
+        .szDevice
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(info.szDevice.len());
+    if end == 0 {
+        return None;
+    }
+
+    Some(String::from_utf16_lossy(&info.szDevice[..end]))
+}
+
+#[cfg(windows)]
+fn read_monitor_scale_factor_percent(monitor: HMONITOR) -> Option<u32> {
+    let mut dpi_x = 0_u32;
+    let mut dpi_y = 0_u32;
+    let result = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+    if result < 0 || dpi_x == 0 || dpi_y == 0 {
+        return None;
+    }
+
+    Some(((u64::from(dpi_x) * 100 + 48) / 96) as u32)
 }
 
 #[cfg(windows)]
@@ -1299,7 +1416,7 @@ impl PlatformAdapter for FakePlatformAdapter {
     }
 
     fn read_desktop_geometry(&self) -> Result<DesktopGeometry, PlatformError> {
-        Ok(self.desktop_geometry)
+        Ok(self.desktop_geometry.clone())
     }
 
     fn start_input_capture(
@@ -1343,6 +1460,18 @@ fn fake_desktop_geometry() -> DesktopGeometry {
                 height: 1080,
             },
         },
+        monitors: vec![DesktopMonitor {
+            id: "primary".to_string(),
+            bounds: LogicalRect {
+                origin: LogicalPoint { x: 0, y: 0 },
+                size: LogicalSize {
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            scale_factor_percent: Some(100),
+            is_primary: true,
+        }],
     }
 }
 
@@ -1358,8 +1487,9 @@ mod tests {
     };
 
     use super::{
-        DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, InputCapturePolicy,
-        PlatformAdapter, PlatformCapabilities, PlatformError, runtime_platform_adapter,
+        DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
+        InputCapturePolicy, PlatformAdapter, PlatformCapabilities, PlatformError,
+        runtime_platform_adapter,
     };
 
     #[cfg(windows)]
@@ -1440,8 +1570,20 @@ mod tests {
                     height: 1080,
                 },
             },
+            monitors: vec![DesktopMonitor {
+                id: "primary".to_string(),
+                bounds: LogicalRect {
+                    origin: LogicalPoint { x: 0, y: 0 },
+                    size: LogicalSize {
+                        width: 1920,
+                        height: 1080,
+                    },
+                },
+                scale_factor_percent: Some(125),
+                is_primary: true,
+            }],
         };
-        let adapter = FakePlatformAdapter::default().with_desktop_geometry(geometry);
+        let adapter = FakePlatformAdapter::default().with_desktop_geometry(geometry.clone());
 
         assert_eq!(adapter.read_desktop_geometry(), Ok(geometry));
     }

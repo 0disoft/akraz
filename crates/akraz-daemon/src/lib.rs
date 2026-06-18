@@ -2706,6 +2706,7 @@ pub fn build_diagnostics_screen_topology(
     Ok(DiagnosticsScreenTopology {
         pointer_position: geometry.pointer_position.into(),
         virtual_screen_bounds: geometry.virtual_screen_bounds.into(),
+        monitors: geometry.monitors.into_iter().map(Into::into).collect(),
     })
 }
 
@@ -3139,8 +3140,8 @@ mod tests {
         SessionDisconnectResult, SessionStatus, call_json_rpc, to_json_line,
     };
     use akraz_platform::{
-        DesktopGeometry, FakePlatformAdapter, InputCaptureConfig, InputCapturePolicy,
-        PlatformAdapter, PlatformCapabilities, PlatformError,
+        DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
+        InputCapturePolicy, PlatformAdapter, PlatformCapabilities, PlatformError,
     };
     use akraz_protocol::{
         AuthTranscript, CapabilityFlags, HANDSHAKE_NONCE_LEN, PeerRole, ProtocolVersion,
@@ -3225,6 +3226,18 @@ mod tests {
                     height: 1080,
                 },
             },
+            monitors: vec![DesktopMonitor {
+                id: "primary".to_string(),
+                bounds: LogicalRect {
+                    origin: LogicalPoint { x: 0, y: 0 },
+                    size: LogicalSize {
+                        width: 1920,
+                        height: 1080,
+                    },
+                },
+                scale_factor_percent: Some(100),
+                is_primary: true,
+            }],
         }
     }
 
@@ -3573,6 +3586,32 @@ mod tests {
                     height: 1080,
                 },
             },
+            monitors: vec![
+                DesktopMonitor {
+                    id: "left".to_string(),
+                    bounds: LogicalRect {
+                        origin: LogicalPoint { x: -1920, y: 0 },
+                        size: LogicalSize {
+                            width: 1920,
+                            height: 1080,
+                        },
+                    },
+                    scale_factor_percent: Some(125),
+                    is_primary: false,
+                },
+                DesktopMonitor {
+                    id: "primary".to_string(),
+                    bounds: LogicalRect {
+                        origin: LogicalPoint { x: 0, y: 0 },
+                        size: LogicalSize {
+                            width: 1920,
+                            height: 1080,
+                        },
+                    },
+                    scale_factor_percent: Some(100),
+                    is_primary: true,
+                },
+            ],
         });
 
         let topology = topology_or_panic(&platform);
@@ -3583,6 +3622,10 @@ mod tests {
         assert_eq!(topology.virtual_screen_bounds.y, 0);
         assert_eq!(topology.virtual_screen_bounds.width, 3840);
         assert_eq!(topology.virtual_screen_bounds.height, 1080);
+        assert_eq!(topology.monitors.len(), 2);
+        assert_eq!(topology.monitors[0].id, "left");
+        assert_eq!(topology.monitors[0].scale_factor_percent, Some(125));
+        assert!(topology.monitors[1].is_primary);
     }
 
     #[test]
@@ -5254,6 +5297,18 @@ mod tests {
                     height: 1080,
                 },
             },
+            monitors: vec![DesktopMonitor {
+                id: "primary".to_string(),
+                bounds: LogicalRect {
+                    origin: LogicalPoint { x: 0, y: 0 },
+                    size: LogicalSize {
+                        width: 1920,
+                        height: 1080,
+                    },
+                },
+                scale_factor_percent: Some(150),
+                is_primary: true,
+            }],
         });
         let dispatcher =
             LocalPlatformCoreActionDispatcher::new(platform.clone(), NoopCoreActionDispatcher);
@@ -5285,6 +5340,8 @@ mod tests {
         assert_eq!(response.result.virtual_screen_bounds.y, 0);
         assert_eq!(response.result.virtual_screen_bounds.width, 3840);
         assert_eq!(response.result.virtual_screen_bounds.height, 1080);
+        assert_eq!(response.result.monitors.len(), 1);
+        assert_eq!(response.result.monitors[0].scale_factor_percent, Some(150));
     }
 
     #[test]

@@ -13,7 +13,8 @@ export type LayoutMismatchIssueCode =
   | "unknown-peer"
   | "duplicate-local-edge"
   | "missing-topology"
-  | "invalid-topology";
+  | "invalid-topology"
+  | "mixed-dpi";
 
 export interface LayoutMismatchIssue {
   code: LayoutMismatchIssueCode;
@@ -49,6 +50,7 @@ const issueMessages: Record<LayoutMismatchIssueCode, string> = {
   "duplicate-local-edge": "같은 화면 끝에 여러 기기가 붙어 있어.",
   "missing-topology": "화면 확인을 하면 현재 해상도와 배치를 함께 검사할 수 있어.",
   "invalid-topology": "현재 화면 범위를 읽지 못했어.",
+  "mixed-dpi": "서로 다른 배율의 화면이 있어. 경계 이동을 한 번 확인해.",
 };
 
 export function isUsableScreenTopology(topology: DiagnosticsScreenTopology | null): boolean {
@@ -65,6 +67,27 @@ export function isUsableScreenTopology(topology: DiagnosticsScreenTopology | nul
     bounds.width > 0 &&
     bounds.height > 0
   );
+}
+
+export function hasMixedDpi(topology: DiagnosticsScreenTopology | null): boolean {
+  if (!topology || topology.monitors.length < 2) {
+    return false;
+  }
+
+  const scaleFactors = new Set<number>();
+  for (const monitor of topology.monitors) {
+    const scaleFactorPercent = monitor.scaleFactorPercent;
+    if (typeof scaleFactorPercent !== "number" || !Number.isFinite(scaleFactorPercent)) {
+      continue;
+    }
+
+    const normalizedScaleFactor = Math.round(scaleFactorPercent);
+    if (normalizedScaleFactor > 0) {
+      scaleFactors.add(normalizedScaleFactor);
+    }
+  }
+
+  return scaleFactors.size > 1;
 }
 
 export function analyzeLayoutMismatch(input: AnalyzeLayoutMismatchInput): LayoutMismatchReport {
@@ -106,6 +129,8 @@ export function analyzeLayoutMismatch(input: AnalyzeLayoutMismatchInput): Layout
     addIssue(issues, "missing-topology", "limited");
   } else if (!hasUsableTopology) {
     addIssue(issues, "invalid-topology", "needs-action");
+  } else if (hasMixedDpi(input.topology)) {
+    addIssue(issues, "mixed-dpi", "limited");
   }
 
   const issueList = Array.from(issues.values());

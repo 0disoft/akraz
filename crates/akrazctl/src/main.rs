@@ -1526,11 +1526,11 @@ mod tests {
 
     use akraz_identity::FileIdentityStore;
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonStatus, DiagnosticsScreenTopology, IpcCallError, IpcEndpoint,
-        IpcEndpointError, IpcEndpointKind, IpcPlatformCapabilities, IpcTransportError,
-        JsonRpcError, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient,
-        LogicalPointSnapshot, LogicalRectSnapshot, PeerStatus, PermissionIssue, PermissionsProbe,
-        ProtocolVersionSnapshot, build_diagnostics_snapshot,
+        ControlModeSnapshot, DaemonStatus, DiagnosticsMonitorSnapshot, DiagnosticsScreenTopology,
+        IpcCallError, IpcEndpoint, IpcEndpointError, IpcEndpointKind, IpcPlatformCapabilities,
+        IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess,
+        LocalIpcClient, LogicalPointSnapshot, LogicalRectSnapshot, PeerStatus, PermissionIssue,
+        PermissionsProbe, ProtocolVersionSnapshot, build_diagnostics_snapshot,
     };
 
     use super::{
@@ -1550,6 +1550,20 @@ mod tests {
     use akraz_ipc::{
         JSONRPC_ERROR_PARSE, JSONRPC_VERSION, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
     };
+
+    fn monitor_snapshots() -> Vec<DiagnosticsMonitorSnapshot> {
+        vec![DiagnosticsMonitorSnapshot {
+            id: "primary".to_string(),
+            bounds: LogicalRectSnapshot {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            scale_factor_percent: Some(100),
+            is_primary: true,
+        }]
+    }
 
     #[test]
     fn parses_endpoint_option() {
@@ -2194,6 +2208,7 @@ mod tests {
                 width: 3840,
                 height: 1080,
             },
+            monitors: monitor_snapshots(),
         };
 
         let snapshot = build_diagnostics_snapshot(
@@ -2220,6 +2235,7 @@ mod tests {
                     width: 3840,
                     height: 1080,
                 },
+                monitors: monitor_snapshots(),
             })
         );
         assert_eq!(snapshot.privacy, Default::default());
