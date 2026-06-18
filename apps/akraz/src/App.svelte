@@ -4,6 +4,7 @@
   import { daemonState } from './lib/state/daemonState.svelte';
   import { diagnosticsState } from './lib/state/diagnosticsState.svelte';
   import { identityState } from './lib/state/identityState.svelte';
+  import { layoutState } from './lib/state/layoutState.svelte';
   import { permissionState } from './lib/state/permissionState.svelte';
   import { settingsState } from './lib/state/settingsState.svelte';
   import {
@@ -74,6 +75,7 @@
     void daemonState.refresh();
     void identityState.load();
     void settingsState.load();
+    void loadLayout();
   });
 
   function canStartDaemon() {
@@ -101,6 +103,24 @@
       return '저장됨';
     }
     return '저장 전';
+  }
+
+  function layoutMessage() {
+    if (layoutState.operation === 'load') {
+      return '불러오는 중';
+    }
+    if (layoutState.operation === 'save') {
+      return '저장 중';
+    }
+    if (layoutState.lastError) {
+      return layoutState.lastError;
+    }
+    if (layoutState.saved) {
+      return '저장됨';
+    }
+    return layoutState.layout.edgeBindings.length > 0
+      ? `${layoutState.layout.edgeBindings.length}개 경계`
+      : '경계 없음';
   }
 
   function identityMessage() {
@@ -237,12 +257,12 @@
     settingsState.updateManualPeerAddress(sessionPeerId, address);
   }
 
-  function selectEdgeTrustedPeer(index: number, peerId: string) {
+  function selectLayoutTrustedPeer(index: number, peerId: string) {
     if (peerId.length === 0) {
       return;
     }
 
-    settingsState.updateEdgeBinding(index, 'peerId', peerId);
+    layoutState.updateEdgeBinding(index, 'peerId', peerId);
   }
 
   function connectedPeers() {
@@ -325,6 +345,27 @@
 
     await daemonState.connectSession(params);
   }
+
+  async function loadLayout() {
+    const layout = await layoutState.load();
+    if (layout) {
+      settingsState.replaceEdgeBindings(layout.edgeBindings);
+    }
+  }
+
+  async function saveLayout() {
+    const layout = await layoutState.save();
+    if (layout) {
+      settingsState.replaceEdgeBindings(layout.edgeBindings);
+    }
+  }
+
+  function startDaemon() {
+    return daemonState.start({
+      ...settingsState.startOptions,
+      edgeBindings: layoutState.layout.edgeBindings,
+    });
+  }
 </script>
 
 <main class="shell">
@@ -346,8 +387,8 @@
         <button
           type="button"
           class="control-button"
-          disabled={daemonState.isBusy || settingsState.isBusy || !canStartDaemon()}
-          onclick={() => daemonState.start(settingsState.startOptions)}
+          disabled={daemonState.isBusy || settingsState.isBusy || layoutState.isBusy || !!layoutState.lastError || !canStartDaemon()}
+          onclick={startDaemon}
         >
           {daemonState.operation === 'start' ? '시작 중' : '시작'}
         </button>
@@ -670,6 +711,109 @@
       </div>
     </section>
 
+    <section class="section-block layout-block" aria-labelledby="layout-title">
+      <div class="section-heading-row">
+        <h2 id="layout-title">화면 배치</h2>
+        <span class:error-text={layoutState.lastError}>{layoutMessage()}</span>
+      </div>
+
+      {#if layoutState.layout.edgeBindings.length === 0}
+        <p class="muted">화면 끝을 넘길 기기를 추가할 수 있어.</p>
+      {:else}
+        <div class="edge-list" aria-label="화면 끝 연결">
+          {#each layoutState.layout.edgeBindings as binding, index}
+            <div class="edge-row">
+              <label>
+                <span>내 화면</span>
+                <select
+                  value={binding.localEdge}
+                  disabled={layoutState.isBusy}
+                  onchange={(event) => layoutState.updateEdgeBinding(index, 'localEdge', event.currentTarget.value)}
+                >
+                  {#each edgeOptions as edge}
+                    <option value={edge}>{edgeLabels[edge]}</option>
+                  {/each}
+                </select>
+              </label>
+
+              <label class="peer-field">
+                <span>기기 ID</span>
+                <select
+                  value={trustedPeerSelectValue(binding.peerId)}
+                  disabled={layoutState.isBusy || identityState.trustedPeers.length === 0}
+                  onchange={(event) => selectLayoutTrustedPeer(index, event.currentTarget.value)}
+                  aria-label="등록된 기기 선택"
+                >
+                  <option value="">직접 입력</option>
+                  {#each identityState.trustedPeers as peer (peer.peerId)}
+                    <option value={peer.peerId}>{trustedPeerLabel(peer)}</option>
+                  {/each}
+                </select>
+                <input
+                  type="text"
+                  value={binding.peerId}
+                  placeholder="linux-laptop"
+                  spellcheck="false"
+                  disabled={layoutState.isBusy}
+                  onchange={(event) => layoutState.updateEdgeBinding(index, 'peerId', event.currentTarget.value)}
+                />
+              </label>
+
+              <label>
+                <span>상대 화면</span>
+                <select
+                  value={binding.remoteEdge}
+                  disabled={layoutState.isBusy}
+                  onchange={(event) => layoutState.updateEdgeBinding(index, 'remoteEdge', event.currentTarget.value)}
+                >
+                  {#each edgeOptions as edge}
+                    <option value={edge}>{edgeLabels[edge]}</option>
+                  {/each}
+                </select>
+              </label>
+
+              <button
+                type="button"
+                class="icon-button"
+                aria-label="연결 삭제"
+                disabled={layoutState.isBusy}
+                onclick={() => layoutState.removeEdgeBinding(index)}
+              >
+                ×
+              </button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+
+      <div class="settings-actions">
+        <button
+          type="button"
+          class="control-button secondary"
+          disabled={layoutState.isBusy}
+          onclick={() => layoutState.addEdgeBinding()}
+        >
+          추가
+        </button>
+        <button
+          type="button"
+          class="control-button secondary"
+          disabled={layoutState.isBusy}
+          onclick={loadLayout}
+        >
+          {layoutState.operation === 'load' ? '불러오는 중' : '불러오기'}
+        </button>
+        <button
+          type="button"
+          class="control-button"
+          disabled={layoutState.isBusy}
+          onclick={saveLayout}
+        >
+          {layoutState.operation === 'save' ? '저장 중' : '저장'}
+        </button>
+      </div>
+    </section>
+
     <section class="section-block session-block" aria-labelledby="session-title">
       <div class="section-heading-row">
         <h2 id="session-title">기기 연결</h2>
@@ -773,67 +917,6 @@
         />
       </label>
 
-      <div class="edge-list" aria-label="화면 끝 연결">
-        {#each settingsState.settings.edgeBindings as binding, index}
-          <div class="edge-row">
-            <label>
-              <span>내 화면</span>
-              <select
-                value={binding.localEdge}
-                onchange={(event) => settingsState.updateEdgeBinding(index, 'localEdge', event.currentTarget.value)}
-              >
-                {#each edgeOptions as edge}
-                  <option value={edge}>{edgeLabels[edge]}</option>
-                {/each}
-              </select>
-            </label>
-
-            <label class="peer-field">
-              <span>기기 ID</span>
-              <select
-                value={trustedPeerSelectValue(binding.peerId)}
-                disabled={identityState.trustedPeers.length === 0}
-                onchange={(event) => selectEdgeTrustedPeer(index, event.currentTarget.value)}
-                aria-label="등록된 기기 선택"
-              >
-                <option value="">직접 입력</option>
-                {#each identityState.trustedPeers as peer (peer.peerId)}
-                  <option value={peer.peerId}>{trustedPeerLabel(peer)}</option>
-                {/each}
-              </select>
-              <input
-                type="text"
-                value={binding.peerId}
-                placeholder="linux-laptop"
-                spellcheck="false"
-                onchange={(event) => settingsState.updateEdgeBinding(index, 'peerId', event.currentTarget.value)}
-              />
-            </label>
-
-            <label>
-              <span>상대 화면</span>
-              <select
-                value={binding.remoteEdge}
-                onchange={(event) => settingsState.updateEdgeBinding(index, 'remoteEdge', event.currentTarget.value)}
-              >
-                {#each edgeOptions as edge}
-                  <option value={edge}>{edgeLabels[edge]}</option>
-                {/each}
-              </select>
-            </label>
-
-            <button
-              type="button"
-              class="icon-button"
-              aria-label="연결 삭제"
-              onclick={() => settingsState.removeEdgeBinding(index)}
-            >
-              ×
-            </button>
-          </div>
-        {/each}
-      </div>
-
       {#if identityState.trustedPeers.length > 0}
         <div class="manual-address-list" aria-label="기기 주소">
           <h3>기기 주소</h3>
@@ -854,14 +937,6 @@
       {/if}
 
       <div class="settings-actions">
-        <button
-          type="button"
-          class="control-button secondary"
-          disabled={settingsState.isBusy}
-          onclick={() => settingsState.addEdgeBinding()}
-        >
-          추가
-        </button>
         <button
           type="button"
           class="control-button"

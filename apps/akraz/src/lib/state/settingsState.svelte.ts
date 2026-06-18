@@ -1,5 +1,6 @@
+import { layoutClient } from "../api/layoutClient";
 import { settingsClient } from "../api/settingsClient";
-import type { AppSettings, DaemonStartOptions, ScreenEdge, ScreenEdgeBinding } from "../api/types";
+import type { AppSettings, DaemonStartOptions, ScreenEdgeBinding } from "../api/types";
 import { manualPeerAddress, updateManualPeerAddress } from "../settings/manualPeerAddresses";
 
 type SettingsOperation = "load" | "save";
@@ -10,14 +11,6 @@ function defaultSettings(): AppSettings {
     peerListenAddress: "",
     edgeBindings: [],
     manualPeerAddresses: [],
-  };
-}
-
-function defaultEdgeBinding(): ScreenEdgeBinding {
-  return {
-    localEdge: "right",
-    peerId: "",
-    remoteEdge: "left",
   };
 }
 
@@ -35,25 +28,12 @@ export class SettingsState {
     const peerListenAddress = this.settings.peerListenAddress.trim();
     const options: DaemonStartOptions = {
       captureInput: this.settings.captureInput,
-      edgeBindings: this.settings.edgeBindings,
     };
     if (peerListenAddress.length > 0) {
       options.peerListenAddress = peerListenAddress;
     }
 
     return options;
-  }
-
-  addEdgeBinding() {
-    this.settings.edgeBindings = [...this.settings.edgeBindings, defaultEdgeBinding()];
-    this.saved = false;
-  }
-
-  removeEdgeBinding(index: number) {
-    this.settings.edgeBindings = this.settings.edgeBindings.filter(
-      (_, itemIndex) => itemIndex !== index,
-    );
-    this.saved = false;
   }
 
   updateCaptureInput(captureInput: boolean) {
@@ -66,18 +46,8 @@ export class SettingsState {
     this.saved = false;
   }
 
-  updateEdgeBinding(index: number, field: keyof ScreenEdgeBinding, value: string) {
-    this.settings.edgeBindings = this.settings.edgeBindings.map((binding, itemIndex) => {
-      if (itemIndex !== index) {
-        return binding;
-      }
-
-      return {
-        ...binding,
-        [field]: field === "peerId" ? value : (value as ScreenEdge),
-      };
-    });
-    this.saved = false;
+  replaceEdgeBindings(edgeBindings: ScreenEdgeBinding[]) {
+    this.settings.edgeBindings = edgeBindings;
   }
 
   manualPeerAddress(peerId: string): string {
@@ -98,18 +68,30 @@ export class SettingsState {
     this.saved = false;
   }
 
-  async load() {
+  async load(): Promise<AppSettings | null> {
+    let loadedSettings: AppSettings | null = null;
     await this.run("load", async () => {
-      this.settings = await settingsClient.load();
+      loadedSettings = await settingsClient.load();
+      this.settings = loadedSettings;
       this.saved = false;
     });
+
+    return loadedSettings;
   }
 
-  async save() {
+  async save(): Promise<AppSettings | null> {
+    let savedSettings: AppSettings | null = null;
     await this.run("save", async () => {
-      this.settings = await settingsClient.save(this.settings);
+      const layout = await layoutClient.get();
+      savedSettings = await settingsClient.save({
+        ...this.settings,
+        edgeBindings: layout.edgeBindings,
+      });
+      this.settings = savedSettings;
       this.saved = true;
     });
+
+    return savedSettings;
   }
 
   private async run(operation: SettingsOperation, action: () => Promise<void>) {
