@@ -70,6 +70,7 @@ const report = JSON.parse(reportLine);
 assertPhase(report.initial?.phase, "not_running", "initial");
 assertPhase(report.started?.phase, "running", "started");
 assertPhase(report.stopped?.phase, "not_running", "stopped");
+assertPermissions(report.permissions);
 if (smokeProfile.expectSettings) {
   assertSettings(report.settings);
 }
@@ -116,5 +117,63 @@ function assertSettings(settings) {
   }
   if (manualAddress.peerId !== "linux-laptop" || manualAddress.address !== "127.0.0.1:4455") {
     throw new Error(`${smokeProfile.label} reported unexpected manual peer address`);
+  }
+}
+
+function assertPermissions(permissions) {
+  if (!permissions) {
+    throw new Error(`${smokeProfile.label} did not report permissions`);
+  }
+  if (typeof permissions.adapterName !== "string" || permissions.adapterName.length === 0) {
+    throw new Error(`${smokeProfile.label} reported an invalid permission adapter`);
+  }
+  const capabilities = permissions.capabilities;
+  const capabilityKeys = [
+    "canCapturePointer",
+    "canCaptureKeyboard",
+    "canInjectPointer",
+    "canInjectKeyboard",
+  ];
+  for (const key of capabilityKeys) {
+    if (typeof capabilities?.[key] !== "boolean") {
+      throw new Error(`${smokeProfile.label} reported invalid ${key} capability`);
+    }
+  }
+  if (!Array.isArray(permissions.issues)) {
+    throw new Error(`${smokeProfile.label} reported invalid permission issues`);
+  }
+
+  const missingCodes = new Set();
+  if (!capabilities.canCapturePointer) {
+    missingCodes.add("capture_pointer_unavailable");
+  }
+  if (!capabilities.canCaptureKeyboard) {
+    missingCodes.add("capture_keyboard_unavailable");
+  }
+  if (!capabilities.canInjectPointer) {
+    missingCodes.add("inject_pointer_unavailable");
+  }
+  if (!capabilities.canInjectKeyboard) {
+    missingCodes.add("inject_keyboard_unavailable");
+  }
+
+  const reportedCodes = new Set();
+  for (const issue of permissions.issues) {
+    if (typeof issue?.code !== "string" || issue.code.length === 0) {
+      throw new Error(`${smokeProfile.label} reported a permission issue without a code`);
+    }
+    if (typeof issue.message !== "string" || issue.message.length === 0) {
+      throw new Error(`${smokeProfile.label} reported a permission issue without a message`);
+    }
+    reportedCodes.add(issue.code);
+  }
+
+  if (reportedCodes.size !== missingCodes.size) {
+    throw new Error(`${smokeProfile.label} reported permission issue count drift`);
+  }
+  for (const code of missingCodes) {
+    if (!reportedCodes.has(code)) {
+      throw new Error(`${smokeProfile.label} did not report missing permission code ${code}`);
+    }
   }
 }

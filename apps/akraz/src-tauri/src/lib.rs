@@ -121,6 +121,10 @@ fn run_daemon_lifecycle_smoke() -> Result<(), String> {
             started.phase
         ));
     }
+    if let Err(error) = record_smoke_permissions(&managed, &mut report) {
+        print_smoke_report(&report)?;
+        return Err(error);
+    }
 
     let stopped = stop_daemon(&managed)?;
     report.stopped = Some(stopped.clone());
@@ -175,6 +179,10 @@ fn run_daemon_settings_start_smoke() -> Result<(), String> {
             started.phase
         ));
     }
+    if let Err(error) = record_smoke_permissions(&managed, &mut report) {
+        print_smoke_report(&report)?;
+        return Err(error);
+    }
 
     let stopped = stop_daemon(&managed)?;
     report.stopped = Some(stopped.clone());
@@ -201,6 +209,22 @@ fn settings_start_smoke_settings() -> AppSettings {
             peer_id: "linux-laptop".to_string(),
             address: "127.0.0.1:4455".to_string(),
         }],
+    }
+}
+
+fn record_smoke_permissions(
+    managed: &ManagedDaemon,
+    report: &mut DaemonLifecycleSmokeReport,
+) -> Result<(), String> {
+    match call_daemon_permissions_probe() {
+        Ok(permissions) => {
+            report.permissions = Some(permissions);
+            Ok(())
+        }
+        Err(error) => {
+            report.stopped = Some(stop_daemon(managed)?);
+            Err(format!("daemon smoke permissions probe failed: {error}"))
+        }
     }
 }
 
@@ -232,6 +256,8 @@ struct DaemonLifecycleSmokeReport {
     initial: DaemonLifecycleSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     settings: Option<AppSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permissions: Option<PermissionsProbe>,
     started: Option<DaemonLifecycleSnapshot>,
     stopped: Option<DaemonLifecycleSnapshot>,
 }
@@ -241,6 +267,7 @@ impl DaemonLifecycleSmokeReport {
         Self {
             initial,
             settings: None,
+            permissions: None,
             started: None,
             stopped: None,
         }
