@@ -12,14 +12,16 @@ use akraz_identity::{
 };
 use akraz_ipc::{
     DaemonLogEntry, DaemonLogsTail, DaemonLogsTailParams, DaemonStatus, DaemonStatusParams,
-    DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, DiagnosticsSnapshot,
-    InputReleaseAllParams, IpcCallError, IpcEndpoint, IpcEndpointError, IpcTransportError,
-    JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, METHOD_DAEMON_LOGS_TAIL,
-    METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL,
-    METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
-    PermissionsProbe, PermissionsProbeParams, SessionConnectParams, SessionDisconnectParams,
-    build_diagnostics_latency_histogram, build_diagnostics_snapshot,
-    build_diagnostics_support_bundle, call_json_rpc, resolve_current_default_endpoint,
+    DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams, DiagnosticsScreenTopology,
+    DiagnosticsScreenTopologyParams, DiagnosticsSnapshot, InputReleaseAllParams, IpcCallError,
+    IpcEndpoint, IpcEndpointError, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure,
+    JsonRpcRequest, JsonRpcSuccess, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
+    METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+    METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
+    METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe, PermissionsProbeParams,
+    SessionConnectParams, SessionDisconnectParams, build_diagnostics_latency_histogram,
+    build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
+    resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 
@@ -295,11 +297,22 @@ fn collect_diagnostics_snapshot(client: &OsLocalIpcClient) -> Result<Diagnostics
         topology
     })
     .ok();
+    let keyboard_layout = call_daemon_json_rpc_timed::<DiagnosticsKeyboardLayout, _>(
+        client,
+        &diagnostics_keyboard_layout_request(),
+        "keyboard layout",
+    )
+    .map(|(keyboard_layout, latency)| {
+        latency_samples.push(latency);
+        keyboard_layout
+    })
+    .ok();
 
     Ok(build_diagnostics_snapshot(
         status,
         permissions,
         screen_topology,
+        keyboard_layout,
         build_diagnostics_latency_histogram(&latency_samples),
         "akrazctl",
         env!("CARGO_PKG_VERSION"),
@@ -497,6 +510,14 @@ fn diagnostics_screen_topology_request() -> JsonRpcRequest<DiagnosticsScreenTopo
         LOCAL_REQUEST_ID,
         METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
         DiagnosticsScreenTopologyParams::default(),
+    )
+}
+
+fn diagnostics_keyboard_layout_request() -> JsonRpcRequest<DiagnosticsKeyboardLayoutParams> {
+    JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
+        DiagnosticsKeyboardLayoutParams::default(),
     )
 }
 
@@ -1526,26 +1547,26 @@ mod tests {
 
     use akraz_identity::FileIdentityStore;
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonStatus, DiagnosticsMonitorSnapshot, DiagnosticsScreenTopology,
-        IpcCallError, IpcEndpoint, IpcEndpointError, IpcEndpointKind, IpcPlatformCapabilities,
-        IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess,
-        LocalIpcClient, LogicalPointSnapshot, LogicalRectSnapshot, PeerStatus, PermissionIssue,
-        PermissionsProbe, ProtocolVersionSnapshot, build_diagnostics_snapshot,
+        ControlModeSnapshot, DaemonStatus, DiagnosticsKeyboardLayout, DiagnosticsMonitorSnapshot,
+        DiagnosticsScreenTopology, IpcCallError, IpcEndpoint, IpcEndpointError, IpcEndpointKind,
+        IpcPlatformCapabilities, IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcRequest,
+        JsonRpcSuccess, LocalIpcClient, LogicalPointSnapshot, LogicalRectSnapshot, PeerStatus,
+        PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, build_diagnostics_snapshot,
     };
 
     use super::{
         CliRuntimeError, CliUsageError, DaemonArgsOptions, EndpointOptions, IdentityForgetOptions,
         IdentityListOptions, IdentityShowOptions, IdentityTrustOptions, LOCAL_REQUEST_ID,
-        METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
-        METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, SessionConnectOptions,
-        build_daemon_client_with_resolver, build_pairing_identity_document,
+        METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
+        METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
+        SessionConnectOptions, build_daemon_client_with_resolver, build_pairing_identity_document,
         daemon_logs_tail_request, daemon_status_request, default_pairing_capabilities,
-        diagnostics_screen_topology_request, forget_trusted_peer_identity,
-        format_daemon_call_error, format_daemon_command_line, input_release_all_request,
-        list_trusted_peer_identities, parse_daemon_args_options, parse_endpoint_options,
-        parse_identity_forget_options, parse_identity_list_options, parse_identity_show_options,
-        parse_identity_trust_options, parse_json_rpc_response, parse_session_connect_options,
-        permissions_probe_request, trust_pairing_identity_document,
+        diagnostics_keyboard_layout_request, diagnostics_screen_topology_request,
+        forget_trusted_peer_identity, format_daemon_call_error, format_daemon_command_line,
+        input_release_all_request, list_trusted_peer_identities, parse_daemon_args_options,
+        parse_endpoint_options, parse_identity_forget_options, parse_identity_list_options,
+        parse_identity_show_options, parse_identity_trust_options, parse_json_rpc_response,
+        parse_session_connect_options, permissions_probe_request, trust_pairing_identity_document,
     };
     use akraz_ipc::{
         JSONRPC_ERROR_PARSE, JSONRPC_VERSION, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
@@ -1563,6 +1584,15 @@ mod tests {
             scale_factor_percent: Some(100),
             is_primary: true,
         }]
+    }
+
+    fn keyboard_layout() -> DiagnosticsKeyboardLayout {
+        DiagnosticsKeyboardLayout {
+            source: "foregroundWindowThread".to_string(),
+            layout_id: "0x0000000004120412".to_string(),
+            language_id: "0x0412".to_string(),
+            layout_name: Some("00000412".to_string()),
+        }
     }
 
     #[test]
@@ -2159,6 +2189,14 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_keyboard_layout_request_uses_diagnostics_ipc_method() {
+        let request = diagnostics_keyboard_layout_request();
+
+        assert_eq!(request.id, LOCAL_REQUEST_ID);
+        assert_eq!(request.method, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT);
+    }
+
+    #[test]
     fn release_all_request_uses_input_release_all_ipc_method() {
         let request = input_release_all_request();
 
@@ -2215,6 +2253,7 @@ mod tests {
             status,
             permissions,
             Some(topology),
+            Some(keyboard_layout()),
             None,
             "akrazctl",
             "0.4.47",
@@ -2238,6 +2277,7 @@ mod tests {
                 monitors: monitor_snapshots(),
             })
         );
+        assert_eq!(snapshot.keyboard_layout, Some(keyboard_layout()));
         assert_eq!(snapshot.privacy, Default::default());
         assert_eq!(
             snapshot.unavailable_sections,
@@ -2273,7 +2313,7 @@ mod tests {
         };
 
         let snapshot =
-            build_diagnostics_snapshot(status, permissions, None, None, "akrazctl", "0.4.47");
+            build_diagnostics_snapshot(status, permissions, None, None, None, "akrazctl", "0.4.47");
         let encoded = serde_json::to_string(&snapshot).expect("diagnostics snapshot JSON");
 
         assert_eq!(snapshot.screen_topology, None);
@@ -2282,6 +2322,7 @@ mod tests {
             vec![
                 "recentLogs".to_string(),
                 "screenTopology".to_string(),
+                "keyboardLayout".to_string(),
                 "latencyHistogram".to_string()
             ]
         );

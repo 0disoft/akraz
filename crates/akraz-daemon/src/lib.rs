@@ -23,11 +23,11 @@ use akraz_identity::{
 };
 use akraz_ipc::{
     ControlModeSnapshot, DaemonLogEntry, DaemonLogLevel, DaemonLogsTail, DaemonStatus,
-    DiagnosticsScreenTopology, InputReleaseAllResult, IpcCodecError, IpcPlatformCapabilities,
-    IpcRequest, IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LocalIpcServer,
-    PeerStatus, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectParams,
-    SessionConnectResult, SessionDisconnectResult, SessionStatus, parse_request_line,
-    serve_os_local_ipc_once, to_json_line,
+    DiagnosticsKeyboardLayout, DiagnosticsScreenTopology, InputReleaseAllResult, IpcCodecError,
+    IpcPlatformCapabilities, IpcRequest, IpcTransportError, JsonRpcError, JsonRpcFailure,
+    JsonRpcSuccess, LocalIpcServer, PeerStatus, PermissionIssue, PermissionsProbe,
+    ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult, SessionDisconnectResult,
+    SessionStatus, parse_request_line, serve_os_local_ipc_once, to_json_line,
 };
 use akraz_platform::{
     DesktopGeometry, InputCaptureConfig, InputCapturePolicy, InputCaptureSession, PlatformAdapter,
@@ -2710,6 +2710,13 @@ pub fn build_diagnostics_screen_topology(
     })
 }
 
+/// Build a sanitized `diagnostics.keyboardLayout` result from the selected platform adapter.
+pub fn build_diagnostics_keyboard_layout(
+    platform: &impl PlatformAdapter,
+) -> Result<DiagnosticsKeyboardLayout, PlatformError> {
+    platform.read_keyboard_layout().map(Into::into)
+}
+
 /// Handle one local IPC JSON-RPC request line.
 pub fn handle_ipc_request_line(
     state: &mut RuntimeInputState,
@@ -2804,6 +2811,28 @@ fn handle_ipc_request(
                         "Screen topology diagnostics failed.",
                     );
                     encode_platform_error(request.id, "screen topology unavailable", error)
+                }
+            }
+        }
+        IpcRequest::DiagnosticsKeyboardLayout(request) => {
+            match build_diagnostics_keyboard_layout(platform) {
+                Ok(keyboard_layout) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Info,
+                        "diagnostics.keyboardLayout",
+                        "Keyboard layout diagnostics requested.",
+                    );
+                    encode_response(&JsonRpcSuccess::new(request.id, keyboard_layout))
+                }
+                Err(error) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Warn,
+                        "diagnostics.keyboardLayout.failed",
+                        "Keyboard layout diagnostics failed.",
+                    );
+                    encode_platform_error(request.id, "keyboard layout unavailable", error)
                 }
             }
         }
@@ -3132,16 +3161,19 @@ mod tests {
     };
     use akraz_ipc::{
         ControlModeSnapshot, DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams, DaemonStatus,
-        DaemonStatusParams, DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams,
-        InputReleaseAllParams, InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities,
-        JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_LOGS_TAIL,
-        METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL,
-        METHOD_SESSION_CONNECT, OsLocalIpcClient, PeerStatus, SessionConnectParams,
-        SessionDisconnectResult, SessionStatus, call_json_rpc, to_json_line,
+        DaemonStatusParams, DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams,
+        DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, InputReleaseAllParams,
+        InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities, JsonRpcFailure,
+        JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_LOGS_TAIL,
+        METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
+        METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT,
+        OsLocalIpcClient, PeerStatus, SessionConnectParams, SessionDisconnectResult, SessionStatus,
+        call_json_rpc, to_json_line,
     };
     use akraz_platform::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
-        InputCapturePolicy, PlatformAdapter, PlatformCapabilities, PlatformError,
+        InputCapturePolicy, KeyboardLayoutSnapshot, PlatformAdapter, PlatformCapabilities,
+        PlatformError,
     };
     use akraz_protocol::{
         AuthTranscript, CapabilityFlags, HANDSHAKE_NONCE_LEN, PeerRole, ProtocolVersion,
@@ -3159,9 +3191,10 @@ mod tests {
         PeerTransportMessage, PeerTransportProtocolVersion, PeerTransportSessionFrame,
         PowerResumeWatchdog, TcpPeerSessionTransport, TcpPeerTransport,
         TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
-        build_daemon_status_with_peer_sessions, build_diagnostics_screen_topology,
-        build_permissions_probe, connect_peer_session, disconnect_peer_session,
-        drain_capture_events, execute_authenticated_peer_transport_session_stream_until_closed,
+        build_daemon_status_with_peer_sessions, build_diagnostics_keyboard_layout,
+        build_diagnostics_screen_topology, build_permissions_probe, connect_peer_session,
+        disconnect_peer_session, drain_capture_events,
+        execute_authenticated_peer_transport_session_stream_until_closed,
         execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
         execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
         handle_ipc_request_line, input_capture_policy_for_control_mode,
@@ -3196,6 +3229,24 @@ mod tests {
         match build_diagnostics_screen_topology(platform) {
             Ok(topology) => topology,
             Err(error) => panic!("expected screen topology: {error}"),
+        }
+    }
+
+    fn keyboard_layout_or_panic(
+        platform: &FakePlatformAdapter,
+    ) -> akraz_ipc::DiagnosticsKeyboardLayout {
+        match build_diagnostics_keyboard_layout(platform) {
+            Ok(keyboard_layout) => keyboard_layout,
+            Err(error) => panic!("expected keyboard layout: {error}"),
+        }
+    }
+
+    fn korean_keyboard_layout() -> KeyboardLayoutSnapshot {
+        KeyboardLayoutSnapshot {
+            source: "foregroundWindowThread".to_string(),
+            layout_id: "0x0000000004120412".to_string(),
+            language_id: "0x0412".to_string(),
+            layout_name: Some("00000412".to_string()),
         }
     }
 
@@ -3626,6 +3677,24 @@ mod tests {
         assert_eq!(topology.monitors[0].id, "left");
         assert_eq!(topology.monitors[0].scale_factor_percent, Some(125));
         assert!(topology.monitors[1].is_primary);
+    }
+
+    #[test]
+    fn diagnostics_keyboard_layout_reflects_platform_input_locale() {
+        let platform =
+            FakePlatformAdapter::default().with_keyboard_layout(korean_keyboard_layout());
+
+        let keyboard_layout = keyboard_layout_or_panic(&platform);
+
+        assert_eq!(
+            keyboard_layout,
+            DiagnosticsKeyboardLayout {
+                source: "foregroundWindowThread".to_string(),
+                layout_id: "0x0000000004120412".to_string(),
+                language_id: "0x0412".to_string(),
+                layout_name: Some("00000412".to_string()),
+            }
+        );
     }
 
     #[test]
@@ -5342,6 +5411,39 @@ mod tests {
         assert_eq!(response.result.virtual_screen_bounds.height, 1080);
         assert_eq!(response.result.monitors.len(), 1);
         assert_eq!(response.result.monitors[0].scale_factor_percent, Some(150));
+    }
+
+    #[test]
+    fn ipc_dispatch_handles_diagnostics_keyboard_layout_request() {
+        let mut state = RuntimeInputState::new();
+        let platform =
+            FakePlatformAdapter::default().with_keyboard_layout(korean_keyboard_layout());
+        let dispatcher =
+            LocalPlatformCoreActionDispatcher::new(platform.clone(), NoopCoreActionDispatcher);
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
+            DiagnosticsKeyboardLayoutParams::default(),
+        );
+        let request_line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        let response_line =
+            match handle_ipc_request_line(&mut state, &platform, &dispatcher, &request_line) {
+                Ok(line) => line,
+                Err(error) => panic!("expected daemon IPC response: {error}"),
+            };
+        let response: JsonRpcSuccess<DiagnosticsKeyboardLayout> =
+            match serde_json::from_str(&response_line) {
+                Ok(response) => response,
+                Err(error) => panic!("expected keyboard layout response JSON: {error}"),
+            };
+
+        assert_eq!(response.id, "req_1");
+        assert_eq!(response.result.language_id, "0x0412");
+        assert_eq!(response.result.layout_name, Some("00000412".to_string()));
     }
 
     #[test]

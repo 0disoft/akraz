@@ -21,7 +21,7 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use akraz_core::{ControlMode, LogicalPoint, LogicalRect};
-use akraz_platform::{DesktopMonitor, PlatformCapabilities};
+use akraz_platform::{DesktopMonitor, KeyboardLayoutSnapshot, PlatformCapabilities};
 use akraz_protocol::ProtocolVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,6 +63,9 @@ pub const METHOD_PERMISSIONS_PROBE: &str = "permissions.probe";
 
 /// JSON-RPC method for sanitized diagnostic screen topology.
 pub const METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY: &str = "diagnostics.screenTopology";
+
+/// JSON-RPC method for sanitized keyboard layout and IME diagnostics.
+pub const METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT: &str = "diagnostics.keyboardLayout";
 
 /// JSON-RPC method for emergency input release and local-control recovery.
 pub const METHOD_INPUT_RELEASE_ALL: &str = "input.releaseAll";
@@ -765,6 +768,7 @@ pub enum IpcRequest {
     DaemonLogsTail(JsonRpcRequest<DaemonLogsTailParams>),
     PermissionsProbe(JsonRpcRequest<PermissionsProbeParams>),
     DiagnosticsScreenTopology(JsonRpcRequest<DiagnosticsScreenTopologyParams>),
+    DiagnosticsKeyboardLayout(JsonRpcRequest<DiagnosticsKeyboardLayoutParams>),
     InputReleaseAll(JsonRpcRequest<InputReleaseAllParams>),
     SessionConnect(JsonRpcRequest<SessionConnectParams>),
     SessionDisconnect(JsonRpcRequest<SessionDisconnectParams>),
@@ -778,6 +782,7 @@ impl IpcRequest {
             Self::DaemonLogsTail(request) => &request.id,
             Self::PermissionsProbe(request) => &request.id,
             Self::DiagnosticsScreenTopology(request) => &request.id,
+            Self::DiagnosticsKeyboardLayout(request) => &request.id,
             Self::InputReleaseAll(request) => &request.id,
             Self::SessionConnect(request) => &request.id,
             Self::SessionDisconnect(request) => &request.id,
@@ -791,6 +796,7 @@ impl IpcRequest {
             Self::DaemonLogsTail(request) => &request.method,
             Self::PermissionsProbe(request) => &request.method,
             Self::DiagnosticsScreenTopology(request) => &request.method,
+            Self::DiagnosticsKeyboardLayout(request) => &request.method,
             Self::InputReleaseAll(request) => &request.method,
             Self::SessionConnect(request) => &request.method,
             Self::SessionDisconnect(request) => &request.method,
@@ -892,6 +898,11 @@ pub struct PermissionsProbeParams {}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticsScreenTopologyParams {}
+
+/// Empty params for `diagnostics.keyboardLayout`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsKeyboardLayoutParams {}
 
 /// Empty params for `input.releaseAll`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1070,6 +1081,28 @@ pub struct DiagnosticsScreenTopology {
     pub monitors: Vec<DiagnosticsMonitorSnapshot>,
 }
 
+/// Sanitized keyboard layout facts for diagnostic snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsKeyboardLayout {
+    pub source: String,
+    pub layout_id: String,
+    pub language_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_name: Option<String>,
+}
+
+impl From<KeyboardLayoutSnapshot> for DiagnosticsKeyboardLayout {
+    fn from(snapshot: KeyboardLayoutSnapshot) -> Self {
+        Self {
+            source: snapshot.source,
+            layout_id: snapshot.layout_id,
+            language_id: snapshot.language_id,
+            layout_name: snapshot.layout_name,
+        }
+    }
+}
+
 /// Sanitized daemon event level used by recent diagnostics logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DaemonLogLevel {
@@ -1106,6 +1139,8 @@ pub struct DiagnosticsSnapshot {
     pub permissions: DiagnosticsPermissionsSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_topology: Option<DiagnosticsScreenTopology>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyboard_layout: Option<DiagnosticsKeyboardLayout>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_histogram: Option<DiagnosticsLatencyHistogram>,
     pub privacy: DiagnosticsPrivacySnapshot,
@@ -1217,6 +1252,7 @@ pub fn build_diagnostics_snapshot(
     status: DaemonStatus,
     permissions: PermissionsProbe,
     screen_topology: Option<DiagnosticsScreenTopology>,
+    keyboard_layout: Option<DiagnosticsKeyboardLayout>,
     latency_histogram: Option<DiagnosticsLatencyHistogram>,
     generated_by: impl Into<String>,
     tool_version: impl Into<String>,
@@ -1229,6 +1265,10 @@ pub fn build_diagnostics_snapshot(
         .collect::<Vec<_>>();
     if screen_topology.is_none() {
         unavailable_sections.insert(1, "screenTopology".to_string());
+    }
+    if keyboard_layout.is_none() {
+        let insert_at = if screen_topology.is_none() { 2 } else { 1 };
+        unavailable_sections.insert(insert_at, "keyboardLayout".to_string());
     }
     if latency_histogram.is_some() {
         unavailable_sections.retain(|section| section != "latencyHistogram");
@@ -1252,6 +1292,7 @@ pub fn build_diagnostics_snapshot(
             issues: permissions.issues,
         },
         screen_topology,
+        keyboard_layout,
         latency_histogram,
         privacy: DiagnosticsPrivacySnapshot::default(),
         unavailable_sections,
@@ -1303,6 +1344,9 @@ pub fn build_diagnostics_support_bundle(
         .collect::<Vec<_>>();
     if snapshot.screen_topology.is_some() {
         included_sections.push("screenTopology".to_string());
+    }
+    if snapshot.keyboard_layout.is_some() {
+        included_sections.push("keyboardLayout".to_string());
     }
     if snapshot.latency_histogram.is_some() {
         included_sections.push("latencyHistogram".to_string());
@@ -1447,6 +1491,9 @@ pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
         METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY => {
             parse_typed_request(raw).map(IpcRequest::DiagnosticsScreenTopology)
         }
+        METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT => {
+            parse_typed_request(raw).map(IpcRequest::DiagnosticsKeyboardLayout)
+        }
         METHOD_INPUT_RELEASE_ALL => parse_typed_request(raw).map(IpcRequest::InputReleaseAll),
         METHOD_SESSION_CONNECT => parse_typed_request(raw).map(IpcRequest::SessionConnect),
         METHOD_SESSION_DISCONNECT => parse_typed_request(raw).map(IpcRequest::SessionDisconnect),
@@ -1496,19 +1543,21 @@ where
 mod tests {
     use super::{
         ControlModeSnapshot, DaemonLogEntry, DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams,
-        DaemonStatus, DaemonStatusParams, DiagnosticsMonitorSnapshot, DiagnosticsPrivacySnapshot,
+        DaemonStatus, DaemonStatusParams, DiagnosticsKeyboardLayout,
+        DiagnosticsKeyboardLayoutParams, DiagnosticsMonitorSnapshot, DiagnosticsPrivacySnapshot,
         DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, InProcessIpcClient,
         IpcEndpoint, IpcEndpointEnvironment, IpcEndpointError, IpcEndpointKind, IpcOperatingSystem,
         IpcPlatformCapabilities, IpcRequest, IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS,
         JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess,
         LocalIpcClient, LocalIpcServer, LogicalPointSnapshot, LogicalRectSnapshot,
-        METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
-        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
-        OsLocalIpcClient, PeerStatus, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
-        SessionConnectParams, SessionConnectResult, SessionDisconnectParams,
-        SessionDisconnectResult, SessionStatus, build_diagnostics_latency_histogram,
-        build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
-        parse_request_line, resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
+        METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
+        METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT,
+        METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PeerStatus, PermissionIssue, PermissionsProbe,
+        ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult,
+        SessionDisconnectParams, SessionDisconnectResult, SessionStatus,
+        build_diagnostics_latency_histogram, build_diagnostics_snapshot,
+        build_diagnostics_support_bundle, call_json_rpc, parse_request_line,
+        resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
     };
     use serde_json::json;
 
@@ -1539,6 +1588,15 @@ mod tests {
                 is_primary: true,
             },
         ]
+    }
+
+    fn keyboard_layout() -> DiagnosticsKeyboardLayout {
+        DiagnosticsKeyboardLayout {
+            source: "foregroundWindowThread".to_string(),
+            layout_id: "0x0000000004120412".to_string(),
+            language_id: "0x0412".to_string(),
+            layout_name: Some("00000412".to_string()),
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -1751,6 +1809,29 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_keyboard_layout_response_uses_camel_case_contract() {
+        let response = JsonRpcSuccess::new("req_1", keyboard_layout());
+        let line = match to_json_line(&response) {
+            Ok(line) => line,
+            Err(error) => panic!("expected response serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "result": {
+                    "source": "foregroundWindowThread",
+                    "layoutId": "0x0000000004120412",
+                    "languageId": "0x0412",
+                    "layoutName": "00000412"
+                }
+            })
+        );
+    }
+
+    #[test]
     fn diagnostics_snapshot_redacts_peer_identifiers_and_sensitive_sections() {
         let capabilities = IpcPlatformCapabilities {
             can_capture_pointer: true,
@@ -1799,6 +1880,7 @@ mod tests {
             status,
             permissions,
             Some(topology),
+            Some(keyboard_layout()),
             None,
             "akrazctl",
             "0.4.47",
@@ -1824,6 +1906,7 @@ mod tests {
                 monitors: monitor_snapshots(),
             })
         );
+        assert_eq!(snapshot.keyboard_layout, Some(keyboard_layout()));
         assert_eq!(snapshot.privacy, DiagnosticsPrivacySnapshot::default());
         assert_eq!(
             snapshot.unavailable_sections,
@@ -1886,6 +1969,7 @@ mod tests {
             status,
             permissions,
             Some(topology),
+            Some(keyboard_layout()),
             build_diagnostics_latency_histogram(&[100, 200, 800]),
             "akrazctl",
             CURRENT_TEST_VERSION,
@@ -1912,6 +1996,7 @@ mod tests {
                 "daemon".to_string(),
                 "permissions".to_string(),
                 "screenTopology".to_string(),
+                "keyboardLayout".to_string(),
                 "latencyHistogram".to_string(),
                 "recentLogs".to_string()
             ]
@@ -1960,7 +2045,7 @@ mod tests {
         };
 
         let snapshot =
-            build_diagnostics_snapshot(status, permissions, None, None, "akrazctl", "0.4.47");
+            build_diagnostics_snapshot(status, permissions, None, None, None, "akrazctl", "0.4.47");
         let encoded = serde_json::to_string(&snapshot).expect("diagnostics snapshot JSON");
 
         assert_eq!(snapshot.screen_topology, None);
@@ -1969,11 +2054,14 @@ mod tests {
             vec![
                 "recentLogs".to_string(),
                 "screenTopology".to_string(),
+                "keyboardLayout".to_string(),
                 "latencyHistogram".to_string()
             ]
         );
         assert!(!encoded.contains("pointerPosition"));
         assert!(!encoded.contains("virtualScreenBounds"));
+        assert!(!encoded.contains("layoutId"));
+        assert!(!encoded.contains("layoutName"));
     }
 
     #[test]
@@ -2250,6 +2338,24 @@ mod tests {
         assert_eq!(
             parse_request_line(&line),
             Ok(IpcRequest::DiagnosticsScreenTopology(request))
+        );
+    }
+
+    #[test]
+    fn parses_diagnostics_keyboard_layout_request_line() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
+            DiagnosticsKeyboardLayoutParams::default(),
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(IpcRequest::DiagnosticsKeyboardLayout(request))
         );
     }
 

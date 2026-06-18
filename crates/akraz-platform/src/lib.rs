@@ -49,22 +49,23 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VK_BACK,
-    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
+    GetKeyboardLayout, GetKeyboardLayoutNameW, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    SendInput, VK_BACK, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU,
+    VK_RSHIFT, VK_RWIN,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetCursorPos, GetMessageW, GetSystemMetrics, HHOOK, KBDLLHOOKSTRUCT,
-    LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED,
-    MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOWS_HOOK_ID,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+    CallNextHookEx, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
+    GetWindowThreadProcessId, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED,
+    LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT,
+    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WINDOWS_HOOK_ID, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
 };
 #[cfg(windows)]
 use windows_sys::core::BOOL;
@@ -93,6 +94,15 @@ pub struct DesktopMonitor {
     pub bounds: LogicalRect,
     pub scale_factor_percent: Option<u32>,
     pub is_primary: bool,
+}
+
+/// Sanitized keyboard layout facts reported by a platform adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyboardLayoutSnapshot {
+    pub source: String,
+    pub layout_id: String,
+    pub language_id: String,
+    pub layout_name: Option<String>,
 }
 
 impl PlatformCapabilities {
@@ -318,6 +328,14 @@ pub trait PlatformAdapter {
         )))
     }
 
+    /// Read sanitized keyboard layout facts used for IME diagnostics.
+    fn read_keyboard_layout(&self) -> Result<KeyboardLayoutSnapshot, PlatformError> {
+        Err(PlatformError::new(format!(
+            "{} keyboard layout is not available",
+            self.name()
+        )))
+    }
+
     /// Start capturing platform input events into a bounded event queue.
     fn start_input_capture(
         &self,
@@ -375,6 +393,15 @@ impl PlatformAdapter for RuntimePlatformAdapter {
             Self::Windows(adapter) => adapter.read_desktop_geometry(),
             #[cfg(not(windows))]
             Self::Unsupported(adapter) => adapter.read_desktop_geometry(),
+        }
+    }
+
+    fn read_keyboard_layout(&self) -> Result<KeyboardLayoutSnapshot, PlatformError> {
+        match self {
+            #[cfg(windows)]
+            Self::Windows(adapter) => adapter.read_keyboard_layout(),
+            #[cfg(not(windows))]
+            Self::Unsupported(adapter) => adapter.read_keyboard_layout(),
         }
     }
 
@@ -449,6 +476,10 @@ impl PlatformAdapter for WindowsPlatformAdapter {
 
     fn read_desktop_geometry(&self) -> Result<DesktopGeometry, PlatformError> {
         read_windows_desktop_geometry()
+    }
+
+    fn read_keyboard_layout(&self) -> Result<KeyboardLayoutSnapshot, PlatformError> {
+        read_windows_keyboard_layout()
     }
 
     fn start_input_capture(
@@ -583,6 +614,65 @@ unsafe extern "system" fn enum_windows_monitor_snapshot(
     }
 
     1
+}
+
+#[cfg(windows)]
+fn read_windows_keyboard_layout() -> Result<KeyboardLayoutSnapshot, PlatformError> {
+    let (thread_id, source) = foreground_window_thread_id()
+        .map(|thread_id| (thread_id, "foregroundWindowThread"))
+        .unwrap_or_else(|| {
+            let thread_id = unsafe { GetCurrentThreadId() };
+            (thread_id, "currentThread")
+        });
+
+    let layout = unsafe { GetKeyboardLayout(thread_id) };
+    if layout.is_null() {
+        return Err(PlatformError::new("failed to read keyboard layout"));
+    }
+
+    let layout_id = layout as usize;
+    let language_id = layout_id & 0xffff;
+
+    Ok(KeyboardLayoutSnapshot {
+        source: source.to_string(),
+        layout_id: format!("0x{layout_id:016X}"),
+        language_id: format!("0x{language_id:04X}"),
+        layout_name: read_windows_keyboard_layout_name(),
+    })
+}
+
+#[cfg(windows)]
+fn foreground_window_thread_id() -> Option<u32> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return None;
+    }
+
+    let thread_id = unsafe { GetWindowThreadProcessId(foreground, null_mut()) };
+    if thread_id == 0 {
+        None
+    } else {
+        Some(thread_id)
+    }
+}
+
+#[cfg(windows)]
+fn read_windows_keyboard_layout_name() -> Option<String> {
+    let mut buffer = [0_u16; 9];
+    let ok = unsafe { GetKeyboardLayoutNameW(buffer.as_mut_ptr()) };
+    if ok == 0 {
+        return None;
+    }
+
+    let end = buffer
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(buffer.len());
+    if end == 0 {
+        None
+    } else {
+        Some(String::from_utf16_lossy(&buffer[..end]))
+    }
 }
 
 #[cfg(windows)]
@@ -1342,6 +1432,7 @@ impl PlatformAdapter for UnsupportedPlatformAdapter {
 pub struct FakePlatformAdapter {
     capabilities: PlatformCapabilities,
     desktop_geometry: DesktopGeometry,
+    keyboard_layout: KeyboardLayoutSnapshot,
     captured_events: Vec<CapturedInputEvent>,
     capture_policy: SharedInputCapturePolicy,
     injected_events: Arc<Mutex<Vec<InjectedInputEvent>>>,
@@ -1354,6 +1445,7 @@ impl FakePlatformAdapter {
         Self {
             capabilities,
             desktop_geometry: fake_desktop_geometry(),
+            keyboard_layout: fake_keyboard_layout(),
             captured_events: Vec::new(),
             capture_policy: SharedInputCapturePolicy::default(),
             injected_events: Arc::new(Mutex::new(Vec::new())),
@@ -1364,6 +1456,12 @@ impl FakePlatformAdapter {
     /// Return a fake adapter that reports the supplied desktop geometry.
     pub fn with_desktop_geometry(mut self, desktop_geometry: DesktopGeometry) -> Self {
         self.desktop_geometry = desktop_geometry;
+        self
+    }
+
+    /// Return a fake adapter that reports the supplied keyboard layout.
+    pub fn with_keyboard_layout(mut self, keyboard_layout: KeyboardLayoutSnapshot) -> Self {
+        self.keyboard_layout = keyboard_layout;
         self
     }
 
@@ -1417,6 +1515,10 @@ impl PlatformAdapter for FakePlatformAdapter {
 
     fn read_desktop_geometry(&self) -> Result<DesktopGeometry, PlatformError> {
         Ok(self.desktop_geometry.clone())
+    }
+
+    fn read_keyboard_layout(&self) -> Result<KeyboardLayoutSnapshot, PlatformError> {
+        Ok(self.keyboard_layout.clone())
     }
 
     fn start_input_capture(
@@ -1475,6 +1577,15 @@ fn fake_desktop_geometry() -> DesktopGeometry {
     }
 }
 
+fn fake_keyboard_layout() -> KeyboardLayoutSnapshot {
+    KeyboardLayoutSnapshot {
+        source: "fake".to_string(),
+        layout_id: "0x0000000004090409".to_string(),
+        language_id: "0x0409".to_string(),
+        layout_name: Some("00000409".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::TryRecvError;
@@ -1488,8 +1599,8 @@ mod tests {
 
     use super::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
-        InputCapturePolicy, PlatformAdapter, PlatformCapabilities, PlatformError,
-        runtime_platform_adapter,
+        InputCapturePolicy, KeyboardLayoutSnapshot, PlatformAdapter, PlatformCapabilities,
+        PlatformError, runtime_platform_adapter,
     };
 
     #[cfg(windows)]
@@ -1586,6 +1697,19 @@ mod tests {
         let adapter = FakePlatformAdapter::default().with_desktop_geometry(geometry.clone());
 
         assert_eq!(adapter.read_desktop_geometry(), Ok(geometry));
+    }
+
+    #[test]
+    fn fake_adapter_reports_configured_keyboard_layout() {
+        let keyboard_layout = KeyboardLayoutSnapshot {
+            source: "test".to_string(),
+            layout_id: "0x0000000004120412".to_string(),
+            language_id: "0x0412".to_string(),
+            layout_name: Some("00000412".to_string()),
+        };
+        let adapter = FakePlatformAdapter::default().with_keyboard_layout(keyboard_layout.clone());
+
+        assert_eq!(adapter.read_keyboard_layout(), Ok(keyboard_layout));
     }
 
     #[test]

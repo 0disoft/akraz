@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 use akraz_identity::{FileIdentityStore, PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_ipc::{
     DaemonLogEntry, DaemonLogsTail, DaemonLogsTailParams, DaemonStatus, DaemonStatusParams,
-    DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, DiagnosticsSnapshot,
-    DiagnosticsSupportBundle, InputReleaseAllParams, InputReleaseAllResult, IpcCallError,
-    IpcEndpoint, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
-    JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
+    DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams, DiagnosticsScreenTopology,
+    DiagnosticsScreenTopologyParams, DiagnosticsSnapshot, DiagnosticsSupportBundle,
+    InputReleaseAllParams, InputReleaseAllResult, IpcCallError, IpcEndpoint, IpcTransportError,
+    JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient,
+    METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
     METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
     METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe,
     PermissionsProbeParams, SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
@@ -896,11 +897,26 @@ fn call_daemon_diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
         topology
     })
     .ok();
+    let keyboard_layout = call_daemon_json_rpc_timed::<DiagnosticsKeyboardLayout, _>(
+        &client,
+        &JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
+            DiagnosticsKeyboardLayoutParams::default(),
+        ),
+        "keyboard layout",
+    )
+    .map(|(keyboard_layout, latency)| {
+        latency_samples.push(latency);
+        keyboard_layout
+    })
+    .ok();
 
     Ok(build_diagnostics_snapshot(
         status,
         permissions,
         screen_topology,
+        keyboard_layout,
         build_diagnostics_latency_histogram(&latency_samples),
         "akraz-app",
         env!("CARGO_PKG_VERSION"),
@@ -1727,11 +1743,11 @@ mod tests {
 
     use akraz_identity::FileIdentityStore;
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonStatus, DiagnosticsMonitorSnapshot, DiagnosticsScreenTopology,
-        InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities, IpcTransportError,
-        JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LogicalPointSnapshot, LogicalRectSnapshot,
-        PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectResult,
-        SessionStatus, to_json_line,
+        ControlModeSnapshot, DaemonStatus, DiagnosticsKeyboardLayout, DiagnosticsMonitorSnapshot,
+        DiagnosticsScreenTopology, InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities,
+        IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LogicalPointSnapshot,
+        LogicalRectSnapshot, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
+        SessionConnectResult, SessionStatus, to_json_line,
     };
 
     use super::{
@@ -1763,6 +1779,15 @@ mod tests {
             scale_factor_percent: Some(100),
             is_primary: true,
         }]
+    }
+
+    fn keyboard_layout() -> DiagnosticsKeyboardLayout {
+        DiagnosticsKeyboardLayout {
+            source: "foregroundWindowThread".to_string(),
+            layout_id: "0x0000000004120412".to_string(),
+            language_id: "0x0412".to_string(),
+            layout_name: Some("00000412".to_string()),
+        }
     }
 
     fn status_fixture() -> DaemonStatus {
@@ -1852,6 +1877,20 @@ mod tests {
         assert_eq!(
             parse_json_rpc_response::<DiagnosticsScreenTopology>(&line, "screen topology"),
             Ok(topology)
+        );
+    }
+
+    #[test]
+    fn parses_diagnostics_keyboard_layout_success_response() {
+        let layout = keyboard_layout();
+        let line = match to_json_line(&JsonRpcSuccess::new("tauri", layout.clone())) {
+            Ok(line) => line,
+            Err(error) => panic!("expected diagnostics keyboard layout JSON: {error}"),
+        };
+
+        assert_eq!(
+            parse_json_rpc_response::<DiagnosticsKeyboardLayout>(&line, "keyboard layout"),
+            Ok(layout)
         );
     }
 

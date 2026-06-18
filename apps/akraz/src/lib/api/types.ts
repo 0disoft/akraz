@@ -62,6 +62,13 @@ export interface DiagnosticsScreenTopology {
   monitors: DiagnosticsMonitorSnapshot[];
 }
 
+export interface DiagnosticsKeyboardLayout {
+  source: string;
+  layoutId: string;
+  languageId: string;
+  layoutName?: string;
+}
+
 export interface DiagnosticsLatencyHistogram {
   sampleCount: number;
   averageMicros: number;
@@ -100,6 +107,7 @@ export interface DiagnosticsSnapshot {
   daemon: DiagnosticsDaemonSnapshot;
   permissions: DiagnosticsPermissionsSnapshot;
   screenTopology?: DiagnosticsScreenTopology;
+  keyboardLayout?: DiagnosticsKeyboardLayout;
   latencyHistogram?: DiagnosticsLatencyHistogram;
   privacy: DiagnosticsPrivacySnapshot;
   unavailableSections: string[];

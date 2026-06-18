@@ -150,6 +150,7 @@ function assertDiagnosticsSnapshot(snapshot) {
   assertCapabilities(snapshot.permissions?.capabilities, "permissions");
   assertPermissionIssues(snapshot.permissions);
   assertOptionalScreenTopology(snapshot);
+  assertOptionalKeyboardLayout(snapshot);
   assertLatencyHistogram(snapshot.latencyHistogram);
   assertPrivacy(snapshot.privacy);
   assertUnavailableSections(snapshot);
@@ -172,6 +173,9 @@ function assertDiagnosticsBundle(bundle, snapshot) {
   const expectedIncludedSections = ["daemon", "permissions"];
   if (bundle.snapshot.screenTopology) {
     expectedIncludedSections.push("screenTopology");
+  }
+  if (bundle.snapshot.keyboardLayout) {
+    expectedIncludedSections.push("keyboardLayout");
   }
   if (bundle.snapshot.latencyHistogram) {
     expectedIncludedSections.push("latencyHistogram");
@@ -301,6 +305,37 @@ function assertOptionalScreenTopology(snapshot) {
   }
 }
 
+function assertOptionalKeyboardLayout(snapshot) {
+  const keyboardLayout = snapshot.keyboardLayout;
+  if (!keyboardLayout) {
+    if (
+      !Array.isArray(snapshot.unavailableSections) ||
+      !snapshot.unavailableSections.includes("keyboardLayout")
+    ) {
+      throw new Error(
+        "diagnostics snapshot omitted keyboard layout without marking it unavailable",
+      );
+    }
+    return;
+  }
+
+  if (typeof keyboardLayout.source !== "string" || keyboardLayout.source.length === 0) {
+    throw new Error("diagnostics snapshot reported an invalid keyboard layout source");
+  }
+  if (!/^0x[0-9A-F]{16}$/.test(keyboardLayout.layoutId)) {
+    throw new Error("diagnostics snapshot reported an invalid keyboard layout id");
+  }
+  if (!/^0x[0-9A-F]{4}$/.test(keyboardLayout.languageId)) {
+    throw new Error("diagnostics snapshot reported an invalid keyboard language id");
+  }
+  if (
+    keyboardLayout.layoutName !== undefined &&
+    (typeof keyboardLayout.layoutName !== "string" || keyboardLayout.layoutName.length === 0)
+  ) {
+    throw new Error("diagnostics snapshot reported an invalid keyboard layout name");
+  }
+}
+
 function assertPrivacy(privacy) {
   const expectedFalseKeys = [
     "includesActualKeyInput",
@@ -384,6 +419,9 @@ function expectedUnavailableSections(snapshot, hasRecentLogs) {
   }
   if (!snapshot.screenTopology) {
     expected.push("screenTopology");
+  }
+  if (!snapshot.keyboardLayout) {
+    expected.push("keyboardLayout");
   }
   if (!snapshot.latencyHistogram) {
     expected.push("latencyHistogram");

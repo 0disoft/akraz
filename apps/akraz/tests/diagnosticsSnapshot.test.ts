@@ -7,6 +7,7 @@ import {
   includedSectionsSummary,
   formatDiagnosticsSnapshot,
   formatRecentLogEntry,
+  keyboardLayoutSummary,
   latencySummary,
   recentLogsSummary,
   screenTopologySummary,
@@ -60,6 +61,12 @@ function snapshotFixture(): DiagnosticsSnapshot {
         },
       ],
     },
+    keyboardLayout: {
+      source: "foregroundWindowThread",
+      layoutId: "0x0000000004120412",
+      languageId: "0x0412",
+      layoutName: "00000412",
+    },
     latencyHistogram: {
       sampleCount: 3,
       averageMicros: 450,
@@ -93,7 +100,14 @@ function bundleFixture(): DiagnosticsSupportBundle {
         message: "Daemon status requested.",
       },
     ],
-    includedSections: ["daemon", "permissions", "screenTopology", "latencyHistogram", "recentLogs"],
+    includedSections: [
+      "daemon",
+      "permissions",
+      "screenTopology",
+      "keyboardLayout",
+      "latencyHistogram",
+      "recentLogs",
+    ],
     unavailableSections: [],
     privacy: snapshot.privacy,
   };
@@ -105,11 +119,13 @@ describe("diagnostics snapshot helpers", () => {
 
     expect(formatted).toContain('"schemaVersion": "akraz.diagnostics.snapshot/v1"');
     expect(formatted).toContain('"screenTopology": {');
+    expect(formatted).toContain('"keyboardLayout": {');
     expect(formatted).toContain('"latencyHistogram": {');
   });
 
-  test("summarizes screen topology, latency, and sections", () => {
+  test("summarizes screen topology, keyboard layout, latency, and sections", () => {
     expect(screenTopologySummary(snapshotFixture())).toBe("1920x1080 @ 0,0");
+    expect(keyboardLayoutSummary(snapshotFixture())).toBe("0x0412 · 00000412 · 0x0000000004120412");
     expect(latencySummary(snapshotFixture())).toBe("평균 0.45ms · p95 0.90ms · p99 0.90ms");
     expect(unavailableSectionsSummary(snapshotFixture())).toBe("recentLogs");
     expect(recentLogsSummary(bundleFixture())).toBe("1개");
@@ -117,17 +133,19 @@ describe("diagnostics snapshot helpers", () => {
       "#1 · Info · daemon.status · Daemon status requested.",
     );
     expect(includedSectionsSummary(bundleFixture())).toBe(
-      "daemon, permissions, screenTopology, latencyHistogram, recentLogs",
+      "daemon, permissions, screenTopology, keyboardLayout, latencyHistogram, recentLogs",
     );
   });
 
   test("summarizes missing optional data", () => {
     const snapshot = snapshotFixture();
     delete snapshot.screenTopology;
+    delete snapshot.keyboardLayout;
     delete snapshot.latencyHistogram;
     snapshot.unavailableSections = [];
 
     expect(screenTopologySummary(snapshot)).toBe("확인 안 됨");
+    expect(keyboardLayoutSummary(snapshot)).toBe("확인 안 됨");
     expect(latencySummary(snapshot)).toBe("확인 안 됨");
     expect(unavailableSectionsSummary(snapshot)).toBe("없음");
   });

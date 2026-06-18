@@ -18,6 +18,21 @@ export function screenTopologySummary(snapshot: DiagnosticsSnapshot): string {
   return `${bounds.width}x${bounds.height} @ ${bounds.x},${bounds.y}`;
 }
 
+export function keyboardLayoutSummary(snapshot: DiagnosticsSnapshot): string {
+  const keyboardLayout = snapshot.keyboardLayout;
+  if (!keyboardLayout) {
+    return "확인 안 됨";
+  }
+
+  const parts = [keyboardLayout.languageId];
+  if (keyboardLayout.layoutName) {
+    parts.push(keyboardLayout.layoutName);
+  }
+  parts.push(keyboardLayout.layoutId);
+
+  return parts.join(" · ");
+}
+
 export function latencySummary(snapshot: DiagnosticsSnapshot): string {
   const latency = snapshot.latencyHistogram;
   if (!latency) {
