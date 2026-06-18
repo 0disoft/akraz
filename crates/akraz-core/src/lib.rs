@@ -422,6 +422,7 @@ pub enum CoreAction {
     ForwardInput {
         event: InjectedInputEvent,
     },
+    InputCaptureIdle,
     ReleaseLocalInputs,
     ReleaseAllInputs,
     StopRemoteSession {

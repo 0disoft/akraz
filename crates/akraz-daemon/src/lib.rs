@@ -48,6 +48,7 @@ const DEFAULT_CAPTURE_DRAIN_BATCH_SIZE: usize = 64;
 const DEFAULT_DAEMON_LOG_CAPACITY: usize = 64;
 const DEFAULT_DAEMON_LOGS_TAIL_LIMIT: usize = 25;
 const DEFAULT_CAPTURE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DEFAULT_CAPTURE_WATCHDOG_IDLE_POLLS: u32 = 80;
 const DEFAULT_PEER_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_PEER_SESSION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_PEER_SESSION_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
@@ -234,7 +235,7 @@ pub enum DaemonTransportCommand {
 impl DaemonTransportCommand {
     fn from_remote_core_action(action: &CoreAction) -> Option<Self> {
         match action {
-            CoreAction::ReleaseLocalInputs => None,
+            CoreAction::InputCaptureIdle | CoreAction::ReleaseLocalInputs => None,
             CoreAction::StartRemoteSession { peer_id, crossing } => {
                 Some(Self::StartRemoteSession {
                     peer_id: peer_id.clone(),
@@ -2242,6 +2243,11 @@ impl DaemonInputCaptureConfig {
             self.idle_poll_interval
         }
     }
+
+    fn bounded_idle_watchdog_timeout(self) -> Duration {
+        self.bounded_idle_poll_interval()
+            .saturating_mul(DEFAULT_CAPTURE_WATCHDOG_IDLE_POLLS)
+    }
 }
 
 impl Default for DaemonInputCaptureConfig {
@@ -2404,12 +2410,15 @@ where
     D: CoreActionDispatcher,
 {
     let idle_poll_interval = config.bounded_idle_poll_interval();
+    let mut idle_watchdog =
+        InputCaptureIdleWatchdog::new(config.bounded_idle_watchdog_timeout(), Instant::now());
     let mut router = CapturedInputRouter::new(routing);
 
     while running.load(Ordering::Acquire) {
         sync_capture_policy_with_state(&capture, &state)?;
         match capture.recv_timeout(idle_poll_interval) {
             Ok(event) => {
+                idle_watchdog.record_progress(Instant::now());
                 dispatch_core_action_batch(
                     &dispatcher,
                     apply_routed_capture_event(&state, &mut router, event)?,
@@ -2428,12 +2437,46 @@ where
             }
             Err(RecvTimeoutError::Timeout) => {
                 sync_capture_policy_with_state(&capture, &state)?;
+                if let Some(action) = idle_watchdog.record_idle_poll(Instant::now()) {
+                    dispatch_core_action_batch(&dispatcher, vec![action])?;
+                }
             }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
 
     capture.stop()
+}
+
+#[derive(Debug, Clone)]
+struct InputCaptureIdleWatchdog {
+    idle_timeout: Duration,
+    last_progress_at: Instant,
+    idle_reported: bool,
+}
+
+impl InputCaptureIdleWatchdog {
+    fn new(idle_timeout: Duration, now: Instant) -> Self {
+        Self {
+            idle_timeout,
+            last_progress_at: now,
+            idle_reported: false,
+        }
+    }
+
+    fn record_progress(&mut self, now: Instant) {
+        self.last_progress_at = now;
+        self.idle_reported = false;
+    }
+
+    fn record_idle_poll(&mut self, now: Instant) -> Option<CoreAction> {
+        if self.idle_reported || now.duration_since(self.last_progress_at) < self.idle_timeout {
+            return None;
+        }
+
+        self.idle_reported = true;
+        Some(CoreAction::InputCaptureIdle)
+    }
 }
 
 fn sync_capture_policy_with_state(
@@ -3034,16 +3077,16 @@ mod tests {
     use super::{
         CapturedInputRouter, CoreActionDispatcher, DAEMON_VERSION, DaemonInputCaptureConfig,
         DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer, DaemonPeerTransport,
-        DaemonTransportCommand, JSONRPC_DAEMON_ERROR, LocalPlatformCoreActionDispatcher,
-        LoopbackPeerTransport, ManagedPeerSessionSnapshot, ManagedPeerSessionTransport,
-        NoopCoreActionDispatcher, PeerSessionReconnectBackoff, PeerTransportCommandExecution,
-        PeerTransportCommandPayload, PeerTransportInputEvent, PeerTransportMessage,
-        PeerTransportProtocolVersion, PeerTransportSessionFrame, TcpPeerSessionTransport,
-        TcpPeerTransport, TransportCoreActionDispatcher, apply_routed_capture_event_to_state,
-        build_daemon_status, build_daemon_status_with_peer_sessions,
-        build_diagnostics_screen_topology, build_permissions_probe, connect_peer_session,
-        disconnect_peer_session, drain_capture_events,
-        execute_authenticated_peer_transport_session_stream_until_closed,
+        DaemonTransportCommand, InputCaptureIdleWatchdog, JSONRPC_DAEMON_ERROR,
+        LocalPlatformCoreActionDispatcher, LoopbackPeerTransport, ManagedPeerSessionSnapshot,
+        ManagedPeerSessionTransport, NoopCoreActionDispatcher, PeerSessionReconnectBackoff,
+        PeerTransportCommandExecution, PeerTransportCommandPayload, PeerTransportInputEvent,
+        PeerTransportMessage, PeerTransportProtocolVersion, PeerTransportSessionFrame,
+        TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher,
+        apply_routed_capture_event_to_state, build_daemon_status,
+        build_daemon_status_with_peer_sessions, build_diagnostics_screen_topology,
+        build_permissions_probe, connect_peer_session, disconnect_peer_session,
+        drain_capture_events, execute_authenticated_peer_transport_session_stream_until_closed,
         execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
         execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
         handle_ipc_request_line, input_capture_policy_for_control_mode,
@@ -3647,6 +3690,47 @@ mod tests {
     }
 
     #[test]
+    fn capture_idle_watchdog_reports_once_per_idle_period() {
+        let now = Instant::now();
+        let mut watchdog = InputCaptureIdleWatchdog::new(Duration::from_millis(20), now);
+
+        assert_eq!(
+            watchdog.record_idle_poll(now + Duration::from_millis(19)),
+            None
+        );
+        assert_eq!(
+            watchdog.record_idle_poll(now + Duration::from_millis(20)),
+            Some(CoreAction::InputCaptureIdle)
+        );
+        assert_eq!(
+            watchdog.record_idle_poll(now + Duration::from_millis(40)),
+            None
+        );
+    }
+
+    #[test]
+    fn capture_idle_watchdog_rearms_after_progress() {
+        let now = Instant::now();
+        let mut watchdog = InputCaptureIdleWatchdog::new(Duration::from_millis(20), now);
+
+        assert_eq!(
+            watchdog.record_idle_poll(now + Duration::from_millis(20)),
+            Some(CoreAction::InputCaptureIdle)
+        );
+
+        watchdog.record_progress(now + Duration::from_millis(25));
+
+        assert_eq!(
+            watchdog.record_idle_poll(now + Duration::from_millis(44)),
+            None
+        );
+        assert_eq!(
+            watchdog.record_idle_poll(now + Duration::from_millis(45)),
+            Some(CoreAction::InputCaptureIdle)
+        );
+    }
+
+    #[test]
     fn capture_policy_sync_follows_shared_remote_state() {
         let platform = FakePlatformAdapter::default();
         let capture = platform
@@ -3741,12 +3825,38 @@ mod tests {
         let dispatcher = TransportCoreActionDispatcher::new(transport.clone());
 
         dispatcher
-            .dispatch_core_actions(&[CoreAction::ReleaseLocalInputs, CoreAction::ReleaseAllInputs])
+            .dispatch_core_actions(&[
+                CoreAction::InputCaptureIdle,
+                CoreAction::ReleaseLocalInputs,
+                CoreAction::ReleaseAllInputs,
+            ])
             .expect("transport command dispatch");
 
         assert_eq!(
             transport.snapshot().expect("loopback command snapshot"),
             vec![DaemonTransportCommand::ReleaseAllInputs]
+        );
+    }
+
+    #[test]
+    fn local_platform_dispatcher_delegates_idle_watchdog_without_local_release() {
+        let platform = FakePlatformAdapter::default();
+        let dispatcher = LocalPlatformCoreActionDispatcher::new(
+            platform.clone(),
+            RecordingCoreActionDispatcher::default(),
+        );
+
+        dispatcher
+            .dispatch_core_actions(&[CoreAction::InputCaptureIdle])
+            .expect("local platform dispatch");
+
+        assert_eq!(
+            platform.release_all_count().expect("local release count"),
+            0
+        );
+        assert_eq!(
+            dispatcher.next().snapshot(),
+            vec![CoreAction::InputCaptureIdle]
         );
     }
 
