@@ -237,6 +237,29 @@ h3 {
   gap: 10px;
 }
 
+.manual-address-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #e0d4be;
+}
+
+.manual-address-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.9fr) minmax(180px, 1.1fr);
+  gap: 10px;
+  align-items: center;
+}
+
+.manual-address-row span {
+  min-width: 0;
+  color: #687280;
+  font-size: 0.82rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
 .edge-row {
   display: grid;
   grid-template-columns: minmax(110px, 0.8fr) minmax(180px, 1.4fr) minmax(110px, 0.8fr) 40px;
@@ -269,6 +292,7 @@ h3 {
 .edge-row select,
 .session-row input,
 .session-row select,
+.manual-address-row input,
 .document-field textarea {
   width: 100%;
   min-width: 0;
@@ -292,6 +316,7 @@ h3 {
 .edge-row select:focus-visible,
 .session-row input:focus-visible,
 .session-row select:focus-visible,
+.manual-address-row input:focus-visible,
 .document-field textarea:focus-visible,
 .toggle-row input:focus-visible {
   outline: 3px solid #c96b4b;
@@ -563,7 +588,8 @@ h3 {
   }
 
   .edge-row,
-  .session-row {
+  .session-row,
+  .manual-address-row {
     grid-template-columns: 1fr;
   }
 

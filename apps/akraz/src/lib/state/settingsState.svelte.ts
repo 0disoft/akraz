@@ -7,6 +7,7 @@ function defaultSettings(): AppSettings {
   return {
     captureInput: false,
     edgeBindings: [],
+    manualPeerAddresses: [],
   };
 }
 
@@ -63,6 +64,31 @@ export class SettingsState {
         [field]: field === "peerId" ? value : (value as ScreenEdge),
       };
     });
+    this.saved = false;
+  }
+
+  manualPeerAddress(peerId: string): string {
+    const normalizedPeerId = peerId.trim();
+    return (
+      this.settings.manualPeerAddresses.find((entry) => entry.peerId === normalizedPeerId)
+        ?.address ?? ""
+    );
+  }
+
+  updateManualPeerAddress(peerId: string, address: string) {
+    const normalizedPeerId = peerId.trim();
+    if (normalizedPeerId.length === 0) {
+      return;
+    }
+
+    const normalizedAddress = address.trim();
+    const remaining = this.settings.manualPeerAddresses.filter(
+      (entry) => entry.peerId !== normalizedPeerId,
+    );
+    this.settings.manualPeerAddresses =
+      normalizedAddress.length === 0
+        ? remaining
+        : [...remaining, { peerId: normalizedPeerId, address: normalizedAddress }];
     this.saved = false;
   }
 

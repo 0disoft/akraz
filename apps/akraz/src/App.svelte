@@ -143,9 +143,15 @@
     }
 
     sessionPeerId = peerId;
+    sessionAddress = settingsState.manualPeerAddress(peerId);
     if (identityState.local) {
       sessionLocalDeviceId = identityState.local.deviceId;
     }
+  }
+
+  function updateSessionAddress(address: string) {
+    sessionAddress = address;
+    settingsState.updateManualPeerAddress(sessionPeerId, address);
   }
 
   function selectEdgeTrustedPeer(index: number, peerId: string) {
@@ -482,10 +488,11 @@
           <span>주소</span>
           <input
             type="text"
-            bind:value={sessionAddress}
+            value={sessionAddress}
             placeholder="127.0.0.1:4455"
             spellcheck="false"
             disabled={daemonState.isBusy || hasConnectedPeer()}
+            oninput={(event) => updateSessionAddress(event.currentTarget.value)}
           />
         </label>
       </div>
@@ -580,6 +587,25 @@
           </div>
         {/each}
       </div>
+
+      {#if identityState.trustedPeers.length > 0}
+        <div class="manual-address-list" aria-label="기기 주소">
+          <h3>기기 주소</h3>
+          {#each identityState.trustedPeers as peer (peer.peerId)}
+            <label class="manual-address-row">
+              <span>{trustedPeerLabel(peer)}</span>
+              <input
+                type="text"
+                value={settingsState.manualPeerAddress(peer.peerId)}
+                placeholder="127.0.0.1:4455"
+                spellcheck="false"
+                disabled={settingsState.isBusy}
+                oninput={(event) => settingsState.updateManualPeerAddress(peer.peerId, event.currentTarget.value)}
+              />
+            </label>
+          {/each}
+        </div>
+      {/if}
 
       <div class="settings-actions">
         <button

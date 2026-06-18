@@ -192,6 +192,10 @@ fn settings_start_smoke_settings() -> AppSettings {
             peer_id: "linux-laptop".to_string(),
             remote_edge: DaemonScreenEdgeOption::Left,
         }],
+        manual_peer_addresses: vec![ManualPeerAddressSetting {
+            peer_id: "linux-laptop".to_string(),
+            address: "127.0.0.1:4455".to_string(),
+        }],
     }
 }
 
@@ -395,6 +399,8 @@ struct AppSettings {
     capture_input: bool,
     #[serde(default)]
     edge_bindings: Vec<DaemonEdgeBindingOption>,
+    #[serde(default)]
+    manual_peer_addresses: Vec<ManualPeerAddressSetting>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -483,6 +489,13 @@ struct DaemonEdgeBindingOption {
     local_edge: DaemonScreenEdgeOption,
     peer_id: String,
     remote_edge: DaemonScreenEdgeOption,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManualPeerAddressSetting {
+    peer_id: String,
+    address: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -982,6 +995,8 @@ fn normalize_settings(mut settings: AppSettings) -> Result<AppSettings, String> 
         .into_iter()
         .map(normalize_edge_binding)
         .collect::<Result<Vec<_>, _>>()?;
+    settings.manual_peer_addresses =
+        normalize_manual_peer_addresses(settings.manual_peer_addresses)?;
 
     Ok(settings)
 }
@@ -991,6 +1006,50 @@ fn normalize_edge_binding(
 ) -> Result<DaemonEdgeBindingOption, String> {
     binding.peer_id = normalize_peer_id(&binding.peer_id)?.to_string();
     Ok(binding)
+}
+
+fn normalize_manual_peer_addresses(
+    addresses: Vec<ManualPeerAddressSetting>,
+) -> Result<Vec<ManualPeerAddressSetting>, String> {
+    let mut normalized_addresses: Vec<ManualPeerAddressSetting> = Vec::new();
+    for address in addresses {
+        let Some(address) = normalize_manual_peer_address(address)? else {
+            continue;
+        };
+
+        if let Some(existing) = normalized_addresses
+            .iter_mut()
+            .find(|existing| existing.peer_id == address.peer_id)
+        {
+            *existing = address;
+        } else {
+            normalized_addresses.push(address);
+        }
+    }
+
+    Ok(normalized_addresses)
+}
+
+fn normalize_manual_peer_address(
+    mut address: ManualPeerAddressSetting,
+) -> Result<Option<ManualPeerAddressSetting>, String> {
+    let normalized_address = address.address.trim();
+    if normalized_address.is_empty() {
+        return Ok(None);
+    }
+
+    address.peer_id = normalize_manual_peer_address_peer_id(&address.peer_id)?.to_string();
+    address.address = normalize_session_address(normalized_address)?.to_string();
+    Ok(Some(address))
+}
+
+fn normalize_manual_peer_address_peer_id(peer_id: &str) -> Result<&str, String> {
+    let peer_id = normalize_required_session_value("manual peer address peer id", peer_id)?;
+    if peer_id.contains(':') || peer_id.contains('@') {
+        return Err("manual peer address peer id cannot contain ':' or '@'.".to_string());
+    }
+
+    Ok(peer_id)
 }
 
 fn normalize_session_connect_options(
@@ -1369,7 +1428,7 @@ mod tests {
         DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_SERVE_ARG, DAEMON_SETTINGS_START_SMOKE_FLAG,
         DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase, DaemonScreenEdgeOption,
         DaemonStartOptions, IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME,
-        build_identity_show_result_from_path, classify_daemon_call_error,
+        ManualPeerAddressSetting, build_identity_show_result_from_path, classify_daemon_call_error,
         daemon_capture_input_enabled_from, daemon_executable_name, daemon_spawn_args_from,
         default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
         has_exact_arg, identity_store_path_from_config_dir, list_trusted_identities_from_path,
@@ -1752,6 +1811,20 @@ mod tests {
                 peer_id: " linux-laptop ".to_string(),
                 remote_edge: DaemonScreenEdgeOption::Left,
             }],
+            manual_peer_addresses: vec![
+                ManualPeerAddressSetting {
+                    peer_id: " linux-laptop ".to_string(),
+                    address: " 127.0.0.1:4455 ".to_string(),
+                },
+                ManualPeerAddressSetting {
+                    peer_id: "empty-address".to_string(),
+                    address: " ".to_string(),
+                },
+                ManualPeerAddressSetting {
+                    peer_id: "linux-laptop".to_string(),
+                    address: "127.0.0.1:4456".to_string(),
+                },
+            ],
         };
 
         let saved = save_settings_to_path(&path, settings).expect("save settings");
@@ -1764,6 +1837,10 @@ mod tests {
                     local_edge: DaemonScreenEdgeOption::Right,
                     peer_id: "linux-laptop".to_string(),
                     remote_edge: DaemonScreenEdgeOption::Left,
+                }],
+                manual_peer_addresses: vec![ManualPeerAddressSetting {
+                    peer_id: "linux-laptop".to_string(),
+                    address: "127.0.0.1:4456".to_string(),
                 }],
             }
         );
@@ -1782,11 +1859,46 @@ mod tests {
                 peer_id: "linux:laptop".to_string(),
                 remote_edge: DaemonScreenEdgeOption::Left,
             }],
+            manual_peer_addresses: Vec::new(),
         };
 
         assert_eq!(
             save_settings_to_path(&path, settings),
             Err("edge binding peer id cannot contain ':'.".to_string())
+        );
+    }
+
+    #[test]
+    fn settings_save_rejects_manual_peer_addresses_that_break_session_contract() {
+        let path = unique_settings_path("invalid-manual-address");
+
+        assert_eq!(
+            save_settings_to_path(
+                &path,
+                AppSettings {
+                    capture_input: false,
+                    edge_bindings: Vec::new(),
+                    manual_peer_addresses: vec![ManualPeerAddressSetting {
+                        peer_id: "linux:laptop".to_string(),
+                        address: "127.0.0.1:4455".to_string(),
+                    }],
+                }
+            ),
+            Err("manual peer address peer id cannot contain ':' or '@'.".to_string())
+        );
+        assert_eq!(
+            save_settings_to_path(
+                &path,
+                AppSettings {
+                    capture_input: false,
+                    edge_bindings: Vec::new(),
+                    manual_peer_addresses: vec![ManualPeerAddressSetting {
+                        peer_id: "linux-laptop".to_string(),
+                        address: "localhost:4455".to_string(),
+                    }],
+                }
+            ),
+            Err("address must be an IP address and port.".to_string())
         );
     }
 

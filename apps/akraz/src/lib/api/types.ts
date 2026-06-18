@@ -48,6 +48,11 @@ export interface ScreenEdgeBinding {
   remoteEdge: ScreenEdge;
 }
 
+export interface ManualPeerAddressSetting {
+  peerId: string;
+  address: string;
+}
+
 export interface DaemonStartOptions {
   captureInput?: boolean;
   edgeBindings?: ScreenEdgeBinding[];
@@ -127,4 +132,5 @@ export interface IdentityForgetTrustedResult {
 export interface AppSettings {
   captureInput: boolean;
   edgeBindings: ScreenEdgeBinding[];
+  manualPeerAddresses: ManualPeerAddressSetting[];
 }
