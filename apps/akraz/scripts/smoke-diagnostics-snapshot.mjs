@@ -170,13 +170,10 @@ function assertDiagnosticsBundle(bundle, snapshot) {
   if (JSON.stringify(bundle.snapshot) !== JSON.stringify(snapshot)) {
     throw new Error("diagnostics bundle snapshot does not match diagnostics snapshot output");
   }
-  const expectedIncludedSections = ["daemon", "permissions", "screenTopology"];
+  const expectedIncludedSections = ["daemon", "permissions", "screenTopology", "recentLogs"];
   assertStringList(bundle.includedSections, expectedIncludedSections, "included sections");
-  assertStringList(
-    bundle.unavailableSections,
-    snapshot.unavailableSections,
-    "unavailable sections",
-  );
+  assertStringList(bundle.unavailableSections, ["latencyHistogram"], "unavailable sections");
+  assertRecentLogs(bundle.recentLogs);
   assertPrivacy(bundle.privacy);
   assertNoSensitiveFields(bundle);
 }
@@ -273,6 +270,30 @@ function assertPrivacy(privacy) {
 function assertUnavailableSections(sections) {
   const expected = ["recentLogs", "latencyHistogram"];
   assertStringList(sections, expected, "unavailable sections");
+}
+
+function assertRecentLogs(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new Error("diagnostics bundle did not include recent daemon logs");
+  }
+  const allowedLevels = new Set(["Info", "Warn", "Error"]);
+  for (const entry of entries) {
+    if (!Number.isInteger(entry.sequence) || entry.sequence <= 0) {
+      throw new Error("diagnostics bundle reported an invalid daemon log sequence");
+    }
+    if (!allowedLevels.has(entry.level)) {
+      throw new Error(`diagnostics bundle reported invalid daemon log level ${entry.level}`);
+    }
+    if (typeof entry.event !== "string" || entry.event.length === 0) {
+      throw new Error("diagnostics bundle reported a daemon log without an event");
+    }
+    if (typeof entry.message !== "string" || entry.message.length === 0) {
+      throw new Error("diagnostics bundle reported a daemon log without a message");
+    }
+  }
+  if (!entries.some((entry) => entry.event === "daemon.logs.tail")) {
+    throw new Error("diagnostics bundle did not include the daemon logs tail event");
+  }
 }
 
 function assertStringList(sections, expected, label) {

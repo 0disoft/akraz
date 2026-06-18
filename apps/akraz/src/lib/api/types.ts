@@ -89,11 +89,21 @@ export interface DiagnosticsSnapshot {
   unavailableSections: string[];
 }
 
+export type DaemonLogLevel = "Info" | "Warn" | "Error";
+
+export interface DaemonLogEntry {
+  sequence: number;
+  level: DaemonLogLevel;
+  event: string;
+  message: string;
+}
+
 export interface DiagnosticsSupportBundle {
   schemaVersion: string;
   generatedBy: string;
   toolVersion: string;
   snapshot: DiagnosticsSnapshot;
+  recentLogs: DaemonLogEntry[];
   includedSections: string[];
   unavailableSections: string[];
   privacy: DiagnosticsPrivacySnapshot;

@@ -13,9 +13,9 @@ function snapshotFixture(): DiagnosticsSnapshot {
   return {
     schemaVersion: "akraz.diagnostics.snapshot/v1",
     generatedBy: "akraz-app",
-    toolVersion: "0.4.49",
+    toolVersion: "0.4.50",
     daemon: {
-      daemonVersion: "0.4.49",
+      daemonVersion: "0.4.50",
       mode: "Local",
       protocol: { major: 1, minor: 4 },
       peerCount: 0,
@@ -58,10 +58,18 @@ function bundleFixture(): DiagnosticsSupportBundle {
   return {
     schemaVersion: "akraz.diagnostics.supportBundle/v1",
     generatedBy: "akraz-app",
-    toolVersion: "0.4.49",
+    toolVersion: "0.4.50",
     snapshot,
-    includedSections: ["daemon", "permissions", "screenTopology"],
-    unavailableSections: snapshot.unavailableSections,
+    recentLogs: [
+      {
+        sequence: 1,
+        level: "Info",
+        event: "daemon.status",
+        message: "Daemon status requested.",
+      },
+    ],
+    includedSections: ["daemon", "permissions", "screenTopology", "recentLogs"],
+    unavailableSections: ["latencyHistogram"],
     privacy: snapshot.privacy,
   };
 }
@@ -77,7 +85,9 @@ describe("diagnostics snapshot helpers", () => {
   test("summarizes screen topology and unavailable sections", () => {
     expect(screenTopologySummary(snapshotFixture())).toBe("1920x1080 @ 0,0");
     expect(unavailableSectionsSummary(snapshotFixture())).toBe("recentLogs, latencyHistogram");
-    expect(includedSectionsSummary(bundleFixture())).toBe("daemon, permissions, screenTopology");
+    expect(includedSectionsSummary(bundleFixture())).toBe(
+      "daemon, permissions, screenTopology, recentLogs",
+    );
   });
 
   test("summarizes missing optional data", () => {
@@ -94,6 +104,7 @@ describe("diagnostics snapshot helpers", () => {
 
     expect(formatted).toContain('"schemaVersion": "akraz.diagnostics.supportBundle/v1"');
     expect(formatted).toContain('"snapshot": {');
+    expect(formatted).toContain('"recentLogs": [');
     expect(formatted).not.toContain("privateKey");
     expect(formatted).not.toContain("identitySecretKey");
     expect(formatted).not.toContain("actualKeyInput");

@@ -9,13 +9,14 @@ use std::time::Duration;
 
 use akraz_identity::{FileIdentityStore, PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_ipc::{
-    DaemonStatus, DaemonStatusParams, DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams,
-    DiagnosticsSnapshot, DiagnosticsSupportBundle, InputReleaseAllParams, InputReleaseAllResult,
-    IpcCallError, IpcEndpoint, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
-    JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
-    METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
-    METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe, PermissionsProbeParams,
-    SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
+    DaemonLogEntry, DaemonLogsTail, DaemonLogsTailParams, DaemonStatus, DaemonStatusParams,
+    DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, DiagnosticsSnapshot,
+    DiagnosticsSupportBundle, InputReleaseAllParams, InputReleaseAllResult, IpcCallError,
+    IpcEndpoint, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
+    JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
+    METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
+    METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe,
+    PermissionsProbeParams, SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
     build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
     resolve_current_default_endpoint,
 };
@@ -853,12 +854,28 @@ fn call_daemon_diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
 
 fn call_daemon_diagnostics_support_bundle() -> Result<DiagnosticsSupportBundle, String> {
     let snapshot = call_daemon_diagnostics_snapshot()?;
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
 
     Ok(build_diagnostics_support_bundle(
         snapshot,
+        collect_recent_daemon_logs(&client),
         "akraz-app",
         env!("CARGO_PKG_VERSION"),
     ))
+}
+
+fn collect_recent_daemon_logs(client: &OsLocalIpcClient) -> Vec<DaemonLogEntry> {
+    call_daemon_json_rpc::<DaemonLogsTail, _>(
+        client,
+        &JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_DAEMON_LOGS_TAIL,
+            DaemonLogsTailParams::default(),
+        ),
+        "daemon logs tail",
+    )
+    .map(|tail| tail.entries)
+    .unwrap_or_default()
 }
 
 fn call_daemon_json_rpc<T, P>(

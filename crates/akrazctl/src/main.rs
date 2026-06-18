@@ -10,9 +10,10 @@ use akraz_identity::{
     TrustedPeerIdentity,
 };
 use akraz_ipc::{
-    DaemonStatus, DaemonStatusParams, DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams,
-    DiagnosticsSnapshot, InputReleaseAllParams, IpcCallError, IpcEndpoint, IpcEndpointError,
-    IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess,
+    DaemonLogEntry, DaemonLogsTail, DaemonLogsTailParams, DaemonStatus, DaemonStatusParams,
+    DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, DiagnosticsSnapshot,
+    InputReleaseAllParams, IpcCallError, IpcEndpoint, IpcEndpointError, IpcTransportError,
+    JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, METHOD_DAEMON_LOGS_TAIL,
     METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL,
     METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
     PermissionsProbe, PermissionsProbeParams, SessionConnectParams, SessionDisconnectParams,
@@ -266,6 +267,7 @@ fn print_diagnostics_bundle(options: EndpointOptions) -> ExitCode {
 
     print_json_pretty(&build_diagnostics_support_bundle(
         snapshot,
+        collect_recent_daemon_logs(&client),
         "akrazctl",
         env!("CARGO_PKG_VERSION"),
     ))
@@ -293,6 +295,16 @@ fn collect_diagnostics_snapshot(client: &OsLocalIpcClient) -> Result<Diagnostics
         "akrazctl",
         env!("CARGO_PKG_VERSION"),
     ))
+}
+
+fn collect_recent_daemon_logs(client: &OsLocalIpcClient) -> Vec<DaemonLogEntry> {
+    call_daemon_json_rpc::<DaemonLogsTail, _>(
+        client,
+        &daemon_logs_tail_request(),
+        "daemon logs tail",
+    )
+    .map(|tail| tail.entries)
+    .unwrap_or_default()
 }
 
 fn print_identity_show(options: IdentityShowOptions) -> ExitCode {
@@ -452,6 +464,14 @@ fn daemon_status_request() -> JsonRpcRequest<DaemonStatusParams> {
         LOCAL_REQUEST_ID,
         METHOD_DAEMON_STATUS,
         DaemonStatusParams::default(),
+    )
+}
+
+fn daemon_logs_tail_request() -> JsonRpcRequest<DaemonLogsTailParams> {
+    JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_DAEMON_LOGS_TAIL,
+        DaemonLogsTailParams::default(),
     )
 }
 
@@ -1493,9 +1513,10 @@ mod tests {
     use super::{
         CliRuntimeError, CliUsageError, DaemonArgsOptions, EndpointOptions, IdentityForgetOptions,
         IdentityListOptions, IdentityShowOptions, IdentityTrustOptions, LOCAL_REQUEST_ID,
-        METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_SESSION_CONNECT,
-        METHOD_SESSION_DISCONNECT, SessionConnectOptions, build_daemon_client_with_resolver,
-        build_pairing_identity_document, daemon_status_request, default_pairing_capabilities,
+        METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+        METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, SessionConnectOptions,
+        build_daemon_client_with_resolver, build_pairing_identity_document,
+        daemon_logs_tail_request, daemon_status_request, default_pairing_capabilities,
         diagnostics_screen_topology_request, forget_trusted_peer_identity,
         format_daemon_call_error, format_daemon_command_line, input_release_all_request,
         list_trusted_peer_identities, parse_daemon_args_options, parse_endpoint_options,
@@ -2073,6 +2094,15 @@ mod tests {
 
         assert_eq!(request.id, LOCAL_REQUEST_ID);
         assert_eq!(request.method, METHOD_DAEMON_STATUS);
+    }
+
+    #[test]
+    fn daemon_logs_tail_request_uses_daemon_logs_tail_ipc_method() {
+        let request = daemon_logs_tail_request();
+
+        assert_eq!(request.id, LOCAL_REQUEST_ID);
+        assert_eq!(request.method, METHOD_DAEMON_LOGS_TAIL);
+        assert_eq!(request.params.limit, None);
     }
 
     #[test]

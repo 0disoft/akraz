@@ -55,6 +55,9 @@ const DIAGNOSTICS_BASE_INCLUDED_SECTIONS: &[&str] = &["daemon", "permissions"];
 /// JSON-RPC method for daemon status.
 pub const METHOD_DAEMON_STATUS: &str = "daemon.status";
 
+/// JSON-RPC method for sanitized daemon log tailing.
+pub const METHOD_DAEMON_LOGS_TAIL: &str = "daemon.logs.tail";
+
 /// JSON-RPC method for platform permission probing.
 pub const METHOD_PERMISSIONS_PROBE: &str = "permissions.probe";
 
@@ -759,6 +762,7 @@ impl<P> JsonRpcRequest<P> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcRequest {
     DaemonStatus(JsonRpcRequest<DaemonStatusParams>),
+    DaemonLogsTail(JsonRpcRequest<DaemonLogsTailParams>),
     PermissionsProbe(JsonRpcRequest<PermissionsProbeParams>),
     DiagnosticsScreenTopology(JsonRpcRequest<DiagnosticsScreenTopologyParams>),
     InputReleaseAll(JsonRpcRequest<InputReleaseAllParams>),
@@ -771,6 +775,7 @@ impl IpcRequest {
     pub fn id(&self) -> &str {
         match self {
             Self::DaemonStatus(request) => &request.id,
+            Self::DaemonLogsTail(request) => &request.id,
             Self::PermissionsProbe(request) => &request.id,
             Self::DiagnosticsScreenTopology(request) => &request.id,
             Self::InputReleaseAll(request) => &request.id,
@@ -783,6 +788,7 @@ impl IpcRequest {
     pub fn method(&self) -> &str {
         match self {
             Self::DaemonStatus(request) => &request.method,
+            Self::DaemonLogsTail(request) => &request.method,
             Self::PermissionsProbe(request) => &request.method,
             Self::DiagnosticsScreenTopology(request) => &request.method,
             Self::InputReleaseAll(request) => &request.method,
@@ -868,6 +874,14 @@ fn empty_params_value() -> Value {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonStatusParams {}
+
+/// Params for `daemon.logs.tail`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonLogsTailParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
 
 /// Empty params for `permissions.probe`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1033,6 +1047,31 @@ pub struct DiagnosticsScreenTopology {
     pub virtual_screen_bounds: LogicalRectSnapshot,
 }
 
+/// Sanitized daemon event level used by recent diagnostics logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DaemonLogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// Sanitized daemon event entry safe for support bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonLogEntry {
+    pub sequence: u64,
+    pub level: DaemonLogLevel,
+    pub event: String,
+    pub message: String,
+}
+
+/// `daemon.logs.tail` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonLogsTail {
+    pub entries: Vec<DaemonLogEntry>,
+}
+
 /// Sanitized local diagnostics snapshot assembled by akraz clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1056,6 +1095,7 @@ pub struct DiagnosticsSupportBundle {
     pub generated_by: String,
     pub tool_version: String,
     pub snapshot: DiagnosticsSnapshot,
+    pub recent_logs: Vec<DaemonLogEntry>,
     pub included_sections: Vec<String>,
     pub unavailable_sections: Vec<String>,
     pub privacy: DiagnosticsPrivacySnapshot,
@@ -1181,6 +1221,7 @@ pub fn build_diagnostics_snapshot(
 /// Build a sanitized support bundle from a diagnostics snapshot.
 pub fn build_diagnostics_support_bundle(
     snapshot: DiagnosticsSnapshot,
+    recent_logs: Vec<DaemonLogEntry>,
     generated_by: impl Into<String>,
     tool_version: impl Into<String>,
 ) -> DiagnosticsSupportBundle {
@@ -1191,14 +1232,25 @@ pub fn build_diagnostics_support_bundle(
     if snapshot.screen_topology.is_some() {
         included_sections.push("screenTopology".to_string());
     }
+    if !recent_logs.is_empty() {
+        included_sections.push("recentLogs".to_string());
+    }
+
+    let unavailable_sections = snapshot
+        .unavailable_sections
+        .iter()
+        .filter(|section| recent_logs.is_empty() || section.as_str() != "recentLogs")
+        .cloned()
+        .collect();
 
     DiagnosticsSupportBundle {
         schema_version: DIAGNOSTICS_SUPPORT_BUNDLE_SCHEMA_VERSION.to_string(),
         generated_by: generated_by.into(),
         tool_version: tool_version.into(),
         included_sections,
-        unavailable_sections: snapshot.unavailable_sections.clone(),
+        unavailable_sections,
         privacy: snapshot.privacy.clone(),
+        recent_logs,
         snapshot,
     }
 }
@@ -1315,6 +1367,7 @@ pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
 
     match raw.method.as_str() {
         METHOD_DAEMON_STATUS => parse_typed_request(raw).map(IpcRequest::DaemonStatus),
+        METHOD_DAEMON_LOGS_TAIL => parse_typed_request(raw).map(IpcRequest::DaemonLogsTail),
         METHOD_PERMISSIONS_PROBE => parse_typed_request(raw).map(IpcRequest::PermissionsProbe),
         METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY => {
             parse_typed_request(raw).map(IpcRequest::DiagnosticsScreenTopology)
@@ -1367,16 +1420,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlModeSnapshot, DaemonStatus, DaemonStatusParams, DiagnosticsPrivacySnapshot,
-        DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, InProcessIpcClient,
-        IpcEndpoint, IpcEndpointEnvironment, IpcEndpointError, IpcEndpointKind, IpcOperatingSystem,
-        IpcPlatformCapabilities, IpcRequest, IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS,
-        JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess,
-        LocalIpcClient, LocalIpcServer, LogicalPointSnapshot, LogicalRectSnapshot,
-        METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL,
-        METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PeerStatus,
-        PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectParams,
-        SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult, SessionStatus,
+        ControlModeSnapshot, DaemonLogEntry, DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams,
+        DaemonStatus, DaemonStatusParams, DiagnosticsPrivacySnapshot, DiagnosticsScreenTopology,
+        DiagnosticsScreenTopologyParams, InProcessIpcClient, IpcEndpoint, IpcEndpointEnvironment,
+        IpcEndpointError, IpcEndpointKind, IpcOperatingSystem, IpcPlatformCapabilities, IpcRequest,
+        IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS, JSONRPC_ERROR_METHOD_NOT_FOUND,
+        JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient, LocalIpcServer,
+        LogicalPointSnapshot, LogicalRectSnapshot, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
+        METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT,
+        METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PeerStatus, PermissionIssue, PermissionsProbe,
+        ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult,
+        SessionDisconnectParams, SessionDisconnectResult, SessionStatus,
         build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
         parse_request_line, resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
     };
@@ -1654,7 +1708,7 @@ mod tests {
             can_inject_keyboard: true,
         };
         let status = DaemonStatus {
-            daemon_version: "0.4.49".to_string(),
+            daemon_version: "0.4.50".to_string(),
             mode: ControlModeSnapshot::Local,
             protocol: ProtocolVersionSnapshot { major: 1, minor: 4 },
             peers: vec![PeerStatus {
@@ -1680,30 +1734,44 @@ mod tests {
         };
 
         let snapshot =
-            build_diagnostics_snapshot(status, permissions, Some(topology), "akrazctl", "0.4.49");
-        let bundle = build_diagnostics_support_bundle(snapshot, "akrazctl", "0.4.49");
+            build_diagnostics_snapshot(status, permissions, Some(topology), "akrazctl", "0.4.50");
+        let bundle = build_diagnostics_support_bundle(
+            snapshot,
+            vec![DaemonLogEntry {
+                sequence: 7,
+                level: DaemonLogLevel::Info,
+                event: "session.connect.failed".to_string(),
+                message: "Peer session connect failed.".to_string(),
+            }],
+            "akrazctl",
+            "0.4.50",
+        );
         let encoded = serde_json::to_string(&bundle).expect("support bundle JSON");
 
         assert_eq!(bundle.schema_version, "akraz.diagnostics.supportBundle/v1");
         assert_eq!(bundle.generated_by, "akrazctl");
-        assert_eq!(bundle.tool_version, "0.4.49");
+        assert_eq!(bundle.tool_version, "0.4.50");
         assert_eq!(
             bundle.included_sections,
             vec![
                 "daemon".to_string(),
                 "permissions".to_string(),
-                "screenTopology".to_string()
+                "screenTopology".to_string(),
+                "recentLogs".to_string()
             ]
         );
         assert_eq!(
             bundle.unavailable_sections,
-            vec!["recentLogs".to_string(), "latencyHistogram".to_string()]
+            vec!["latencyHistogram".to_string()]
         );
+        assert_eq!(bundle.recent_logs.len(), 1);
+        assert_eq!(bundle.recent_logs[0].event, "session.connect.failed");
         assert_eq!(bundle.privacy, DiagnosticsPrivacySnapshot::default());
         assert_eq!(bundle.snapshot.daemon.peer_count, 1);
         assert_eq!(bundle.snapshot.daemon.connected_peer_count, 1);
         assert!(!encoded.contains("secret-peer-id"));
         assert!(!encoded.contains("Secret Peer"));
+        assert!(!encoded.contains("127.0.0.1"));
         assert!(!encoded.contains("privateKey"));
         assert!(!encoded.contains("identitySecretKey"));
         assert!(!encoded.contains("actualKeyInput"));
@@ -1810,6 +1878,43 @@ mod tests {
                         "address": "127.0.0.1:24888",
                         "connected": true
                     }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_logs_tail_response_uses_camel_case_contract() {
+        let response = JsonRpcSuccess::new(
+            "req_1",
+            DaemonLogsTail {
+                entries: vec![DaemonLogEntry {
+                    sequence: 42,
+                    level: DaemonLogLevel::Warn,
+                    event: "session.connect.failed".to_string(),
+                    message: "Peer session connect failed.".to_string(),
+                }],
+            },
+        );
+        let line = match to_json_line(&response) {
+            Ok(line) => line,
+            Err(error) => panic!("expected response serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "result": {
+                    "entries": [
+                        {
+                            "sequence": 42,
+                            "level": "Warn",
+                            "event": "session.connect.failed",
+                            "message": "Peer session connect failed."
+                        }
+                    ]
                 }
             })
         );
@@ -1948,6 +2053,24 @@ mod tests {
         assert_eq!(
             parse_request_line(&line),
             Ok(IpcRequest::DaemonStatus(request))
+        );
+    }
+
+    #[test]
+    fn parses_daemon_logs_tail_request_line() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_DAEMON_LOGS_TAIL,
+            DaemonLogsTailParams { limit: Some(12) },
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(IpcRequest::DaemonLogsTail(request))
         );
     }
 

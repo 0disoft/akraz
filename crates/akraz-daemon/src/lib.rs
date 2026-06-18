@@ -1,5 +1,6 @@
 //! Daemon status builders shared by akraz daemon and diagnostic clients.
 
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{BufRead, BufReader, Write};
@@ -21,11 +22,12 @@ use akraz_identity::{
     TrustedPeer,
 };
 use akraz_ipc::{
-    ControlModeSnapshot, DaemonStatus, DiagnosticsScreenTopology, InputReleaseAllResult,
-    IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError, JsonRpcError,
-    JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PeerStatus, PermissionIssue, PermissionsProbe,
-    ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult, SessionDisconnectResult,
-    SessionStatus, parse_request_line, serve_os_local_ipc_once, to_json_line,
+    ControlModeSnapshot, DaemonLogEntry, DaemonLogLevel, DaemonLogsTail, DaemonStatus,
+    DiagnosticsScreenTopology, InputReleaseAllResult, IpcCodecError, IpcPlatformCapabilities,
+    IpcRequest, IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LocalIpcServer,
+    PeerStatus, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectParams,
+    SessionConnectResult, SessionDisconnectResult, SessionStatus, parse_request_line,
+    serve_os_local_ipc_once, to_json_line,
 };
 use akraz_platform::{
     DesktopGeometry, InputCaptureConfig, InputCapturePolicy, InputCaptureSession, PlatformAdapter,
@@ -43,6 +45,8 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const JSONRPC_DAEMON_ERROR: i32 = -32000;
 const DEFAULT_CAPTURE_DRAIN_BATCH_SIZE: usize = 64;
+const DEFAULT_DAEMON_LOG_CAPACITY: usize = 64;
+const DEFAULT_DAEMON_LOGS_TAIL_LIMIT: usize = 25;
 const DEFAULT_CAPTURE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_PEER_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_PEER_SESSION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -90,10 +94,73 @@ pub trait CoreActionDispatcher: Send + Sync + 'static {
 /// Thread-safe shared dispatcher used by IPC and capture workers.
 pub type SharedCoreActionDispatcher = Arc<dyn CoreActionDispatcher>;
 
+/// Shared sanitized daemon event buffer used by diagnostics support bundles.
+pub type SharedDaemonLogBuffer = Arc<Mutex<DaemonLogBuffer>>;
+
 impl CoreActionDispatcher for SharedCoreActionDispatcher {
     fn dispatch_core_actions(&self, actions: &[CoreAction]) -> Result<(), PlatformError> {
         self.as_ref().dispatch_core_actions(actions)
     }
+}
+
+/// Bounded, sanitized daemon event buffer.
+#[derive(Debug, Clone)]
+pub struct DaemonLogBuffer {
+    entries: VecDeque<DaemonLogEntry>,
+    next_sequence: u64,
+    capacity: usize,
+}
+
+impl DaemonLogBuffer {
+    /// Create a bounded daemon log buffer.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(capacity),
+            next_sequence: 1,
+            capacity,
+        }
+    }
+
+    /// Record a sanitized daemon event with no user-provided payload values.
+    pub fn record(
+        &mut self,
+        level: DaemonLogLevel,
+        event: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(DaemonLogEntry {
+            sequence: self.next_sequence,
+            level,
+            event: event.into(),
+            message: message.into(),
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
+    }
+
+    /// Return the most recent sanitized daemon events.
+    pub fn tail(&self, limit: usize) -> Vec<DaemonLogEntry> {
+        let limit = limit.min(self.capacity);
+        self.entries
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+}
+
+/// Build a shared diagnostics log buffer.
+pub fn shared_daemon_log_buffer(capacity: usize) -> SharedDaemonLogBuffer {
+    Arc::new(Mutex::new(DaemonLogBuffer::new(capacity)))
 }
 
 /// No-op dispatcher used until a real peer transport is attached.
@@ -1907,6 +1974,7 @@ pub struct DaemonIpcServer<P> {
     platform: P,
     dispatcher: SharedCoreActionDispatcher,
     peer_sessions: ManagedPeerSessionTransport,
+    logs: SharedDaemonLogBuffer,
 }
 
 impl<P> DaemonIpcServer<P>
@@ -1951,11 +2019,29 @@ impl<P> DaemonIpcServer<P> {
         dispatcher: SharedCoreActionDispatcher,
         peer_sessions: ManagedPeerSessionTransport,
     ) -> Self {
+        Self::from_shared_state_dispatcher_peer_sessions_and_logs(
+            state,
+            platform,
+            dispatcher,
+            peer_sessions,
+            shared_daemon_log_buffer(DEFAULT_DAEMON_LOG_CAPACITY),
+        )
+    }
+
+    /// Create an in-process daemon IPC server with an explicit diagnostics log buffer.
+    pub fn from_shared_state_dispatcher_peer_sessions_and_logs(
+        state: SharedRuntimeInputState,
+        platform: P,
+        dispatcher: SharedCoreActionDispatcher,
+        peer_sessions: ManagedPeerSessionTransport,
+        logs: SharedDaemonLogBuffer,
+    ) -> Self {
         Self {
             state,
             platform,
             dispatcher,
             peer_sessions,
+            logs,
         }
     }
 
@@ -1980,6 +2066,7 @@ where
             &self.dispatcher,
             &self.peer_sessions,
             request_line,
+            Some(&self.logs),
         )
         .map_err(|error| IpcTransportError::request_failed(error.to_string()))
     }
@@ -2417,6 +2504,7 @@ pub fn handle_ipc_request_line(
         dispatcher,
         &ManagedPeerSessionTransport::new(),
         line,
+        None,
     )
 }
 
@@ -2427,9 +2515,12 @@ pub fn handle_ipc_request_line_with_peer_sessions(
     dispatcher: &impl CoreActionDispatcher,
     peer_sessions: &ManagedPeerSessionTransport,
     line: &str,
+    logs: Option<&SharedDaemonLogBuffer>,
 ) -> Result<String, DaemonIpcError> {
     match parse_request_line(line) {
-        Ok(request) => handle_ipc_request(state, platform, dispatcher, peer_sessions, request),
+        Ok(request) => {
+            handle_ipc_request(state, platform, dispatcher, peer_sessions, logs, request)
+        }
         Err(failure) => encode_response(&failure),
     }
 }
@@ -2439,49 +2530,168 @@ fn handle_ipc_request(
     platform: &impl PlatformAdapter,
     dispatcher: &impl CoreActionDispatcher,
     peer_sessions: &ManagedPeerSessionTransport,
+    logs: Option<&SharedDaemonLogBuffer>,
     request: IpcRequest,
 ) -> Result<String, DaemonIpcError> {
     match request {
         IpcRequest::DaemonStatus(request) => {
+            record_daemon_event(
+                logs,
+                DaemonLogLevel::Info,
+                "daemon.status",
+                "Daemon status requested.",
+            );
             match build_daemon_status_with_peer_sessions(state, platform, peer_sessions) {
                 Ok(status) => encode_response(&JsonRpcSuccess::new(request.id, status)),
                 Err(error) => encode_platform_error(request.id, "daemon status unavailable", error),
             }
         }
         IpcRequest::PermissionsProbe(request) => match build_permissions_probe(platform) {
-            Ok(probe) => encode_response(&JsonRpcSuccess::new(request.id, probe)),
-            Err(error) => encode_platform_error(request.id, "permissions probe unavailable", error),
+            Ok(probe) => {
+                record_daemon_event(
+                    logs,
+                    DaemonLogLevel::Info,
+                    "permissions.probe",
+                    "Permissions probe requested.",
+                );
+                encode_response(&JsonRpcSuccess::new(request.id, probe))
+            }
+            Err(error) => {
+                record_daemon_event(
+                    logs,
+                    DaemonLogLevel::Warn,
+                    "permissions.probe.failed",
+                    "Permissions probe failed.",
+                );
+                encode_platform_error(request.id, "permissions probe unavailable", error)
+            }
         },
         IpcRequest::DiagnosticsScreenTopology(request) => {
             match build_diagnostics_screen_topology(platform) {
-                Ok(topology) => encode_response(&JsonRpcSuccess::new(request.id, topology)),
+                Ok(topology) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Info,
+                        "diagnostics.screenTopology",
+                        "Screen topology diagnostics requested.",
+                    );
+                    encode_response(&JsonRpcSuccess::new(request.id, topology))
+                }
                 Err(error) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Warn,
+                        "diagnostics.screenTopology.failed",
+                        "Screen topology diagnostics failed.",
+                    );
                     encode_platform_error(request.id, "screen topology unavailable", error)
                 }
             }
         }
+        IpcRequest::DaemonLogsTail(request) => {
+            record_daemon_event(
+                logs,
+                DaemonLogLevel::Info,
+                "daemon.logs.tail",
+                "Daemon logs tail requested.",
+            );
+            let entries = daemon_log_tail(logs, request.params.limit);
+            encode_response(&JsonRpcSuccess::new(request.id, DaemonLogsTail { entries }))
+        }
         IpcRequest::InputReleaseAll(request) => {
             match recover_local_control_and_release_inputs(state, dispatcher) {
-                Ok(result) => encode_response(&JsonRpcSuccess::new(request.id, result)),
-                Err(error) => encode_platform_error(request.id, "input release unavailable", error),
+                Ok(result) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Warn,
+                        "input.releaseAll",
+                        "Input release requested.",
+                    );
+                    encode_response(&JsonRpcSuccess::new(request.id, result))
+                }
+                Err(error) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Error,
+                        "input.releaseAll.failed",
+                        "Input release failed.",
+                    );
+                    encode_platform_error(request.id, "input release unavailable", error)
+                }
             }
         }
         IpcRequest::SessionConnect(request) => {
             match connect_peer_session(&request.params, peer_sessions) {
-                Ok(result) => encode_response(&JsonRpcSuccess::new(request.id, result)),
+                Ok(result) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Info,
+                        "session.connect",
+                        "Peer session connect requested.",
+                    );
+                    encode_response(&JsonRpcSuccess::new(request.id, result))
+                }
                 Err(error) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Warn,
+                        "session.connect.failed",
+                        "Peer session connect failed.",
+                    );
                     encode_platform_error(request.id, "session connect unavailable", error)
                 }
             }
         }
         IpcRequest::SessionDisconnect(request) => {
             match disconnect_peer_session(state, dispatcher, peer_sessions) {
-                Ok(result) => encode_response(&JsonRpcSuccess::new(request.id, result)),
+                Ok(result) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Info,
+                        "session.disconnect",
+                        "Peer session disconnect requested.",
+                    );
+                    encode_response(&JsonRpcSuccess::new(request.id, result))
+                }
                 Err(error) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Warn,
+                        "session.disconnect.failed",
+                        "Peer session disconnect failed.",
+                    );
                     encode_platform_error(request.id, "session disconnect unavailable", error)
                 }
             }
         }
+    }
+}
+
+fn record_daemon_event(
+    logs: Option<&SharedDaemonLogBuffer>,
+    level: DaemonLogLevel,
+    event: &'static str,
+    message: &'static str,
+) {
+    let Some(logs) = logs else {
+        return;
+    };
+    if let Ok(mut buffer) = logs.lock() {
+        buffer.record(level, event, message);
+    }
+}
+
+fn daemon_log_tail(
+    logs: Option<&SharedDaemonLogBuffer>,
+    requested_limit: Option<usize>,
+) -> Vec<DaemonLogEntry> {
+    let Some(logs) = logs else {
+        return Vec::new();
+    };
+    let limit = requested_limit.unwrap_or(DEFAULT_DAEMON_LOGS_TAIL_LIMIT);
+    match logs.lock() {
+        Ok(buffer) => buffer.tail(limit),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -2685,6 +2895,8 @@ fn push_missing_capability_issue(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use akraz_core::{
         CapturedInputEvent, ControlMode, CoreAction, DEFAULT_PANIC_HOTKEY_KEY, DeviceId,
         EdgeCrossing, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize, MouseButton,
@@ -2696,9 +2908,10 @@ mod tests {
         TrustedPeer, TrustedPeerIdentity, fingerprint_for_public_key,
     };
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonStatus, DaemonStatusParams, DiagnosticsScreenTopology,
-        DiagnosticsScreenTopologyParams, InputReleaseAllParams, InputReleaseAllResult, IpcEndpoint,
-        IpcPlatformCapabilities, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer,
+        ControlModeSnapshot, DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams, DaemonStatus,
+        DaemonStatusParams, DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams,
+        InputReleaseAllParams, InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities,
+        JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_LOGS_TAIL,
         METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL,
         METHOD_SESSION_CONNECT, OsLocalIpcClient, PeerStatus, SessionConnectParams,
         SessionDisconnectResult, SessionStatus, call_json_rpc, to_json_line,
@@ -2733,7 +2946,7 @@ mod tests {
         serve_tcp_peer_transport_session_and_execute,
         serve_tcp_peer_transport_session_and_execute_until_closed,
         serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout,
-        shared_runtime_state, start_daemon_input_capture,
+        shared_daemon_log_buffer, shared_runtime_state, start_daemon_input_capture,
         start_daemon_input_capture_with_edge_bindings, start_daemon_input_capture_with_routing,
         start_daemon_input_capture_with_routing_and_dispatcher, sync_capture_policy_with_state,
     };
@@ -4643,6 +4856,70 @@ mod tests {
         assert_eq!(response.result.virtual_screen_bounds.y, 0);
         assert_eq!(response.result.virtual_screen_bounds.width, 3840);
         assert_eq!(response.result.virtual_screen_bounds.height, 1080);
+    }
+
+    #[test]
+    fn daemon_ipc_server_tails_sanitized_recent_logs() {
+        let state = shared_runtime_state(RuntimeInputState::new());
+        let platform = FakePlatformAdapter::default();
+        let dispatcher = Arc::new(LocalPlatformCoreActionDispatcher::new(
+            platform.clone(),
+            NoopCoreActionDispatcher,
+        ));
+        let logs = shared_daemon_log_buffer(8);
+        let server = DaemonIpcServer::from_shared_state_dispatcher_peer_sessions_and_logs(
+            state,
+            platform,
+            dispatcher,
+            ManagedPeerSessionTransport::new(),
+            logs,
+        );
+        let connect_request = JsonRpcRequest::new(
+            "req_connect",
+            METHOD_SESSION_CONNECT,
+            SessionConnectParams {
+                peer_id: "secret-peer-id".to_string(),
+                local_device_id: "secret-local-device".to_string(),
+                address: "127.0.0.1:24888".to_string(),
+            },
+        );
+        let connect_line = match to_json_line(&connect_request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        let _ = match server.handle_request_line(&connect_line) {
+            Ok(line) => line,
+            Err(error) => panic!("expected daemon IPC failure response line: {error}"),
+        };
+
+        let logs_request = JsonRpcRequest::new(
+            "req_logs",
+            METHOD_DAEMON_LOGS_TAIL,
+            DaemonLogsTailParams { limit: Some(4) },
+        );
+        let logs_line = match to_json_line(&logs_request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+        let response_line = match server.handle_request_line(&logs_line) {
+            Ok(line) => line,
+            Err(error) => panic!("expected daemon logs response: {error}"),
+        };
+        let response: JsonRpcSuccess<DaemonLogsTail> = match serde_json::from_str(&response_line) {
+            Ok(response) => response,
+            Err(error) => panic!("expected daemon logs JSON: {error}"),
+        };
+        let encoded = serde_json::to_string(&response).expect("daemon logs JSON");
+
+        assert_eq!(response.id, "req_logs");
+        assert_eq!(response.result.entries.len(), 2);
+        assert_eq!(response.result.entries[0].level, DaemonLogLevel::Warn);
+        assert_eq!(response.result.entries[0].event, "session.connect.failed");
+        assert_eq!(response.result.entries[1].event, "daemon.logs.tail");
+        assert!(!encoded.contains("secret-peer-id"));
+        assert!(!encoded.contains("secret-local-device"));
+        assert!(!encoded.contains("127.0.0.1"));
     }
 
     #[test]
