@@ -1,5 +1,6 @@
 import { settingsClient } from "../api/settingsClient";
 import type { AppSettings, DaemonStartOptions, ScreenEdge, ScreenEdgeBinding } from "../api/types";
+import { manualPeerAddress, updateManualPeerAddress } from "../settings/manualPeerAddresses";
 
 type SettingsOperation = "load" | "save";
 
@@ -80,27 +81,20 @@ export class SettingsState {
   }
 
   manualPeerAddress(peerId: string): string {
-    const normalizedPeerId = peerId.trim();
-    return (
-      this.settings.manualPeerAddresses.find((entry) => entry.peerId === normalizedPeerId)
-        ?.address ?? ""
-    );
+    return manualPeerAddress(this.settings.manualPeerAddresses, peerId);
   }
 
   updateManualPeerAddress(peerId: string, address: string) {
-    const normalizedPeerId = peerId.trim();
-    if (normalizedPeerId.length === 0) {
+    const nextManualPeerAddresses = updateManualPeerAddress(
+      this.settings.manualPeerAddresses,
+      peerId,
+      address,
+    );
+    if (nextManualPeerAddresses === this.settings.manualPeerAddresses) {
       return;
     }
 
-    const normalizedAddress = address.trim();
-    const remaining = this.settings.manualPeerAddresses.filter(
-      (entry) => entry.peerId !== normalizedPeerId,
-    );
-    this.settings.manualPeerAddresses =
-      normalizedAddress.length === 0
-        ? remaining
-        : [...remaining, { peerId: normalizedPeerId, address: normalizedAddress }];
+    this.settings.manualPeerAddresses = nextManualPeerAddresses;
     this.saved = false;
   }
 

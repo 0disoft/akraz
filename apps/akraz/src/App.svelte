@@ -4,6 +4,7 @@
   import { daemonState } from './lib/state/daemonState.svelte';
   import { identityState } from './lib/state/identityState.svelte';
   import { settingsState } from './lib/state/settingsState.svelte';
+  import { selectTrustedPeerSessionDraft } from './lib/session/sessionDraft';
   import type {
     ControlMode,
     DaemonLifecyclePhase,
@@ -138,15 +139,20 @@
   }
 
   function selectSessionTrustedPeer(peerId: string) {
-    if (peerId.length === 0) {
-      return;
-    }
+    const draft = selectTrustedPeerSessionDraft(
+      {
+        peerId: sessionPeerId,
+        localDeviceId: sessionLocalDeviceId,
+        address: sessionAddress,
+      },
+      peerId,
+      settingsState.manualPeerAddress(peerId),
+      identityState.local?.deviceId ?? null,
+    );
 
-    sessionPeerId = peerId;
-    sessionAddress = settingsState.manualPeerAddress(peerId);
-    if (identityState.local) {
-      sessionLocalDeviceId = identityState.local.deviceId;
-    }
+    sessionPeerId = draft.peerId;
+    sessionLocalDeviceId = draft.localDeviceId;
+    sessionAddress = draft.address;
   }
 
   function updateSessionAddress(address: string) {
