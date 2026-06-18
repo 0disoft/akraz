@@ -188,7 +188,7 @@ fn run_daemon_settings_start_smoke() -> Result<(), String> {
 fn settings_start_smoke_settings() -> AppSettings {
     AppSettings {
         capture_input: true,
-        peer_listen_address: String::new(),
+        peer_listen_address: "127.0.0.1:0".to_string(),
         edge_bindings: vec![DaemonEdgeBindingOption {
             local_edge: DaemonScreenEdgeOption::Right,
             peer_id: "linux-laptop".to_string(),
@@ -2039,13 +2039,20 @@ mod tests {
 
     #[test]
     fn settings_start_smoke_settings_become_daemon_start_options() {
+        let identity_store_path = PathBuf::from("akraz-identity.json");
         let options = DaemonStartOptions::from(settings_start_smoke_settings());
 
         assert_eq!(
-            daemon_spawn_args_from(&options, None, None),
+            daemon_spawn_args_from(&options, None, Some(&identity_store_path)),
             Ok(vec![
                 DAEMON_SERVE_ARG.to_string(),
+                DAEMON_IDENTITY_STORE_ARG.to_string(),
+                "akraz-identity.json".to_string(),
+                DAEMON_IDENTITY_DISPLAY_NAME_ARG.to_string(),
+                DAEMON_IDENTITY_DISPLAY_NAME.to_string(),
                 DAEMON_CAPTURE_INPUT_ARG.to_string(),
+                DAEMON_PEER_LISTEN_ARG.to_string(),
+                "127.0.0.1:0".to_string(),
                 DAEMON_EDGE_BINDING_ARG.to_string(),
                 "right:linux-laptop:left".to_string()
             ])

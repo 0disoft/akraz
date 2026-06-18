@@ -96,6 +96,9 @@ function assertSettings(settings) {
   if (settings.captureInput !== true) {
     throw new Error(`${smokeProfile.label} expected captureInput true`);
   }
+  if (settings.peerListenAddress !== "127.0.0.1:0") {
+    throw new Error(`${smokeProfile.label} expected peerListenAddress 127.0.0.1:0`);
+  }
   const [binding] = settings.edgeBindings ?? [];
   if (!binding || settings.edgeBindings.length !== 1) {
     throw new Error(`${smokeProfile.label} expected one edge binding`);
@@ -106,5 +109,12 @@ function assertSettings(settings) {
     binding.remoteEdge !== "left"
   ) {
     throw new Error(`${smokeProfile.label} reported unexpected edge binding`);
+  }
+  const [manualAddress] = settings.manualPeerAddresses ?? [];
+  if (!manualAddress || settings.manualPeerAddresses.length !== 1) {
+    throw new Error(`${smokeProfile.label} expected one manual peer address`);
+  }
+  if (manualAddress.peerId !== "linux-laptop" || manualAddress.address !== "127.0.0.1:4455") {
+    throw new Error(`${smokeProfile.label} reported unexpected manual peer address`);
   }
 }
