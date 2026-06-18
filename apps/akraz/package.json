@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.4.44",
+  "version": "0.4.45",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
     "prepare:sidecar": "bun scripts/prepare-sidecar.mjs",
     "prepare:sidecar:release": "bun scripts/prepare-sidecar.mjs --release",
     "smoke:daemon-lifecycle": "bun scripts/smoke-daemon-lifecycle.mjs",
+    "smoke:diagnostics-snapshot": "bun scripts/smoke-diagnostics-snapshot.mjs",
     "smoke:loopback-transport": "bun scripts/smoke-loopback-transport.mjs",
     "smoke:peer-session": "bun scripts/smoke-peer-session.mjs",
     "smoke:peer-session-executor": "bun scripts/smoke-peer-session-executor.mjs",
