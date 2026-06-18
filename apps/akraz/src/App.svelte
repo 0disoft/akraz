@@ -7,6 +7,7 @@
   import type {
     ControlMode,
     DaemonLifecyclePhase,
+    IdentityTrustedPeer,
     PlatformCapabilities,
     PeerStatus,
     ScreenEdge,
@@ -125,6 +126,34 @@
       .map((capability) => capability.label);
 
     return labels.length > 0 ? labels.join(' · ') : '없음';
+  }
+
+  function trustedPeerLabel(peer: IdentityTrustedPeer) {
+    return `${peer.displayName} (${peer.peerId})`;
+  }
+
+  function trustedPeerSelectValue(peerId: string) {
+    const normalizedPeerId = peerId.trim();
+    return identityState.trustedPeers.some((peer) => peer.peerId === normalizedPeerId) ? normalizedPeerId : '';
+  }
+
+  function selectSessionTrustedPeer(peerId: string) {
+    if (peerId.length === 0) {
+      return;
+    }
+
+    sessionPeerId = peerId;
+    if (identityState.local) {
+      sessionLocalDeviceId = identityState.local.deviceId;
+    }
+  }
+
+  function selectEdgeTrustedPeer(index: number, peerId: string) {
+    if (peerId.length === 0) {
+      return;
+    }
+
+    settingsState.updateEdgeBinding(index, 'peerId', peerId);
   }
 
   function connectedPeers() {
@@ -418,6 +447,17 @@
       <div class="session-row">
         <label>
           <span>기기 ID</span>
+          <select
+            value={trustedPeerSelectValue(sessionPeerId)}
+            disabled={daemonState.isBusy || hasConnectedPeer() || identityState.trustedPeers.length === 0}
+            onchange={(event) => selectSessionTrustedPeer(event.currentTarget.value)}
+            aria-label="등록된 기기 선택"
+          >
+            <option value="">직접 입력</option>
+            {#each identityState.trustedPeers as peer (peer.peerId)}
+              <option value={peer.peerId}>{trustedPeerLabel(peer)}</option>
+            {/each}
+          </select>
           <input
             type="text"
             bind:value={sessionPeerId}
@@ -497,6 +537,17 @@
 
             <label class="peer-field">
               <span>기기 ID</span>
+              <select
+                value={trustedPeerSelectValue(binding.peerId)}
+                disabled={identityState.trustedPeers.length === 0}
+                onchange={(event) => selectEdgeTrustedPeer(index, event.currentTarget.value)}
+                aria-label="등록된 기기 선택"
+              >
+                <option value="">직접 입력</option>
+                {#each identityState.trustedPeers as peer (peer.peerId)}
+                  <option value={peer.peerId}>{trustedPeerLabel(peer)}</option>
+                {/each}
+              </select>
               <input
                 type="text"
                 value={binding.peerId}
