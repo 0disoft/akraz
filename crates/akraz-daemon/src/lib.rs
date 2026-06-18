@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use akraz_core::{
     CapturedInputEvent, ControlMode, CoreAction, CoreTransitionError, DeviceId, EdgeCrossing,
@@ -50,6 +50,8 @@ const DEFAULT_DAEMON_LOGS_TAIL_LIMIT: usize = 25;
 const DEFAULT_CAPTURE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_PEER_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_PEER_SESSION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_PEER_SESSION_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
+const DEFAULT_PEER_SESSION_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const PRE_TLS_REMOTE_NONCE: [u8; HANDSHAKE_NONCE_LEN] = [0; HANDSHAKE_NONCE_LEN];
 const PRE_TLS_EXPORTER: [u8; TLS_EXPORTER_LEN] = [0; TLS_EXPORTER_LEN];
 
@@ -634,10 +636,66 @@ impl DaemonPeerTransport for TcpPeerSessionTransport {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PeerSessionReconnectBackoff {
+    consecutive_failures: u32,
+    next_allowed_at: Option<Instant>,
+    initial_delay: Duration,
+    max_delay: Duration,
+}
+
+impl Default for PeerSessionReconnectBackoff {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: 0,
+            next_allowed_at: None,
+            initial_delay: DEFAULT_PEER_SESSION_RECONNECT_BACKOFF_INITIAL,
+            max_delay: DEFAULT_PEER_SESSION_RECONNECT_BACKOFF_MAX,
+        }
+    }
+}
+
+impl PeerSessionReconnectBackoff {
+    fn retry_after(&self, now: Instant) -> Option<Duration> {
+        self.next_allowed_at
+            .and_then(|deadline| deadline.checked_duration_since(now))
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    fn record_failure(&mut self, now: Instant) -> Duration {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let delay = self.delay_for_failure(self.consecutive_failures);
+        self.next_allowed_at = Some(now.checked_add(delay).unwrap_or(now));
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+        self.next_allowed_at = None;
+    }
+
+    fn delay_for_failure(&self, failure_count: u32) -> Duration {
+        if failure_count == 0 {
+            return Duration::ZERO;
+        }
+
+        let mut delay = self.initial_delay.min(self.max_delay);
+        for _ in 1..failure_count {
+            delay = delay.checked_mul(2).unwrap_or(self.max_delay);
+            if delay >= self.max_delay {
+                return self.max_delay;
+            }
+        }
+
+        delay
+    }
+}
+
 /// Runtime-managed peer session transport used by daemon control commands.
 #[derive(Debug, Default, Clone)]
 pub struct ManagedPeerSessionTransport {
     active_session: Arc<Mutex<Option<TcpPeerSessionTransport>>>,
+    reconnect_backoff: Arc<Mutex<PeerSessionReconnectBackoff>>,
     auth_config: Option<ManagedPeerSessionAuthConfig>,
 }
 
@@ -660,6 +718,7 @@ impl ManagedPeerSessionTransport {
     ) -> Self {
         Self {
             active_session: Arc::new(Mutex::new(None)),
+            reconnect_backoff: Arc::new(Mutex::new(PeerSessionReconnectBackoff::default())),
             auth_config: Some(ManagedPeerSessionAuthConfig {
                 identity_store: identity_store.into(),
                 identity_display_name: identity_display_name.into(),
@@ -723,47 +782,55 @@ impl ManagedPeerSessionTransport {
         local_device_id: DeviceId,
         address: SocketAddr,
     ) -> Result<(), PlatformError> {
-        let session = match &self.auth_config {
-            Some(auth_config) => {
-                let store = FileIdentityStore::new(&auth_config.identity_store);
-                let local = store
-                    .load_or_create(&auth_config.identity_display_name)
-                    .map_err(|error| {
-                        PlatformError::new(format!(
-                            "failed to load identity store {}: {error}",
-                            auth_config.identity_store.display()
-                        ))
-                    })?
-                    .into_local_identity();
-                if local.identity().device_id() != local_device_id.as_str() {
-                    return Err(PlatformError::new(format!(
-                        "session local device id {} does not match identity store device id {}",
-                        local_device_id.as_str(),
-                        local.identity().device_id()
-                    )));
-                }
-                let trusted_peer = store.load_trusted_peer(peer_id.as_str()).map_err(|error| {
-                    PlatformError::new(format!(
-                        "failed to load trusted peer {} from {}: {error}",
-                        peer_id.as_str(),
-                        auth_config.identity_store.display()
-                    ))
-                })?;
-                TcpPeerSessionTransport::connect_authenticated(
-                    peer_id,
-                    &local,
-                    address,
-                    &trusted_peer,
-                )?
-            }
-            None => {
-                return Err(PlatformError::new(
-                    "managed peer session requires identity store before session.connect",
-                ));
-            }
+        if self.is_connected()? {
+            return Err(PlatformError::new(
+                "managed peer session already has an active peer",
+            ));
+        }
+
+        self.ensure_connect_backoff_allows(Instant::now())?;
+
+        let Some(auth_config) = &self.auth_config else {
+            return Err(PlatformError::new(
+                "managed peer session requires identity store before session.connect",
+            ));
+        };
+        let store = FileIdentityStore::new(&auth_config.identity_store);
+        let local = store
+            .load_or_create(&auth_config.identity_display_name)
+            .map_err(|error| {
+                PlatformError::new(format!(
+                    "failed to load identity store {}: {error}",
+                    auth_config.identity_store.display()
+                ))
+            })?
+            .into_local_identity();
+        if local.identity().device_id() != local_device_id.as_str() {
+            return Err(PlatformError::new(format!(
+                "session local device id {} does not match identity store device id {}",
+                local_device_id.as_str(),
+                local.identity().device_id()
+            )));
+        }
+        let trusted_peer = store.load_trusted_peer(peer_id.as_str()).map_err(|error| {
+            PlatformError::new(format!(
+                "failed to load trusted peer {} from {}: {error}",
+                peer_id.as_str(),
+                auth_config.identity_store.display()
+            ))
+        })?;
+        let session = match TcpPeerSessionTransport::connect_authenticated(
+            peer_id,
+            &local,
+            address,
+            &trusted_peer,
+        ) {
+            Ok(session) => session,
+            Err(error) => return Err(self.record_connect_failure(Instant::now(), error)),
         };
 
-        self.attach_session(session)
+        self.attach_session(session)?;
+        self.reset_connect_backoff()
     }
 
     /// Disconnect the active peer session and return the detached session snapshot.
@@ -784,6 +851,43 @@ impl ManagedPeerSessionTransport {
             .lock()
             .map_err(|_| PlatformError::new("managed peer session is unavailable"))
             .map(|session| session.clone())
+    }
+
+    fn ensure_connect_backoff_allows(&self, now: Instant) -> Result<(), PlatformError> {
+        let backoff = self.reconnect_backoff.lock().map_err(|_| {
+            PlatformError::new("managed peer session reconnect backoff is unavailable")
+        })?;
+        if let Some(retry_after) = backoff.retry_after(now) {
+            return Err(PlatformError::new(format!(
+                "peer session reconnect backoff active for {}ms",
+                retry_after.as_millis()
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn record_connect_failure(&self, now: Instant, error: PlatformError) -> PlatformError {
+        let Ok(mut backoff) = self.reconnect_backoff.lock() else {
+            return PlatformError::new(format!(
+                "{error}; managed peer session reconnect backoff is unavailable"
+            ));
+        };
+        let delay = backoff.record_failure(now);
+
+        PlatformError::new(format!(
+            "{error}; retry peer session connect after {}ms",
+            delay.as_millis()
+        ))
+    }
+
+    fn reset_connect_backoff(&self) -> Result<(), PlatformError> {
+        self.reconnect_backoff
+            .lock()
+            .map_err(|_| {
+                PlatformError::new("managed peer session reconnect backoff is unavailable")
+            })
+            .map(|mut backoff| backoff.reset())
     }
 }
 
@@ -2896,6 +3000,7 @@ fn push_missing_capability_issue(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use akraz_core::{
         CapturedInputEvent, ControlMode, CoreAction, DEFAULT_PANIC_HOTKEY_KEY, DeviceId,
@@ -2931,13 +3036,14 @@ mod tests {
         DaemonInputRoutingConfig, DaemonIpcRunConfig, DaemonIpcServer, DaemonPeerTransport,
         DaemonTransportCommand, JSONRPC_DAEMON_ERROR, LocalPlatformCoreActionDispatcher,
         LoopbackPeerTransport, ManagedPeerSessionSnapshot, ManagedPeerSessionTransport,
-        NoopCoreActionDispatcher, PeerTransportCommandExecution, PeerTransportCommandPayload,
-        PeerTransportInputEvent, PeerTransportMessage, PeerTransportProtocolVersion,
-        PeerTransportSessionFrame, TcpPeerSessionTransport, TcpPeerTransport,
-        TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
-        build_daemon_status_with_peer_sessions, build_diagnostics_screen_topology,
-        build_permissions_probe, connect_peer_session, disconnect_peer_session,
-        drain_capture_events, execute_authenticated_peer_transport_session_stream_until_closed,
+        NoopCoreActionDispatcher, PeerSessionReconnectBackoff, PeerTransportCommandExecution,
+        PeerTransportCommandPayload, PeerTransportInputEvent, PeerTransportMessage,
+        PeerTransportProtocolVersion, PeerTransportSessionFrame, TcpPeerSessionTransport,
+        TcpPeerTransport, TransportCoreActionDispatcher, apply_routed_capture_event_to_state,
+        build_daemon_status, build_daemon_status_with_peer_sessions,
+        build_diagnostics_screen_topology, build_permissions_probe, connect_peer_session,
+        disconnect_peer_session, drain_capture_events,
+        execute_authenticated_peer_transport_session_stream_until_closed,
         execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
         execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
         handle_ipc_request_line, input_capture_policy_for_control_mode,
@@ -4048,6 +4154,96 @@ mod tests {
         drop(managed);
         assert!(first_server_thread.join().expect("first server").is_ok());
         assert!(second_server_thread.join().expect("second server").is_ok());
+    }
+
+    #[test]
+    fn peer_session_reconnect_backoff_grows_and_resets() {
+        let mut backoff = PeerSessionReconnectBackoff::default();
+        let start = Instant::now();
+
+        assert_eq!(backoff.record_failure(start), Duration::from_millis(250));
+        assert_eq!(
+            backoff.retry_after(start + Duration::from_millis(100)),
+            Some(Duration::from_millis(150))
+        );
+        assert_eq!(
+            backoff.retry_after(start + Duration::from_millis(250)),
+            None
+        );
+        assert_eq!(
+            backoff.record_failure(start + Duration::from_millis(250)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            backoff.record_failure(start + Duration::from_millis(750)),
+            Duration::from_secs(1)
+        );
+
+        for attempt in 0..10 {
+            let _ = backoff.record_failure(start + Duration::from_secs(2 + attempt));
+        }
+        assert_eq!(
+            backoff.record_failure(start + Duration::from_secs(20)),
+            Duration::from_secs(5)
+        );
+
+        backoff.reset();
+        assert_eq!(backoff.retry_after(start + Duration::from_secs(21)), None);
+        assert_eq!(
+            backoff.record_failure(start + Duration::from_secs(21)),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn managed_peer_session_transport_delays_immediate_connect_retry_after_failure() {
+        let identity_store_path = unique_identity_store_path("connect-backoff");
+        let _ = std::fs::remove_file(&identity_store_path);
+        let identity_store = FileIdentityStore::new(&identity_store_path);
+        let local = identity_store
+            .load_or_create("Windows Desktop")
+            .expect("local identity")
+            .into_local_identity();
+        let (_, trusted_target, _) = peer_session_pair_auth_fixture();
+        identity_store
+            .save_trusted_peer(trusted_target.identity())
+            .expect("save trusted target peer");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind temporary listener");
+        let unavailable_address = listener.local_addr().expect("temporary listener address");
+        drop(listener);
+        let managed = ManagedPeerSessionTransport::with_identity_store(
+            &identity_store_path,
+            "Windows Desktop",
+        );
+
+        let first_error = managed
+            .connect_session(
+                PeerId::new("right-peer"),
+                DeviceId::new(local.identity().device_id()),
+                unavailable_address,
+            )
+            .expect_err("closed listener should fail connect");
+        let retry_error = managed
+            .connect_session(
+                PeerId::new("right-peer"),
+                DeviceId::new(local.identity().device_id()),
+                unavailable_address,
+            )
+            .expect_err("immediate retry should be delayed");
+
+        assert!(
+            first_error
+                .to_string()
+                .contains("retry peer session connect after 250ms")
+        );
+        assert!(
+            retry_error
+                .to_string()
+                .starts_with("peer session reconnect backoff active for ")
+        );
+        assert_eq!(managed.active_session(), Ok(None));
+
+        let _ = std::fs::remove_file(&identity_store_path);
     }
 
     #[test]
