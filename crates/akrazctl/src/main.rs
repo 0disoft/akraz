@@ -10,16 +10,20 @@ use akraz_identity::{
     TrustedPeerIdentity,
 };
 use akraz_ipc::{
-    DaemonStatusParams, InputReleaseAllParams, IpcCallError, IpcEndpoint, IpcEndpointError,
-    IpcTransportError, JsonRpcRequest, METHOD_DAEMON_STATUS, METHOD_INPUT_RELEASE_ALL,
+    DaemonStatus, DaemonStatusParams, InputReleaseAllParams, IpcCallError, IpcEndpoint,
+    IpcEndpointError, IpcPlatformCapabilities, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure,
+    JsonRpcRequest, JsonRpcSuccess, METHOD_DAEMON_STATUS, METHOD_INPUT_RELEASE_ALL,
     METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
-    PermissionsProbeParams, SessionConnectParams, SessionDisconnectParams, call_json_rpc,
-    resolve_current_default_endpoint,
+    PermissionIssue, PermissionsProbe, PermissionsProbeParams, ProtocolVersionSnapshot,
+    SessionConnectParams, SessionDisconnectParams, call_json_rpc, resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 
 const LOCAL_REQUEST_ID: &str = "local";
 const DEFAULT_IDENTITY_DISPLAY_NAME: &str = "Akraz Device";
+const DIAGNOSTICS_SNAPSHOT_SCHEMA_VERSION: &str = "akraz.diagnostics.snapshot/v1";
+const DIAGNOSTICS_UNAVAILABLE_SECTIONS: &[&str] =
+    &["recentLogs", "screenTopology", "latencyHistogram"];
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -33,6 +37,23 @@ fn main() -> ExitCode {
             Ok(options) => print_status(options),
             Err(error) => {
                 eprintln!("{error}");
+                ExitCode::from(2)
+            }
+        },
+        Some("diagnostics") => match args.next().as_deref() {
+            Some("snapshot") => match parse_endpoint_options(args) {
+                Ok(options) => print_diagnostics_snapshot(options),
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            },
+            Some(argument) => {
+                eprintln!("unknown diagnostics command: {argument}");
+                ExitCode::from(2)
+            }
+            None => {
+                eprintln!("missing diagnostics command");
                 ExitCode::from(2)
             }
         },
@@ -145,7 +166,7 @@ fn main() -> ExitCode {
         }
         None => {
             eprintln!(
-                "usage: akrazctl <status|permissions probe|input release-all|identity show|identity list|identity trust|identity forget|session connect|session disconnect|daemon-args|--version>"
+                "usage: akrazctl <status|diagnostics snapshot|permissions probe|input release-all|identity show|identity list|identity trust|identity forget|session connect|session disconnect|daemon-args|--version>"
             );
             ExitCode::from(2)
         }
@@ -157,32 +178,17 @@ fn print_version() {
 }
 
 fn print_status(options: EndpointOptions) -> ExitCode {
-    let request = JsonRpcRequest::new(
-        LOCAL_REQUEST_ID,
-        METHOD_DAEMON_STATUS,
-        DaemonStatusParams::default(),
-    );
-
+    let request = daemon_status_request();
     print_local_daemon_response(options.endpoint, &request)
 }
 
 fn print_permissions_probe(options: EndpointOptions) -> ExitCode {
-    let request = JsonRpcRequest::new(
-        LOCAL_REQUEST_ID,
-        METHOD_PERMISSIONS_PROBE,
-        PermissionsProbeParams::default(),
-    );
-
+    let request = permissions_probe_request();
     print_local_daemon_response(options.endpoint, &request)
 }
 
 fn print_input_release_all(options: EndpointOptions) -> ExitCode {
-    let request = JsonRpcRequest::new(
-        LOCAL_REQUEST_ID,
-        METHOD_INPUT_RELEASE_ALL,
-        InputReleaseAllParams::default(),
-    );
-
+    let request = input_release_all_request();
     print_local_daemon_response(options.endpoint, &request)
 }
 
@@ -213,6 +219,41 @@ fn print_session_disconnect(options: EndpointOptions) -> ExitCode {
 fn print_daemon_args(options: DaemonArgsOptions) -> ExitCode {
     println!("{}", format_daemon_command_line(&options));
     ExitCode::SUCCESS
+}
+
+fn print_diagnostics_snapshot(options: EndpointOptions) -> ExitCode {
+    let client = match build_daemon_client(options.endpoint) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let status = match call_daemon_json_rpc::<DaemonStatus, _>(
+        &client,
+        &daemon_status_request(),
+        "status",
+    ) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let permissions = match call_daemon_json_rpc::<PermissionsProbe, _>(
+        &client,
+        &permissions_probe_request(),
+        "permissions probe",
+    ) {
+        Ok(permissions) => permissions,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    print_json_pretty(&build_diagnostics_snapshot(status, permissions))
 }
 
 fn print_identity_show(options: IdentityShowOptions) -> ExitCode {
@@ -367,6 +408,59 @@ fn default_pairing_capabilities() -> CapabilityFlags {
     CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
 }
 
+fn daemon_status_request() -> JsonRpcRequest<DaemonStatusParams> {
+    JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_DAEMON_STATUS,
+        DaemonStatusParams::default(),
+    )
+}
+
+fn permissions_probe_request() -> JsonRpcRequest<PermissionsProbeParams> {
+    JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_PERMISSIONS_PROBE,
+        PermissionsProbeParams::default(),
+    )
+}
+
+fn input_release_all_request() -> JsonRpcRequest<InputReleaseAllParams> {
+    JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_INPUT_RELEASE_ALL,
+        InputReleaseAllParams::default(),
+    )
+}
+
+fn build_diagnostics_snapshot(
+    status: DaemonStatus,
+    permissions: PermissionsProbe,
+) -> DiagnosticsSnapshot {
+    let peer_count = status.peers.len();
+    let connected_peer_count = status.peers.iter().filter(|peer| peer.connected).count();
+
+    DiagnosticsSnapshot {
+        schema_version: DIAGNOSTICS_SNAPSHOT_SCHEMA_VERSION,
+        generated_by: "akrazctl",
+        tool_version: env!("CARGO_PKG_VERSION"),
+        daemon: DiagnosticsDaemonSnapshot {
+            daemon_version: status.daemon_version,
+            mode: status.mode,
+            protocol: status.protocol,
+            peer_count,
+            connected_peer_count,
+            capabilities: status.capabilities,
+        },
+        permissions: DiagnosticsPermissionsSnapshot {
+            adapter_name: permissions.adapter_name,
+            capabilities: permissions.capabilities,
+            issues: permissions.issues,
+        },
+        privacy: DiagnosticsPrivacySnapshot::default(),
+        unavailable_sections: DIAGNOSTICS_UNAVAILABLE_SECTIONS.to_vec(),
+    }
+}
+
 fn print_local_daemon_response<P>(
     endpoint: Option<IpcEndpoint>,
     request: &JsonRpcRequest<P>,
@@ -392,6 +486,50 @@ where
             ExitCode::FAILURE
         }
     }
+}
+
+fn call_daemon_json_rpc<T, P>(
+    client: &OsLocalIpcClient,
+    request: &JsonRpcRequest<P>,
+    label: &str,
+) -> Result<T, String>
+where
+    T: for<'de> serde::Deserialize<'de>,
+    P: serde::Serialize,
+{
+    let line = call_json_rpc(client, request).map_err(|error| format_daemon_call_error(&error))?;
+    parse_json_rpc_response(&line, label)
+}
+
+fn parse_json_rpc_response<T>(response_line: &str, label: &str) -> Result<T, String>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    let value: serde_json::Value = serde_json::from_str(response_line.trim_end())
+        .map_err(|error| format!("daemon returned invalid JSON: {error}"))?;
+
+    if value.get("error").is_some() {
+        let failure: JsonRpcFailure = serde_json::from_value(value)
+            .map_err(|error| format!("daemon returned an invalid error response: {error}"))?;
+        return Err(failure.error.message);
+    }
+
+    let success: JsonRpcSuccess<T> = serde_json::from_value(value)
+        .map_err(|error| format!("daemon returned an invalid {label} response: {error}"))?;
+    if success.jsonrpc != JSONRPC_VERSION {
+        return Err(format!(
+            "daemon returned unsupported JSON-RPC version: {}",
+            success.jsonrpc
+        ));
+    }
+    if success.id != LOCAL_REQUEST_ID {
+        return Err(format!(
+            "daemon returned unexpected response id: {}",
+            success.id
+        ));
+    }
+
+    Ok(success.result)
 }
 
 fn format_daemon_call_error(error: &IpcCallError) -> String {
@@ -509,6 +647,48 @@ struct IdentityForgetResult {
     peer_id: String,
 }
 
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsSnapshot {
+    schema_version: &'static str,
+    generated_by: &'static str,
+    tool_version: &'static str,
+    daemon: DiagnosticsDaemonSnapshot,
+    permissions: DiagnosticsPermissionsSnapshot,
+    privacy: DiagnosticsPrivacySnapshot,
+    unavailable_sections: Vec<&'static str>,
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsDaemonSnapshot {
+    daemon_version: String,
+    mode: akraz_ipc::ControlModeSnapshot,
+    protocol: ProtocolVersionSnapshot,
+    peer_count: usize,
+    connected_peer_count: usize,
+    capabilities: IpcPlatformCapabilities,
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsPermissionsSnapshot {
+    adapter_name: String,
+    capabilities: IpcPlatformCapabilities,
+    issues: Vec<PermissionIssue>,
+}
+
+#[derive(Debug, Default, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsPrivacySnapshot {
+    includes_actual_key_input: bool,
+    includes_text_input: bool,
+    includes_clipboard: bool,
+    includes_private_keys: bool,
+    includes_full_peer_public_keys: bool,
+    includes_full_file_paths: bool,
+}
+
 impl From<TrustedPeerIdentity> for IdentityTrustedPeer {
     fn from(peer: TrustedPeerIdentity) -> Self {
         Self {
@@ -534,7 +714,7 @@ where
             let value = args.next().ok_or(CliUsageError::MissingEndpointValue)?;
             endpoint = Some(IpcEndpoint::manual(value).map_err(CliUsageError::from)?);
         } else {
-            return Err(CliUsageError::UnknownStatusOption(argument));
+            return Err(CliUsageError::UnknownEndpointOption(argument));
         }
     }
 
@@ -1182,7 +1362,7 @@ enum CliUsageError {
         value: String,
         reason: String,
     },
-    UnknownStatusOption(String),
+    UnknownEndpointOption(String),
     UnknownIdentityOption(String),
     UnknownSessionOption(String),
     UnknownDaemonArgsOption(String),
@@ -1249,8 +1429,8 @@ impl Display for CliUsageError {
             } => {
                 write!(formatter, "invalid value for {option}: {value} ({reason})")
             }
-            Self::UnknownStatusOption(argument) => {
-                write!(formatter, "unknown status option: {argument}")
+            Self::UnknownEndpointOption(argument) => {
+                write!(formatter, "unknown endpoint option: {argument}")
             }
             Self::UnknownIdentityOption(argument) => {
                 write!(formatter, "unknown identity option: {argument}")
@@ -1327,22 +1507,27 @@ mod tests {
 
     use akraz_identity::FileIdentityStore;
     use akraz_ipc::{
-        IpcCallError, IpcEndpoint, IpcEndpointError, IpcEndpointKind, IpcTransportError,
-        JsonRpcRequest, LocalIpcClient,
+        ControlModeSnapshot, DaemonStatus, IpcCallError, IpcEndpoint, IpcEndpointError,
+        IpcEndpointKind, IpcPlatformCapabilities, IpcTransportError, JsonRpcError, JsonRpcFailure,
+        JsonRpcRequest, JsonRpcSuccess, LocalIpcClient, PeerStatus, PermissionIssue,
+        PermissionsProbe, ProtocolVersionSnapshot,
     };
 
     use super::{
         CliRuntimeError, CliUsageError, DaemonArgsOptions, EndpointOptions, IdentityForgetOptions,
         IdentityListOptions, IdentityShowOptions, IdentityTrustOptions, LOCAL_REQUEST_ID,
         METHOD_DAEMON_STATUS, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
-        SessionConnectOptions, build_daemon_client_with_resolver, build_pairing_identity_document,
-        default_pairing_capabilities, forget_trusted_peer_identity, format_daemon_call_error,
-        format_daemon_command_line, list_trusted_peer_identities, parse_daemon_args_options,
+        SessionConnectOptions, build_daemon_client_with_resolver, build_diagnostics_snapshot,
+        build_pairing_identity_document, daemon_status_request, default_pairing_capabilities,
+        forget_trusted_peer_identity, format_daemon_call_error, format_daemon_command_line,
+        input_release_all_request, list_trusted_peer_identities, parse_daemon_args_options,
         parse_endpoint_options, parse_identity_forget_options, parse_identity_list_options,
-        parse_identity_show_options, parse_identity_trust_options, parse_session_connect_options,
-        trust_pairing_identity_document,
+        parse_identity_show_options, parse_identity_trust_options, parse_json_rpc_response,
+        parse_session_connect_options, permissions_probe_request, trust_pairing_identity_document,
     };
-    use akraz_ipc::METHOD_INPUT_RELEASE_ALL;
+    use akraz_ipc::{
+        JSONRPC_ERROR_PARSE, JSONRPC_VERSION, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
+    };
 
     #[test]
     fn parses_endpoint_option() {
@@ -1374,7 +1559,7 @@ mod tests {
         );
         assert_eq!(
             parse_endpoint_options(["--bad"].map(String::from)),
-            Err(CliUsageError::UnknownStatusOption("--bad".to_string()))
+            Err(CliUsageError::UnknownEndpointOption("--bad".to_string()))
         );
     }
 
@@ -1906,26 +2091,126 @@ mod tests {
 
     #[test]
     fn status_request_uses_daemon_status_ipc_method() {
-        let request = JsonRpcRequest::new(
-            LOCAL_REQUEST_ID,
-            METHOD_DAEMON_STATUS,
-            akraz_ipc::DaemonStatusParams::default(),
-        );
+        let request = daemon_status_request();
 
         assert_eq!(request.id, LOCAL_REQUEST_ID);
         assert_eq!(request.method, METHOD_DAEMON_STATUS);
     }
 
     #[test]
+    fn permissions_probe_request_uses_permissions_probe_ipc_method() {
+        let request = permissions_probe_request();
+
+        assert_eq!(request.id, LOCAL_REQUEST_ID);
+        assert_eq!(request.method, METHOD_PERMISSIONS_PROBE);
+    }
+
+    #[test]
     fn release_all_request_uses_input_release_all_ipc_method() {
-        let request = JsonRpcRequest::new(
-            LOCAL_REQUEST_ID,
-            METHOD_INPUT_RELEASE_ALL,
-            akraz_ipc::InputReleaseAllParams::default(),
-        );
+        let request = input_release_all_request();
 
         assert_eq!(request.id, LOCAL_REQUEST_ID);
         assert_eq!(request.method, METHOD_INPUT_RELEASE_ALL);
+    }
+
+    #[test]
+    fn diagnostics_snapshot_redacts_peer_identifiers_and_sensitive_sections() {
+        let capabilities = IpcPlatformCapabilities {
+            can_capture_pointer: true,
+            can_capture_keyboard: true,
+            can_inject_pointer: true,
+            can_inject_keyboard: false,
+        };
+        let status = DaemonStatus {
+            daemon_version: "0.4.44".to_string(),
+            mode: ControlModeSnapshot::Remote,
+            protocol: ProtocolVersionSnapshot { major: 1, minor: 4 },
+            peers: vec![
+                PeerStatus {
+                    peer_id: "linux-laptop-secret-id".to_string(),
+                    display_name: "Alice Linux Laptop".to_string(),
+                    connected: true,
+                },
+                PeerStatus {
+                    peer_id: "windows-desktop-secret-id".to_string(),
+                    display_name: "Windows Desktop".to_string(),
+                    connected: false,
+                },
+            ],
+            capabilities: capabilities.clone(),
+        };
+        let permissions = PermissionsProbe {
+            adapter_name: "windows".to_string(),
+            capabilities,
+            issues: vec![PermissionIssue {
+                code: "inject-keyboard-unavailable".to_string(),
+                message: "keyboard injection is unavailable".to_string(),
+            }],
+        };
+
+        let snapshot = build_diagnostics_snapshot(status, permissions);
+        let encoded = serde_json::to_string(&snapshot).expect("diagnostics snapshot JSON");
+
+        assert_eq!(snapshot.schema_version, "akraz.diagnostics.snapshot/v1");
+        assert_eq!(snapshot.daemon.peer_count, 2);
+        assert_eq!(snapshot.daemon.connected_peer_count, 1);
+        assert_eq!(snapshot.permissions.adapter_name, "windows");
+        assert_eq!(snapshot.privacy, Default::default());
+        assert_eq!(
+            snapshot.unavailable_sections,
+            vec!["recentLogs", "screenTopology", "latencyHistogram"]
+        );
+        assert!(!encoded.contains("linux-laptop-secret-id"));
+        assert!(!encoded.contains("windows-desktop-secret-id"));
+        assert!(!encoded.contains("Alice Linux Laptop"));
+        assert!(!encoded.contains("Windows Desktop"));
+        assert!(!encoded.contains("privateKey"));
+        assert!(!encoded.contains("clipboard"));
+    }
+
+    #[test]
+    fn parses_json_rpc_response_success_and_failure_envelopes() {
+        let success = JsonRpcSuccess::new("local", ProtocolVersionSnapshot { major: 1, minor: 4 });
+        let success_line = serde_json::to_string(&success).expect("success JSON");
+        assert_eq!(
+            parse_json_rpc_response::<ProtocolVersionSnapshot>(&success_line, "protocol"),
+            Ok(ProtocolVersionSnapshot { major: 1, minor: 4 })
+        );
+
+        let failure = JsonRpcFailure::new(
+            Some("local".to_string()),
+            JsonRpcError::new(JSONRPC_ERROR_PARSE, "boom"),
+        );
+        let failure_line = serde_json::to_string(&failure).expect("failure JSON");
+        assert_eq!(
+            parse_json_rpc_response::<ProtocolVersionSnapshot>(&failure_line, "protocol"),
+            Err("boom".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_json_rpc_response_metadata() {
+        let wrong_id = serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": "other",
+            "result": { "major": 1, "minor": 4 }
+        })
+        .to_string();
+        assert_eq!(
+            parse_json_rpc_response::<ProtocolVersionSnapshot>(&wrong_id, "protocol"),
+            Err("daemon returned unexpected response id: other".to_string())
+        );
+
+        let wrong_version = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": LOCAL_REQUEST_ID,
+            "result": { "major": 1, "minor": 4 }
+        })
+        .to_string();
+        assert_eq!(
+            parse_json_rpc_response::<ProtocolVersionSnapshot>(&wrong_version, "protocol"),
+            Err("daemon returned unsupported JSON-RPC version: 1.0".to_string())
+        );
     }
 
     #[test]
