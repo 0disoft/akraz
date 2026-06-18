@@ -11,19 +11,17 @@ use akraz_identity::{
 };
 use akraz_ipc::{
     DaemonStatus, DaemonStatusParams, DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams,
-    InputReleaseAllParams, IpcCallError, IpcEndpoint, IpcEndpointError, IpcPlatformCapabilities,
-    IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess,
-    METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL,
-    METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
-    PermissionIssue, PermissionsProbe, PermissionsProbeParams, ProtocolVersionSnapshot,
-    SessionConnectParams, SessionDisconnectParams, call_json_rpc, resolve_current_default_endpoint,
+    InputReleaseAllParams, IpcCallError, IpcEndpoint, IpcEndpointError, IpcTransportError,
+    JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, METHOD_DAEMON_STATUS,
+    METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
+    METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe,
+    PermissionsProbeParams, SessionConnectParams, SessionDisconnectParams,
+    build_diagnostics_snapshot, call_json_rpc, resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 
 const LOCAL_REQUEST_ID: &str = "local";
 const DEFAULT_IDENTITY_DISPLAY_NAME: &str = "Akraz Device";
-const DIAGNOSTICS_SNAPSHOT_SCHEMA_VERSION: &str = "akraz.diagnostics.snapshot/v1";
-const DIAGNOSTICS_ALWAYS_UNAVAILABLE_SECTIONS: &[&str] = &["recentLogs", "latencyHistogram"];
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -263,6 +261,8 @@ fn print_diagnostics_snapshot(options: EndpointOptions) -> ExitCode {
         status,
         permissions,
         screen_topology,
+        "akrazctl",
+        env!("CARGO_PKG_VERSION"),
     ))
 }
 
@@ -450,41 +450,6 @@ fn input_release_all_request() -> JsonRpcRequest<InputReleaseAllParams> {
     )
 }
 
-fn build_diagnostics_snapshot(
-    status: DaemonStatus,
-    permissions: PermissionsProbe,
-    screen_topology: Option<DiagnosticsScreenTopology>,
-) -> DiagnosticsSnapshot {
-    let peer_count = status.peers.len();
-    let connected_peer_count = status.peers.iter().filter(|peer| peer.connected).count();
-    let mut unavailable_sections = DIAGNOSTICS_ALWAYS_UNAVAILABLE_SECTIONS.to_vec();
-    if screen_topology.is_none() {
-        unavailable_sections.insert(1, "screenTopology");
-    }
-
-    DiagnosticsSnapshot {
-        schema_version: DIAGNOSTICS_SNAPSHOT_SCHEMA_VERSION,
-        generated_by: "akrazctl",
-        tool_version: env!("CARGO_PKG_VERSION"),
-        daemon: DiagnosticsDaemonSnapshot {
-            daemon_version: status.daemon_version,
-            mode: status.mode,
-            protocol: status.protocol,
-            peer_count,
-            connected_peer_count,
-            capabilities: status.capabilities,
-        },
-        permissions: DiagnosticsPermissionsSnapshot {
-            adapter_name: permissions.adapter_name,
-            capabilities: permissions.capabilities,
-            issues: permissions.issues,
-        },
-        screen_topology,
-        privacy: DiagnosticsPrivacySnapshot::default(),
-        unavailable_sections,
-    }
-}
-
 fn print_local_daemon_response<P>(
     endpoint: Option<IpcEndpoint>,
     request: &JsonRpcRequest<P>,
@@ -669,50 +634,6 @@ struct IdentityTrustResult {
 struct IdentityForgetResult {
     forgotten: bool,
     peer_id: String,
-}
-
-#[derive(Debug, serde::Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct DiagnosticsSnapshot {
-    schema_version: &'static str,
-    generated_by: &'static str,
-    tool_version: &'static str,
-    daemon: DiagnosticsDaemonSnapshot,
-    permissions: DiagnosticsPermissionsSnapshot,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    screen_topology: Option<DiagnosticsScreenTopology>,
-    privacy: DiagnosticsPrivacySnapshot,
-    unavailable_sections: Vec<&'static str>,
-}
-
-#[derive(Debug, serde::Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct DiagnosticsDaemonSnapshot {
-    daemon_version: String,
-    mode: akraz_ipc::ControlModeSnapshot,
-    protocol: ProtocolVersionSnapshot,
-    peer_count: usize,
-    connected_peer_count: usize,
-    capabilities: IpcPlatformCapabilities,
-}
-
-#[derive(Debug, serde::Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct DiagnosticsPermissionsSnapshot {
-    adapter_name: String,
-    capabilities: IpcPlatformCapabilities,
-    issues: Vec<PermissionIssue>,
-}
-
-#[derive(Debug, Default, serde::Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct DiagnosticsPrivacySnapshot {
-    includes_actual_key_input: bool,
-    includes_text_input: bool,
-    includes_clipboard: bool,
-    includes_private_keys: bool,
-    includes_full_peer_public_keys: bool,
-    includes_full_file_paths: bool,
 }
 
 impl From<TrustedPeerIdentity> for IdentityTrustedPeer {
@@ -1537,7 +1458,7 @@ mod tests {
         IpcEndpointError, IpcEndpointKind, IpcPlatformCapabilities, IpcTransportError,
         JsonRpcError, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient,
         LogicalPointSnapshot, LogicalRectSnapshot, PeerStatus, PermissionIssue, PermissionsProbe,
-        ProtocolVersionSnapshot,
+        ProtocolVersionSnapshot, build_diagnostics_snapshot,
     };
 
     use super::{
@@ -1545,13 +1466,13 @@ mod tests {
         IdentityListOptions, IdentityShowOptions, IdentityTrustOptions, LOCAL_REQUEST_ID,
         METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_SESSION_CONNECT,
         METHOD_SESSION_DISCONNECT, SessionConnectOptions, build_daemon_client_with_resolver,
-        build_diagnostics_snapshot, build_pairing_identity_document, daemon_status_request,
-        default_pairing_capabilities, diagnostics_screen_topology_request,
-        forget_trusted_peer_identity, format_daemon_call_error, format_daemon_command_line,
-        input_release_all_request, list_trusted_peer_identities, parse_daemon_args_options,
-        parse_endpoint_options, parse_identity_forget_options, parse_identity_list_options,
-        parse_identity_show_options, parse_identity_trust_options, parse_json_rpc_response,
-        parse_session_connect_options, permissions_probe_request, trust_pairing_identity_document,
+        build_pairing_identity_document, daemon_status_request, default_pairing_capabilities,
+        diagnostics_screen_topology_request, forget_trusted_peer_identity,
+        format_daemon_call_error, format_daemon_command_line, input_release_all_request,
+        list_trusted_peer_identities, parse_daemon_args_options, parse_endpoint_options,
+        parse_identity_forget_options, parse_identity_list_options, parse_identity_show_options,
+        parse_identity_trust_options, parse_json_rpc_response, parse_session_connect_options,
+        permissions_probe_request, trust_pairing_identity_document,
     };
     use akraz_ipc::{
         JSONRPC_ERROR_PARSE, JSONRPC_VERSION, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
@@ -2158,7 +2079,7 @@ mod tests {
             can_inject_keyboard: false,
         };
         let status = DaemonStatus {
-            daemon_version: "0.4.46".to_string(),
+            daemon_version: "0.4.47".to_string(),
             mode: ControlModeSnapshot::Remote,
             protocol: ProtocolVersionSnapshot { major: 1, minor: 4 },
             peers: vec![
@@ -2193,7 +2114,8 @@ mod tests {
             },
         };
 
-        let snapshot = build_diagnostics_snapshot(status, permissions, Some(topology));
+        let snapshot =
+            build_diagnostics_snapshot(status, permissions, Some(topology), "akrazctl", "0.4.47");
         let encoded = serde_json::to_string(&snapshot).expect("diagnostics snapshot JSON");
 
         assert_eq!(snapshot.schema_version, "akraz.diagnostics.snapshot/v1");
@@ -2215,7 +2137,7 @@ mod tests {
         assert_eq!(snapshot.privacy, Default::default());
         assert_eq!(
             snapshot.unavailable_sections,
-            vec!["recentLogs", "latencyHistogram"]
+            vec!["recentLogs".to_string(), "latencyHistogram".to_string()]
         );
         assert!(!encoded.contains("linux-laptop-secret-id"));
         assert!(!encoded.contains("windows-desktop-secret-id"));
@@ -2234,7 +2156,7 @@ mod tests {
             can_inject_keyboard: true,
         };
         let status = DaemonStatus {
-            daemon_version: "0.4.46".to_string(),
+            daemon_version: "0.4.47".to_string(),
             mode: ControlModeSnapshot::Local,
             protocol: ProtocolVersionSnapshot { major: 1, minor: 4 },
             peers: Vec::new(),
@@ -2246,13 +2168,17 @@ mod tests {
             issues: Vec::new(),
         };
 
-        let snapshot = build_diagnostics_snapshot(status, permissions, None);
+        let snapshot = build_diagnostics_snapshot(status, permissions, None, "akrazctl", "0.4.47");
         let encoded = serde_json::to_string(&snapshot).expect("diagnostics snapshot JSON");
 
         assert_eq!(snapshot.screen_topology, None);
         assert_eq!(
             snapshot.unavailable_sections,
-            vec!["recentLogs", "screenTopology", "latencyHistogram"]
+            vec![
+                "recentLogs".to_string(),
+                "screenTopology".to_string(),
+                "latencyHistogram".to_string()
+            ]
         );
         assert!(!encoded.contains("pointerPosition"));
         assert!(!encoded.contains("virtualScreenBounds"));

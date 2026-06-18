@@ -37,6 +37,58 @@ export interface PermissionsProbe {
   issues: PermissionIssue[];
 }
 
+export interface LogicalPointSnapshot {
+  x: number;
+  y: number;
+}
+
+export interface LogicalRectSnapshot {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface DiagnosticsScreenTopology {
+  pointerPosition: LogicalPointSnapshot;
+  virtualScreenBounds: LogicalRectSnapshot;
+}
+
+export interface DiagnosticsDaemonSnapshot {
+  daemonVersion: string;
+  mode: ControlMode;
+  protocol: ProtocolVersion;
+  peerCount: number;
+  connectedPeerCount: number;
+  capabilities: PlatformCapabilities;
+}
+
+export interface DiagnosticsPermissionsSnapshot {
+  adapterName: string;
+  capabilities: PlatformCapabilities;
+  issues: PermissionIssue[];
+}
+
+export interface DiagnosticsPrivacySnapshot {
+  includesActualKeyInput: boolean;
+  includesTextInput: boolean;
+  includesClipboard: boolean;
+  includesPrivateKeys: boolean;
+  includesFullPeerPublicKeys: boolean;
+  includesFullFilePaths: boolean;
+}
+
+export interface DiagnosticsSnapshot {
+  schemaVersion: string;
+  generatedBy: string;
+  toolVersion: string;
+  daemon: DiagnosticsDaemonSnapshot;
+  permissions: DiagnosticsPermissionsSnapshot;
+  screenTopology?: DiagnosticsScreenTopology;
+  privacy: DiagnosticsPrivacySnapshot;
+  unavailableSections: string[];
+}
+
 export type DaemonLifecyclePhase =
   | "not_running"
   | "starting"

@@ -9,12 +9,14 @@ use std::time::Duration;
 
 use akraz_identity::{FileIdentityStore, PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_ipc::{
-    DaemonStatus, DaemonStatusParams, InputReleaseAllParams, InputReleaseAllResult, IpcCallError,
-    IpcEndpoint, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
-    JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_STATUS, METHOD_INPUT_RELEASE_ALL,
-    METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
-    PermissionsProbe, PermissionsProbeParams, SessionConnectResult, SessionDisconnectParams,
-    SessionDisconnectResult, call_json_rpc, resolve_current_default_endpoint,
+    DaemonStatus, DaemonStatusParams, DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams,
+    DiagnosticsSnapshot, InputReleaseAllParams, InputReleaseAllResult, IpcCallError, IpcEndpoint,
+    IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess,
+    LocalIpcClient, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+    METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
+    METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe, PermissionsProbeParams,
+    SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
+    build_diagnostics_snapshot, call_json_rpc, resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 use serde::{Deserialize, Serialize};
@@ -71,6 +73,7 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             permissions_probe,
+            diagnostics_snapshot,
             daemon_start,
             daemon_stop,
             session_connect,
@@ -289,6 +292,13 @@ async fn permissions_probe() -> Result<PermissionsProbe, String> {
     tauri::async_runtime::spawn_blocking(call_daemon_permissions_probe)
         .await
         .map_err(|error| format!("permissions probe task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(call_daemon_diagnostics_snapshot)
+        .await
+        .map_err(|error| format!("diagnostics snapshot task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -790,6 +800,61 @@ fn call_daemon_permissions_probe() -> Result<PermissionsProbe, String> {
         .map_err(|error| classify_daemon_call_error(&error, client.endpoint()).to_user_message())?;
 
     parse_json_rpc_response::<PermissionsProbe>(&response_line, "permissions probe")
+}
+
+fn call_daemon_diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    let status = call_daemon_json_rpc::<DaemonStatus, _>(
+        &client,
+        &JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_DAEMON_STATUS,
+            DaemonStatusParams::default(),
+        ),
+        "status",
+    )?;
+    let permissions = call_daemon_json_rpc::<PermissionsProbe, _>(
+        &client,
+        &JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_PERMISSIONS_PROBE,
+            PermissionsProbeParams::default(),
+        ),
+        "permissions probe",
+    )?;
+    let screen_topology = call_daemon_json_rpc::<DiagnosticsScreenTopology, _>(
+        &client,
+        &JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+            DiagnosticsScreenTopologyParams::default(),
+        ),
+        "screen topology",
+    )
+    .ok();
+
+    Ok(build_diagnostics_snapshot(
+        status,
+        permissions,
+        screen_topology,
+        "akraz-app",
+        env!("CARGO_PKG_VERSION"),
+    ))
+}
+
+fn call_daemon_json_rpc<T, P>(
+    client: &OsLocalIpcClient,
+    request: &JsonRpcRequest<P>,
+    label: &str,
+) -> Result<T, String>
+where
+    T: for<'de> Deserialize<'de>,
+    P: Serialize,
+{
+    let response_line = call_json_rpc(client, request)
+        .map_err(|error| classify_daemon_call_error(&error, client.endpoint()).to_user_message())?;
+
+    parse_json_rpc_response::<T>(&response_line, label)
 }
 
 fn connect_daemon_session(
@@ -1527,10 +1592,11 @@ mod tests {
 
     use akraz_identity::FileIdentityStore;
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonStatus, InputReleaseAllResult, IpcEndpoint,
-        IpcPlatformCapabilities, IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcSuccess,
-        PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectResult,
-        SessionStatus, to_json_line,
+        ControlModeSnapshot, DaemonStatus, DiagnosticsScreenTopology, InputReleaseAllResult,
+        IpcEndpoint, IpcPlatformCapabilities, IpcTransportError, JsonRpcError, JsonRpcFailure,
+        JsonRpcSuccess, LogicalPointSnapshot, LogicalRectSnapshot, PermissionIssue,
+        PermissionsProbe, ProtocolVersionSnapshot, SessionConnectResult, SessionStatus,
+        to_json_line,
     };
 
     use super::{
@@ -1613,6 +1679,28 @@ mod tests {
         assert_eq!(
             parse_json_rpc_response::<PermissionsProbe>(&line, "permissions probe"),
             Ok(probe)
+        );
+    }
+
+    #[test]
+    fn parses_diagnostics_screen_topology_success_response() {
+        let topology = DiagnosticsScreenTopology {
+            pointer_position: LogicalPointSnapshot { x: 1919, y: 540 },
+            virtual_screen_bounds: LogicalRectSnapshot {
+                x: -1920,
+                y: 0,
+                width: 3840,
+                height: 1080,
+            },
+        };
+        let line = match to_json_line(&JsonRpcSuccess::new("tauri", topology.clone())) {
+            Ok(line) => line,
+            Err(error) => panic!("expected diagnostics screen topology JSON: {error}"),
+        };
+
+        assert_eq!(
+            parse_json_rpc_response::<DiagnosticsScreenTopology>(&line, "screen topology"),
+            Ok(topology)
         );
     }
 

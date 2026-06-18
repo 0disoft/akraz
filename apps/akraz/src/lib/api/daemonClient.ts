@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   DaemonLifecycleSnapshot,
   DaemonStartOptions,
+  DiagnosticsSnapshot,
   PermissionsProbe,
   SessionConnectParams,
 } from "./types";
@@ -14,6 +15,10 @@ export const daemonClient = {
 
   probePermissions(): Promise<PermissionsProbe> {
     return invoke<PermissionsProbe>("permissions_probe");
+  },
+
+  diagnosticsSnapshot(): Promise<DiagnosticsSnapshot> {
+    return invoke<DiagnosticsSnapshot>("diagnostics_snapshot");
   },
 
   start(options: DaemonStartOptions = {}): Promise<DaemonLifecycleSnapshot> {
