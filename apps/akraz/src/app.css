@@ -270,6 +270,163 @@ h3 {
   gap: 10px;
 }
 
+.layout-editor {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.layout-board {
+  display: grid;
+  grid-template-columns: minmax(92px, 0.8fr) minmax(180px, 1.35fr) minmax(92px, 0.8fr);
+  grid-template-rows: minmax(72px, auto) minmax(132px, auto) minmax(72px, auto);
+  gap: 8px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #e0d4be;
+  border-radius: 8px;
+  background: #fffaf0;
+}
+
+.layout-edge-zone {
+  display: grid;
+  min-width: 0;
+  min-height: 72px;
+  place-items: center;
+  padding: 8px;
+  border: 1px dashed #cbb996;
+  border-radius: 8px;
+  color: #74684f;
+  background: #fffdf8;
+  cursor: pointer;
+}
+
+.layout-edge-zone:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.layout-edge-zone.active-edge {
+  border-style: solid;
+  border-color: #2f6f43;
+  background: #eef8ed;
+}
+
+.layout-edge-zone:focus-visible,
+.layout-binding-tabs button:focus-visible {
+  outline: 3px solid #c96b4b;
+  outline-offset: 3px;
+}
+
+.layout-edge-top {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.layout-edge-left {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.layout-edge-right {
+  grid-column: 3;
+  grid-row: 2;
+}
+
+.layout-edge-bottom {
+  grid-column: 2;
+  grid-row: 3;
+}
+
+.local-screen-tile {
+  display: grid;
+  grid-column: 2;
+  grid-row: 2;
+  min-width: 0;
+  min-height: 132px;
+  place-items: center;
+  align-content: center;
+  gap: 4px;
+  padding: 16px;
+  border: 2px solid #2e3a32;
+  border-radius: 8px;
+  color: #20242b;
+  background: #f5f1e8;
+  text-align: center;
+}
+
+.local-screen-tile span,
+.remote-screen-tile span {
+  color: #687280;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.local-screen-tile strong,
+.remote-screen-tile strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.remote-screen-tile {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid #2f6f43;
+  border-radius: 8px;
+  color: #20242b;
+  background: #eef8ed;
+  text-align: center;
+  cursor: grab;
+}
+
+.remote-screen-tile:active {
+  cursor: grabbing;
+}
+
+.layout-binding-tabs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+  gap: 8px;
+}
+
+.layout-binding-tabs button {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid #d8cab1;
+  border-radius: 8px;
+  color: #20242b;
+  background: #fffdf8;
+  text-align: start;
+  cursor: pointer;
+}
+
+.layout-binding-tabs button.active {
+  border-color: #2f6f43;
+  background: #eef8ed;
+}
+
+.layout-binding-tabs button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.layout-binding-tabs strong,
+.layout-binding-tabs span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.layout-binding-tabs span {
+  color: #687280;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
 .manual-address-list {
   display: grid;
   gap: 10px;
@@ -784,6 +941,20 @@ h3 {
   .session-row,
   .manual-address-row {
     grid-template-columns: 1fr;
+  }
+
+  .layout-board {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+  }
+
+  .layout-edge-top,
+  .layout-edge-left,
+  .layout-edge-right,
+  .layout-edge-bottom,
+  .local-screen-tile {
+    grid-column: 1;
+    grid-row: auto;
   }
 
   .icon-button {

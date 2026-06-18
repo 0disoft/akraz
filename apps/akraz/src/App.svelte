@@ -72,6 +72,8 @@
   let sessionLocalDeviceId = $state('');
   let sessionAddress = $state('');
   let diagnosticsCopyMessage = $state('');
+  let selectedLayoutBindingIndex = $state(0);
+  let draggedLayoutBindingIndex = $state<number | null>(null);
 
   onMount(() => {
     void daemonState.refresh();
@@ -141,6 +143,82 @@
 
   function formatRect(rect: LogicalRectSnapshot) {
     return `${Math.round(rect.width)}×${Math.round(rect.height)} @ ${Math.round(rect.x)}, ${Math.round(rect.y)}`;
+  }
+
+  function oppositeEdge(edge: ScreenEdge): ScreenEdge {
+    if (edge === 'left') {
+      return 'right';
+    }
+    if (edge === 'right') {
+      return 'left';
+    }
+    if (edge === 'top') {
+      return 'bottom';
+    }
+    return 'top';
+  }
+
+  function selectedLayoutBinding() {
+    return layoutState.layout.edgeBindings[selectedLayoutBindingIndex] ?? null;
+  }
+
+  function selectedLayoutBindingPeerLabel() {
+    const binding = selectedLayoutBinding();
+    if (!binding) {
+      return '기기 선택';
+    }
+
+    const peer = identityState.trustedPeers.find((trustedPeer) => trustedPeer.peerId === binding.peerId.trim());
+    if (peer) {
+      return peer.displayName;
+    }
+
+    return binding.peerId.trim().length > 0 ? binding.peerId : '기기 ID 없음';
+  }
+
+  function selectLayoutBinding(index: number) {
+    selectedLayoutBindingIndex = Math.max(0, Math.min(index, layoutState.layout.edgeBindings.length - 1));
+  }
+
+  function addLayoutBinding() {
+    const nextIndex = layoutState.layout.edgeBindings.length;
+    layoutState.addEdgeBinding();
+    selectedLayoutBindingIndex = nextIndex;
+  }
+
+  function removeLayoutBinding(index: number) {
+    layoutState.removeEdgeBinding(index);
+    selectedLayoutBindingIndex = Math.max(0, Math.min(selectedLayoutBindingIndex, layoutState.layout.edgeBindings.length - 2));
+  }
+
+  function moveSelectedLayoutBinding(localEdge: ScreenEdge) {
+    const binding = selectedLayoutBinding();
+    if (!binding || layoutState.isBusy) {
+      return;
+    }
+
+    layoutState.moveEdgeBinding(selectedLayoutBindingIndex, localEdge, oppositeEdge(localEdge));
+  }
+
+  function startLayoutDrag(index: number) {
+    selectedLayoutBindingIndex = index;
+    draggedLayoutBindingIndex = index;
+  }
+
+  function dropLayoutBinding(event: DragEvent, localEdge: ScreenEdge) {
+    event.preventDefault();
+    const bindingIndex = draggedLayoutBindingIndex ?? selectedLayoutBindingIndex;
+    if (!layoutState.layout.edgeBindings[bindingIndex] || layoutState.isBusy) {
+      return;
+    }
+
+    selectedLayoutBindingIndex = bindingIndex;
+    layoutState.moveEdgeBinding(bindingIndex, localEdge, oppositeEdge(localEdge));
+    draggedLayoutBindingIndex = null;
+  }
+
+  function endLayoutDrag() {
+    draggedLayoutBindingIndex = null;
   }
 
   function identityMessage() {
@@ -737,6 +815,119 @@
         <span class:error-text={layoutState.lastError}>{layoutMessage()}</span>
       </div>
 
+      <div class="layout-editor" aria-label="화면 배치 편집">
+        <div class="layout-board">
+          <button
+            type="button"
+            class:active-edge={selectedLayoutBinding()?.localEdge === 'top'}
+            class="layout-edge-zone layout-edge-top"
+            draggable={selectedLayoutBinding()?.localEdge === 'top' && !layoutState.isBusy}
+            disabled={layoutState.isBusy || layoutState.layout.edgeBindings.length === 0}
+            ondragstart={() => startLayoutDrag(selectedLayoutBindingIndex)}
+            ondragend={endLayoutDrag}
+            ondragover={(event) => event.preventDefault()}
+            ondrop={(event) => dropLayoutBinding(event, 'top')}
+            onclick={() => moveSelectedLayoutBinding('top')}
+          >
+            {#if selectedLayoutBinding()?.localEdge === 'top'}
+              <span class="remote-screen-tile">
+                <strong>{selectedLayoutBindingPeerLabel()}</strong>
+                <span>{edgeLabels[selectedLayoutBinding()?.remoteEdge ?? 'bottom']}에서 연결</span>
+              </span>
+            {:else}
+              <span>{edgeLabels.top}</span>
+            {/if}
+          </button>
+
+          <button
+            type="button"
+            class:active-edge={selectedLayoutBinding()?.localEdge === 'left'}
+            class="layout-edge-zone layout-edge-left"
+            draggable={selectedLayoutBinding()?.localEdge === 'left' && !layoutState.isBusy}
+            disabled={layoutState.isBusy || layoutState.layout.edgeBindings.length === 0}
+            ondragstart={() => startLayoutDrag(selectedLayoutBindingIndex)}
+            ondragend={endLayoutDrag}
+            ondragover={(event) => event.preventDefault()}
+            ondrop={(event) => dropLayoutBinding(event, 'left')}
+            onclick={() => moveSelectedLayoutBinding('left')}
+          >
+            {#if selectedLayoutBinding()?.localEdge === 'left'}
+              <span class="remote-screen-tile">
+                <strong>{selectedLayoutBindingPeerLabel()}</strong>
+                <span>{edgeLabels[selectedLayoutBinding()?.remoteEdge ?? 'right']}에서 연결</span>
+              </span>
+            {:else}
+              <span>{edgeLabels.left}</span>
+            {/if}
+          </button>
+
+          <div class="local-screen-tile">
+            <span>내 화면</span>
+            <strong>{layoutState.topology ? formatRect(layoutState.topology.virtualScreenBounds) : '로컬'}</strong>
+          </div>
+
+          <button
+            type="button"
+            class:active-edge={selectedLayoutBinding()?.localEdge === 'right'}
+            class="layout-edge-zone layout-edge-right"
+            draggable={selectedLayoutBinding()?.localEdge === 'right' && !layoutState.isBusy}
+            disabled={layoutState.isBusy || layoutState.layout.edgeBindings.length === 0}
+            ondragstart={() => startLayoutDrag(selectedLayoutBindingIndex)}
+            ondragend={endLayoutDrag}
+            ondragover={(event) => event.preventDefault()}
+            ondrop={(event) => dropLayoutBinding(event, 'right')}
+            onclick={() => moveSelectedLayoutBinding('right')}
+          >
+            {#if selectedLayoutBinding()?.localEdge === 'right'}
+              <span class="remote-screen-tile">
+                <strong>{selectedLayoutBindingPeerLabel()}</strong>
+                <span>{edgeLabels[selectedLayoutBinding()?.remoteEdge ?? 'left']}에서 연결</span>
+              </span>
+            {:else}
+              <span>{edgeLabels.right}</span>
+            {/if}
+          </button>
+
+          <button
+            type="button"
+            class:active-edge={selectedLayoutBinding()?.localEdge === 'bottom'}
+            class="layout-edge-zone layout-edge-bottom"
+            draggable={selectedLayoutBinding()?.localEdge === 'bottom' && !layoutState.isBusy}
+            disabled={layoutState.isBusy || layoutState.layout.edgeBindings.length === 0}
+            ondragstart={() => startLayoutDrag(selectedLayoutBindingIndex)}
+            ondragend={endLayoutDrag}
+            ondragover={(event) => event.preventDefault()}
+            ondrop={(event) => dropLayoutBinding(event, 'bottom')}
+            onclick={() => moveSelectedLayoutBinding('bottom')}
+          >
+            {#if selectedLayoutBinding()?.localEdge === 'bottom'}
+              <span class="remote-screen-tile">
+                <strong>{selectedLayoutBindingPeerLabel()}</strong>
+                <span>{edgeLabels[selectedLayoutBinding()?.remoteEdge ?? 'top']}에서 연결</span>
+              </span>
+            {:else}
+              <span>{edgeLabels.bottom}</span>
+            {/if}
+          </button>
+        </div>
+
+        {#if layoutState.layout.edgeBindings.length > 0}
+          <div class="layout-binding-tabs" aria-label="배치할 기기">
+            {#each layoutState.layout.edgeBindings as binding, index}
+              <button
+                type="button"
+                class:active={selectedLayoutBindingIndex === index}
+                disabled={layoutState.isBusy}
+                onclick={() => selectLayoutBinding(index)}
+              >
+                <strong>{binding.peerId.trim().length > 0 ? binding.peerId : `기기 ${index + 1}`}</strong>
+                <span>{edgeLabels[binding.localEdge]} ↔ {edgeLabels[binding.remoteEdge]}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+
       {#if layoutState.layout.edgeBindings.length === 0}
         <p class="muted">화면 끝을 넘길 기기를 추가할 수 있어.</p>
       {:else}
@@ -797,7 +988,7 @@
                 class="icon-button"
                 aria-label="연결 삭제"
                 disabled={layoutState.isBusy}
-                onclick={() => layoutState.removeEdgeBinding(index)}
+                onclick={() => removeLayoutBinding(index)}
               >
                 ×
               </button>
@@ -833,7 +1024,7 @@
           type="button"
           class="control-button secondary"
           disabled={layoutState.isBusy}
-          onclick={() => layoutState.addEdgeBinding()}
+          onclick={addLayoutBinding}
         >
           추가
         </button>

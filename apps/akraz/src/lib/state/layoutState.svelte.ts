@@ -67,6 +67,21 @@ export class LayoutState {
     this.saved = false;
   }
 
+  moveEdgeBinding(index: number, localEdge: ScreenEdge, remoteEdge: ScreenEdge) {
+    this.layout.edgeBindings = this.layout.edgeBindings.map((binding, itemIndex) => {
+      if (itemIndex !== index) {
+        return binding;
+      }
+
+      return {
+        ...binding,
+        localEdge,
+        remoteEdge,
+      };
+    });
+    this.saved = false;
+  }
+
   async load(): Promise<LayoutSettings | null> {
     let loadedLayout: LayoutSettings | null = null;
     await this.run("load", async () => {
