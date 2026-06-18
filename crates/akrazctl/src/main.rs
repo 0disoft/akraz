@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use akraz_identity::{
     FileIdentityStore, IdentityDocumentError, IdentityStoreError, PairingIdentityDocument,
+    TrustedPeerIdentity,
 };
 use akraz_ipc::{
     DaemonStatusParams, InputReleaseAllParams, IpcCallError, IpcEndpoint, IpcEndpointError,
@@ -84,8 +85,22 @@ fn main() -> ExitCode {
                     ExitCode::from(2)
                 }
             },
+            Some("list") => match parse_identity_list_options(args) {
+                Ok(options) => print_identity_list(options),
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            },
             Some("trust") => match parse_identity_trust_options(args) {
                 Ok(options) => print_identity_trust(options),
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            },
+            Some("forget") => match parse_identity_forget_options(args) {
+                Ok(options) => print_identity_forget(options),
                 Err(error) => {
                     eprintln!("{error}");
                     ExitCode::from(2)
@@ -130,7 +145,7 @@ fn main() -> ExitCode {
         }
         None => {
             eprintln!(
-                "usage: akrazctl <status|permissions probe|input release-all|identity show|identity trust|session connect|session disconnect|daemon-args|--version>"
+                "usage: akrazctl <status|permissions probe|input release-all|identity show|identity list|identity trust|identity forget|session connect|session disconnect|daemon-args|--version>"
             );
             ExitCode::from(2)
         }
@@ -210,8 +225,28 @@ fn print_identity_show(options: IdentityShowOptions) -> ExitCode {
     }
 }
 
+fn print_identity_list(options: IdentityListOptions) -> ExitCode {
+    match list_trusted_peer_identities(&options) {
+        Ok(result) => print_json_pretty(&result),
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn print_identity_trust(options: IdentityTrustOptions) -> ExitCode {
     match trust_pairing_identity_document(&options) {
+        Ok(result) => print_json_pretty(&result),
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn print_identity_forget(options: IdentityForgetOptions) -> ExitCode {
+    match forget_trusted_peer_identity(&options) {
         Ok(result) => print_json_pretty(&result),
         Err(error) => {
             eprintln!("{error}");
@@ -254,6 +289,23 @@ fn build_pairing_identity_document(
     ))
 }
 
+fn list_trusted_peer_identities(
+    options: &IdentityListOptions,
+) -> Result<IdentityTrustedPeersResult, CliRuntimeError> {
+    let store = FileIdentityStore::new(&options.identity_store);
+    let peers = store
+        .list_trusted_peers()
+        .map_err(|source| CliRuntimeError::IdentityStore {
+            operation: "list trusted peers",
+            path: options.identity_store.clone(),
+            source: Box::new(source),
+        })?;
+
+    Ok(IdentityTrustedPeersResult {
+        peers: peers.into_iter().map(IdentityTrustedPeer::from).collect(),
+    })
+}
+
 fn trust_pairing_identity_document(
     options: &IdentityTrustOptions,
 ) -> Result<IdentityTrustResult, CliRuntimeError> {
@@ -290,6 +342,24 @@ fn trust_pairing_identity_document(
         display_name: peer.display_name().to_string(),
         fingerprint: peer.fingerprint().to_string(),
         capabilities: peer.capabilities(),
+    })
+}
+
+fn forget_trusted_peer_identity(
+    options: &IdentityForgetOptions,
+) -> Result<IdentityForgetResult, CliRuntimeError> {
+    let store = FileIdentityStore::new(&options.identity_store);
+    store
+        .remove_trusted_peer(&options.peer_id)
+        .map_err(|source| CliRuntimeError::IdentityStore {
+            operation: "remove trusted peer",
+            path: options.identity_store.clone(),
+            source: Box::new(source),
+        })?;
+
+    Ok(IdentityForgetResult {
+        forgotten: true,
+        peer_id: options.peer_id.clone(),
     })
 }
 
@@ -390,10 +460,36 @@ struct IdentityShowOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct IdentityListOptions {
+    identity_store: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct IdentityTrustOptions {
     identity_store: PathBuf,
     identity_display_name: String,
     peer_file: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdentityForgetOptions {
+    identity_store: PathBuf,
+    peer_id: String,
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct IdentityTrustedPeer {
+    peer_id: String,
+    display_name: String,
+    fingerprint: String,
+    capabilities: CapabilityFlags,
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct IdentityTrustedPeersResult {
+    peers: Vec<IdentityTrustedPeer>,
 }
 
 #[derive(Debug, serde::Serialize, PartialEq, Eq)]
@@ -404,6 +500,24 @@ struct IdentityTrustResult {
     display_name: String,
     fingerprint: String,
     capabilities: CapabilityFlags,
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct IdentityForgetResult {
+    forgotten: bool,
+    peer_id: String,
+}
+
+impl From<TrustedPeerIdentity> for IdentityTrustedPeer {
+    fn from(peer: TrustedPeerIdentity) -> Self {
+        Self {
+            peer_id: peer.peer_id().to_string(),
+            display_name: peer.display_name().to_string(),
+            fingerprint: peer.fingerprint().to_string(),
+            capabilities: peer.capabilities(),
+        }
+    }
 }
 
 fn parse_endpoint_options<I>(args: I) -> Result<EndpointOptions, CliUsageError>
@@ -480,6 +594,38 @@ where
     })
 }
 
+fn parse_identity_list_options<I>(args: I) -> Result<IdentityListOptions, CliUsageError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut identity_store = None;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        if let Some(value) = argument.strip_prefix("--identity-store=") {
+            set_once_path_option(
+                "--identity-store",
+                &mut identity_store,
+                normalize_path_arg("--identity-store", value)?,
+            )?;
+        } else if argument == "--identity-store" {
+            let value = args
+                .next()
+                .ok_or(CliUsageError::MissingIdentityOptionValue(
+                    "--identity-store",
+                ))?;
+            let value = normalize_path_arg("--identity-store", &value)?;
+            set_once_path_option("--identity-store", &mut identity_store, value)?;
+        } else {
+            return Err(CliUsageError::UnknownIdentityOption(argument));
+        }
+    }
+
+    Ok(IdentityListOptions {
+        identity_store: identity_store.ok_or(CliUsageError::MissingIdentityStore)?,
+    })
+}
+
 fn parse_identity_trust_options<I>(args: I) -> Result<IdentityTrustOptions, CliUsageError>
 where
     I: IntoIterator<Item = String>,
@@ -544,6 +690,52 @@ where
         identity_display_name: identity_display_name
             .unwrap_or_else(|| DEFAULT_IDENTITY_DISPLAY_NAME.to_string()),
         peer_file: peer_file.ok_or(CliUsageError::MissingIdentityPeerFile)?,
+    })
+}
+
+fn parse_identity_forget_options<I>(args: I) -> Result<IdentityForgetOptions, CliUsageError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut identity_store = None;
+    let mut peer_id = None;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        if let Some(value) = argument.strip_prefix("--identity-store=") {
+            set_once_path_option(
+                "--identity-store",
+                &mut identity_store,
+                normalize_path_arg("--identity-store", value)?,
+            )?;
+        } else if argument == "--identity-store" {
+            let value = args
+                .next()
+                .ok_or(CliUsageError::MissingIdentityOptionValue(
+                    "--identity-store",
+                ))?;
+            let value = normalize_path_arg("--identity-store", &value)?;
+            set_once_path_option("--identity-store", &mut identity_store, value)?;
+        } else if let Some(value) = argument.strip_prefix("--peer-id=") {
+            set_once_identity_string_option(
+                "--peer-id",
+                &mut peer_id,
+                normalize_identity_peer_id_arg(value)?,
+            )?;
+        } else if argument == "--peer-id" {
+            let value = args
+                .next()
+                .ok_or(CliUsageError::MissingIdentityOptionValue("--peer-id"))?;
+            let value = normalize_identity_peer_id_arg(&value)?;
+            set_once_identity_string_option("--peer-id", &mut peer_id, value)?;
+        } else {
+            return Err(CliUsageError::UnknownIdentityOption(argument));
+        }
+    }
+
+    Ok(IdentityForgetOptions {
+        identity_store: identity_store.ok_or(CliUsageError::MissingIdentityStore)?,
+        peer_id: peer_id.ok_or(CliUsageError::MissingIdentityPeerId)?,
     })
 }
 
@@ -882,6 +1074,26 @@ fn normalize_display_name_arg(value: &str) -> Result<String, CliUsageError> {
     Ok(value.to_string())
 }
 
+fn normalize_identity_peer_id_arg(value: &str) -> Result<String, CliUsageError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(CliUsageError::InvalidIdentityOptionValue {
+            option: "--peer-id",
+            value: value.to_string(),
+            reason: "peer id must not be empty".to_string(),
+        });
+    }
+    if value.contains(':') || value.contains('@') {
+        return Err(CliUsageError::InvalidIdentityOptionValue {
+            option: "--peer-id",
+            value: value.to_string(),
+            reason: "peer id must not contain ':' or '@'".to_string(),
+        });
+    }
+
+    Ok(value.to_string())
+}
+
 fn normalize_shell_safe_arg(
     option_name: &'static str,
     value: &str,
@@ -952,6 +1164,7 @@ enum CliUsageError {
     MissingSessionOptionValue(&'static str),
     MissingIdentityStore,
     MissingIdentityPeerFile,
+    MissingIdentityPeerId,
     MissingSessionConnectPeerId,
     MissingSessionConnectLocalDeviceId,
     MissingSessionConnectAddress,
@@ -999,6 +1212,9 @@ impl Display for CliUsageError {
             }
             Self::MissingIdentityPeerFile => {
                 formatter.write_str("identity trust requires --peer-file")
+            }
+            Self::MissingIdentityPeerId => {
+                formatter.write_str("identity forget requires --peer-id")
             }
             Self::MissingSessionConnectPeerId => {
                 formatter.write_str("session connect requires --peer-id")
@@ -1116,12 +1332,14 @@ mod tests {
     };
 
     use super::{
-        CliRuntimeError, CliUsageError, DaemonArgsOptions, EndpointOptions, IdentityShowOptions,
-        IdentityTrustOptions, LOCAL_REQUEST_ID, METHOD_DAEMON_STATUS, METHOD_SESSION_CONNECT,
-        METHOD_SESSION_DISCONNECT, SessionConnectOptions, build_daemon_client_with_resolver,
-        build_pairing_identity_document, format_daemon_call_error, format_daemon_command_line,
-        parse_daemon_args_options, parse_endpoint_options, parse_identity_show_options,
-        parse_identity_trust_options, parse_session_connect_options,
+        CliRuntimeError, CliUsageError, DaemonArgsOptions, EndpointOptions, IdentityForgetOptions,
+        IdentityListOptions, IdentityShowOptions, IdentityTrustOptions, LOCAL_REQUEST_ID,
+        METHOD_DAEMON_STATUS, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
+        SessionConnectOptions, build_daemon_client_with_resolver, build_pairing_identity_document,
+        default_pairing_capabilities, forget_trusted_peer_identity, format_daemon_call_error,
+        format_daemon_command_line, list_trusted_peer_identities, parse_daemon_args_options,
+        parse_endpoint_options, parse_identity_forget_options, parse_identity_list_options,
+        parse_identity_show_options, parse_identity_trust_options, parse_session_connect_options,
         trust_pairing_identity_document,
     };
     use akraz_ipc::METHOD_INPUT_RELEASE_ALL;
@@ -1206,6 +1424,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_identity_list_options() {
+        assert_eq!(
+            parse_identity_list_options(
+                ["--identity-store", "akraz identity.json"].map(String::from)
+            ),
+            Ok(IdentityListOptions {
+                identity_store: PathBuf::from("akraz identity.json"),
+            })
+        );
+        assert_eq!(
+            parse_identity_list_options(["--identity-store=akraz-identity.json"].map(String::from)),
+            Ok(IdentityListOptions {
+                identity_store: PathBuf::from("akraz-identity.json"),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_identity_forget_options() {
+        assert_eq!(
+            parse_identity_forget_options(
+                [
+                    "--identity-store",
+                    "akraz-identity.json",
+                    "--peer-id=linux-laptop",
+                ]
+                .map(String::from)
+            ),
+            Ok(IdentityForgetOptions {
+                identity_store: PathBuf::from("akraz-identity.json"),
+                peer_id: "linux-laptop".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn rejects_invalid_identity_options() {
         assert_eq!(
             parse_identity_show_options(["--identity-display-name", "Device"].map(String::from)),
@@ -1224,6 +1478,26 @@ mod tests {
                 ["--identity-store", "akraz-identity.json"].map(String::from)
             ),
             Err(CliUsageError::MissingIdentityPeerFile)
+        );
+        assert_eq!(
+            parse_identity_list_options(["--bad"].map(String::from)),
+            Err(CliUsageError::UnknownIdentityOption("--bad".to_string()))
+        );
+        assert_eq!(
+            parse_identity_forget_options(
+                ["--identity-store", "akraz-identity.json"].map(String::from)
+            ),
+            Err(CliUsageError::MissingIdentityPeerId)
+        );
+        assert_eq!(
+            parse_identity_forget_options(
+                ["--identity-store", "akraz-identity.json", "--peer-id", "",].map(String::from)
+            ),
+            Err(CliUsageError::InvalidIdentityOptionValue {
+                option: "--peer-id",
+                value: "".to_string(),
+                reason: "peer id must not be empty".to_string(),
+            })
         );
         assert_eq!(
             parse_identity_trust_options(
@@ -1300,6 +1574,88 @@ mod tests {
         assert_eq!(
             trusted.identity().fingerprint(),
             peer_document.fingerprint()
+        );
+
+        remove_identity_path(local_path);
+        remove_identity_path(peer_path);
+        remove_identity_path(peer_file);
+    }
+
+    #[test]
+    fn identity_list_outputs_trusted_peer_metadata() {
+        let local_path = unique_identity_path("list-local");
+        let peer_path = unique_identity_path("list-peer");
+        let peer_file = unique_identity_path("list-peer-document");
+        let peer_document = build_pairing_identity_document(&IdentityShowOptions {
+            identity_store: peer_path.clone(),
+            identity_display_name: "Linux Laptop".to_string(),
+        })
+        .expect("peer pairing document");
+        fs::write(
+            &peer_file,
+            serde_json::to_string_pretty(&peer_document).expect("peer pairing JSON"),
+        )
+        .expect("write peer pairing document");
+        trust_pairing_identity_document(&IdentityTrustOptions {
+            identity_store: local_path.clone(),
+            identity_display_name: "Windows Desktop".to_string(),
+            peer_file: peer_file.clone(),
+        })
+        .expect("trusted peer import");
+
+        let result = list_trusted_peer_identities(&IdentityListOptions {
+            identity_store: local_path.clone(),
+        })
+        .expect("listed trusted peers");
+
+        assert_eq!(result.peers.len(), 1);
+        assert_eq!(result.peers[0].peer_id, peer_document.device_id());
+        assert_eq!(result.peers[0].display_name, "Linux Laptop");
+        assert_eq!(result.peers[0].fingerprint, peer_document.fingerprint());
+        assert_eq!(result.peers[0].capabilities, default_pairing_capabilities());
+
+        remove_identity_path(local_path);
+        remove_identity_path(peer_path);
+        remove_identity_path(peer_file);
+    }
+
+    #[test]
+    fn identity_forget_removes_trusted_peer() {
+        let local_path = unique_identity_path("forget-local");
+        let peer_path = unique_identity_path("forget-peer");
+        let peer_file = unique_identity_path("forget-peer-document");
+        let peer_document = build_pairing_identity_document(&IdentityShowOptions {
+            identity_store: peer_path.clone(),
+            identity_display_name: "Linux Laptop".to_string(),
+        })
+        .expect("peer pairing document");
+        fs::write(
+            &peer_file,
+            serde_json::to_string_pretty(&peer_document).expect("peer pairing JSON"),
+        )
+        .expect("write peer pairing document");
+        trust_pairing_identity_document(&IdentityTrustOptions {
+            identity_store: local_path.clone(),
+            identity_display_name: "Windows Desktop".to_string(),
+            peer_file: peer_file.clone(),
+        })
+        .expect("trusted peer import");
+
+        let result = forget_trusted_peer_identity(&IdentityForgetOptions {
+            identity_store: local_path.clone(),
+            peer_id: peer_document.device_id().to_string(),
+        })
+        .expect("forgot trusted peer");
+
+        assert!(result.forgotten);
+        assert_eq!(result.peer_id, peer_document.device_id());
+        assert!(
+            list_trusted_peer_identities(&IdentityListOptions {
+                identity_store: local_path.clone()
+            })
+            .expect("listed trusted peers")
+            .peers
+            .is_empty()
         );
 
         remove_identity_path(local_path);
