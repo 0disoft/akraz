@@ -4,6 +4,7 @@ import {
   formatDiagnosticsSupportBundle,
   includedSectionsSummary,
   formatDiagnosticsSnapshot,
+  latencySummary,
   screenTopologySummary,
   unavailableSectionsSummary,
 } from "../src/lib/diagnostics/diagnosticsSnapshot";
@@ -13,9 +14,9 @@ function snapshotFixture(): DiagnosticsSnapshot {
   return {
     schemaVersion: "akraz.diagnostics.snapshot/v1",
     generatedBy: "akraz-app",
-    toolVersion: "0.4.50",
+    toolVersion: "0.4.51",
     daemon: {
-      daemonVersion: "0.4.50",
+      daemonVersion: "0.4.51",
       mode: "Local",
       protocol: { major: 1, minor: 4 },
       peerCount: 0,
@@ -41,6 +42,12 @@ function snapshotFixture(): DiagnosticsSnapshot {
       pointerPosition: { x: 120, y: 80 },
       virtualScreenBounds: { x: 0, y: 0, width: 1920, height: 1080 },
     },
+    latencyHistogram: {
+      sampleCount: 3,
+      averageMicros: 450,
+      p95Micros: 900,
+      p99Micros: 900,
+    },
     privacy: {
       includesActualKeyInput: false,
       includesTextInput: false,
@@ -49,7 +56,7 @@ function snapshotFixture(): DiagnosticsSnapshot {
       includesFullPeerPublicKeys: false,
       includesFullFilePaths: false,
     },
-    unavailableSections: ["recentLogs", "latencyHistogram"],
+    unavailableSections: ["recentLogs"],
   };
 }
 
@@ -58,7 +65,7 @@ function bundleFixture(): DiagnosticsSupportBundle {
   return {
     schemaVersion: "akraz.diagnostics.supportBundle/v1",
     generatedBy: "akraz-app",
-    toolVersion: "0.4.50",
+    toolVersion: "0.4.51",
     snapshot,
     recentLogs: [
       {
@@ -68,8 +75,8 @@ function bundleFixture(): DiagnosticsSupportBundle {
         message: "Daemon status requested.",
       },
     ],
-    includedSections: ["daemon", "permissions", "screenTopology", "recentLogs"],
-    unavailableSections: ["latencyHistogram"],
+    includedSections: ["daemon", "permissions", "screenTopology", "latencyHistogram", "recentLogs"],
+    unavailableSections: [],
     privacy: snapshot.privacy,
   };
 }
@@ -80,22 +87,26 @@ describe("diagnostics snapshot helpers", () => {
 
     expect(formatted).toContain('"schemaVersion": "akraz.diagnostics.snapshot/v1"');
     expect(formatted).toContain('"screenTopology": {');
+    expect(formatted).toContain('"latencyHistogram": {');
   });
 
-  test("summarizes screen topology and unavailable sections", () => {
+  test("summarizes screen topology, latency, and sections", () => {
     expect(screenTopologySummary(snapshotFixture())).toBe("1920x1080 @ 0,0");
-    expect(unavailableSectionsSummary(snapshotFixture())).toBe("recentLogs, latencyHistogram");
+    expect(latencySummary(snapshotFixture())).toBe("평균 0.45ms · p95 0.90ms · p99 0.90ms");
+    expect(unavailableSectionsSummary(snapshotFixture())).toBe("recentLogs");
     expect(includedSectionsSummary(bundleFixture())).toBe(
-      "daemon, permissions, screenTopology, recentLogs",
+      "daemon, permissions, screenTopology, latencyHistogram, recentLogs",
     );
   });
 
   test("summarizes missing optional data", () => {
     const snapshot = snapshotFixture();
     delete snapshot.screenTopology;
+    delete snapshot.latencyHistogram;
     snapshot.unavailableSections = [];
 
     expect(screenTopologySummary(snapshot)).toBe("확인 안 됨");
+    expect(latencySummary(snapshot)).toBe("확인 안 됨");
     expect(unavailableSectionsSummary(snapshot)).toBe("없음");
   });
 

@@ -10,6 +10,7 @@
     formatDiagnosticsSnapshot,
     formatDiagnosticsSupportBundle,
     includedSectionsSummary,
+    latencySummary,
     screenTopologySummary,
     unavailableSectionsSummary,
   } from './lib/diagnostics/diagnosticsSnapshot';
@@ -472,6 +473,10 @@
           <div>
             <dt>화면</dt>
             <dd>{screenTopologySummary(diagnosticsState.snapshot)}</dd>
+          </div>
+          <div>
+            <dt>지연</dt>
+            <dd>{latencySummary(diagnosticsState.snapshot)}</dd>
           </div>
           <div>
             <dt>미포함</dt>

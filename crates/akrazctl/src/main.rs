@@ -4,6 +4,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use akraz_identity::{
     FileIdentityStore, IdentityDocumentError, IdentityStoreError, PairingIdentityDocument,
@@ -17,8 +18,8 @@ use akraz_ipc::{
     METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL,
     METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient,
     PermissionsProbe, PermissionsProbeParams, SessionConnectParams, SessionDisconnectParams,
-    build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
-    resolve_current_default_endpoint,
+    build_diagnostics_latency_histogram, build_diagnostics_snapshot,
+    build_diagnostics_support_bundle, call_json_rpc, resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 
@@ -274,24 +275,32 @@ fn print_diagnostics_bundle(options: EndpointOptions) -> ExitCode {
 }
 
 fn collect_diagnostics_snapshot(client: &OsLocalIpcClient) -> Result<DiagnosticsSnapshot, String> {
-    let status =
-        call_daemon_json_rpc::<DaemonStatus, _>(client, &daemon_status_request(), "status")?;
-    let permissions = call_daemon_json_rpc::<PermissionsProbe, _>(
+    let mut latency_samples = Vec::new();
+    let (status, status_latency) =
+        call_daemon_json_rpc_timed::<DaemonStatus, _>(client, &daemon_status_request(), "status")?;
+    latency_samples.push(status_latency);
+    let (permissions, permissions_latency) = call_daemon_json_rpc_timed::<PermissionsProbe, _>(
         client,
         &permissions_probe_request(),
         "permissions probe",
     )?;
-    let screen_topology = call_daemon_json_rpc::<DiagnosticsScreenTopology, _>(
+    latency_samples.push(permissions_latency);
+    let screen_topology = call_daemon_json_rpc_timed::<DiagnosticsScreenTopology, _>(
         client,
         &diagnostics_screen_topology_request(),
         "screen topology",
     )
+    .map(|(topology, latency)| {
+        latency_samples.push(latency);
+        topology
+    })
     .ok();
 
     Ok(build_diagnostics_snapshot(
         status,
         permissions,
         screen_topology,
+        build_diagnostics_latency_histogram(&latency_samples),
         "akrazctl",
         env!("CARGO_PKG_VERSION"),
     ))
@@ -537,6 +546,20 @@ where
 {
     let line = call_json_rpc(client, request).map_err(|error| format_daemon_call_error(&error))?;
     parse_json_rpc_response(&line, label)
+}
+
+fn call_daemon_json_rpc_timed<T, P>(
+    client: &OsLocalIpcClient,
+    request: &JsonRpcRequest<P>,
+    label: &str,
+) -> Result<(T, u128), String>
+where
+    T: for<'de> serde::Deserialize<'de>,
+    P: serde::Serialize,
+{
+    let started = Instant::now();
+    let result = call_daemon_json_rpc(client, request, label)?;
+    Ok((result, started.elapsed().as_micros()))
 }
 
 fn parse_json_rpc_response<T>(response_line: &str, label: &str) -> Result<T, String>
@@ -2173,8 +2196,14 @@ mod tests {
             },
         };
 
-        let snapshot =
-            build_diagnostics_snapshot(status, permissions, Some(topology), "akrazctl", "0.4.47");
+        let snapshot = build_diagnostics_snapshot(
+            status,
+            permissions,
+            Some(topology),
+            None,
+            "akrazctl",
+            "0.4.47",
+        );
         let encoded = serde_json::to_string(&snapshot).expect("diagnostics snapshot JSON");
 
         assert_eq!(snapshot.schema_version, "akraz.diagnostics.snapshot/v1");
@@ -2227,7 +2256,8 @@ mod tests {
             issues: Vec::new(),
         };
 
-        let snapshot = build_diagnostics_snapshot(status, permissions, None, "akrazctl", "0.4.47");
+        let snapshot =
+            build_diagnostics_snapshot(status, permissions, None, None, "akrazctl", "0.4.47");
         let encoded = serde_json::to_string(&snapshot).expect("diagnostics snapshot JSON");
 
         assert_eq!(snapshot.screen_topology, None);

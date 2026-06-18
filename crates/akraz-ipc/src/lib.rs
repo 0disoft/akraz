@@ -1083,6 +1083,8 @@ pub struct DiagnosticsSnapshot {
     pub permissions: DiagnosticsPermissionsSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_topology: Option<DiagnosticsScreenTopology>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_histogram: Option<DiagnosticsLatencyHistogram>,
     pub privacy: DiagnosticsPrivacySnapshot,
     pub unavailable_sections: Vec<String>,
 }
@@ -1120,6 +1122,16 @@ pub struct DiagnosticsPermissionsSnapshot {
     pub adapter_name: String,
     pub capabilities: IpcPlatformCapabilities,
     pub issues: Vec<PermissionIssue>,
+}
+
+/// Sanitized local latency samples measured while collecting diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsLatencyHistogram {
+    pub sample_count: usize,
+    pub average_micros: u64,
+    pub p95_micros: u64,
+    pub p99_micros: u64,
 }
 
 /// Privacy flags describing which sensitive classes are included in a diagnostics snapshot.
@@ -1182,6 +1194,7 @@ pub fn build_diagnostics_snapshot(
     status: DaemonStatus,
     permissions: PermissionsProbe,
     screen_topology: Option<DiagnosticsScreenTopology>,
+    latency_histogram: Option<DiagnosticsLatencyHistogram>,
     generated_by: impl Into<String>,
     tool_version: impl Into<String>,
 ) -> DiagnosticsSnapshot {
@@ -1193,6 +1206,9 @@ pub fn build_diagnostics_snapshot(
         .collect::<Vec<_>>();
     if screen_topology.is_none() {
         unavailable_sections.insert(1, "screenTopology".to_string());
+    }
+    if latency_histogram.is_some() {
+        unavailable_sections.retain(|section| section != "latencyHistogram");
     }
 
     DiagnosticsSnapshot {
@@ -1213,9 +1229,42 @@ pub fn build_diagnostics_snapshot(
             issues: permissions.issues,
         },
         screen_topology,
+        latency_histogram,
         privacy: DiagnosticsPrivacySnapshot::default(),
         unavailable_sections,
     }
+}
+
+/// Build stable latency summary values from elapsed microsecond samples.
+pub fn build_diagnostics_latency_histogram(
+    samples_micros: &[u128],
+) -> Option<DiagnosticsLatencyHistogram> {
+    if samples_micros.is_empty() {
+        return None;
+    }
+
+    let mut samples = samples_micros.to_vec();
+    samples.sort_unstable();
+    let sum = samples.iter().copied().sum::<u128>();
+    let sample_count = samples.len();
+    let average = (sum + (sample_count as u128 / 2)) / sample_count as u128;
+
+    Some(DiagnosticsLatencyHistogram {
+        sample_count,
+        average_micros: saturating_u128_to_u64(average),
+        p95_micros: percentile_micros(&samples, 95),
+        p99_micros: percentile_micros(&samples, 99),
+    })
+}
+
+fn percentile_micros(sorted_samples: &[u128], percentile: usize) -> u64 {
+    let rank = (sorted_samples.len() * percentile).div_ceil(100);
+    let index = rank.saturating_sub(1).min(sorted_samples.len() - 1);
+    saturating_u128_to_u64(sorted_samples[index])
+}
+
+fn saturating_u128_to_u64(value: u128) -> u64 {
+    value.min(u64::MAX as u128) as u64
 }
 
 /// Build a sanitized support bundle from a diagnostics snapshot.
@@ -1231,6 +1280,9 @@ pub fn build_diagnostics_support_bundle(
         .collect::<Vec<_>>();
     if snapshot.screen_topology.is_some() {
         included_sections.push("screenTopology".to_string());
+    }
+    if snapshot.latency_histogram.is_some() {
+        included_sections.push("latencyHistogram".to_string());
     }
     if !recent_logs.is_empty() {
         included_sections.push("recentLogs".to_string());
@@ -1431,8 +1483,9 @@ mod tests {
         METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PeerStatus, PermissionIssue, PermissionsProbe,
         ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult,
         SessionDisconnectParams, SessionDisconnectResult, SessionStatus,
-        build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
-        parse_request_line, resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
+        build_diagnostics_latency_histogram, build_diagnostics_snapshot,
+        build_diagnostics_support_bundle, call_json_rpc, parse_request_line,
+        resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
     };
     use serde_json::json;
 
@@ -1664,8 +1717,14 @@ mod tests {
             },
         };
 
-        let snapshot =
-            build_diagnostics_snapshot(status, permissions, Some(topology), "akrazctl", "0.4.47");
+        let snapshot = build_diagnostics_snapshot(
+            status,
+            permissions,
+            Some(topology),
+            None,
+            "akrazctl",
+            "0.4.47",
+        );
         let encoded = serde_json::to_string(&snapshot).expect("diagnostics snapshot JSON");
 
         assert_eq!(snapshot.schema_version, "akraz.diagnostics.snapshot/v1");
@@ -1708,7 +1767,7 @@ mod tests {
             can_inject_keyboard: true,
         };
         let status = DaemonStatus {
-            daemon_version: "0.4.50".to_string(),
+            daemon_version: "0.4.51".to_string(),
             mode: ControlModeSnapshot::Local,
             protocol: ProtocolVersionSnapshot { major: 1, minor: 4 },
             peers: vec![PeerStatus {
@@ -1733,8 +1792,14 @@ mod tests {
             },
         };
 
-        let snapshot =
-            build_diagnostics_snapshot(status, permissions, Some(topology), "akrazctl", "0.4.50");
+        let snapshot = build_diagnostics_snapshot(
+            status,
+            permissions,
+            Some(topology),
+            build_diagnostics_latency_histogram(&[100, 200, 800]),
+            "akrazctl",
+            "0.4.51",
+        );
         let bundle = build_diagnostics_support_bundle(
             snapshot,
             vec![DaemonLogEntry {
@@ -1744,26 +1809,31 @@ mod tests {
                 message: "Peer session connect failed.".to_string(),
             }],
             "akrazctl",
-            "0.4.50",
+            "0.4.51",
         );
         let encoded = serde_json::to_string(&bundle).expect("support bundle JSON");
 
         assert_eq!(bundle.schema_version, "akraz.diagnostics.supportBundle/v1");
         assert_eq!(bundle.generated_by, "akrazctl");
-        assert_eq!(bundle.tool_version, "0.4.50");
+        assert_eq!(bundle.tool_version, "0.4.51");
         assert_eq!(
             bundle.included_sections,
             vec![
                 "daemon".to_string(),
                 "permissions".to_string(),
                 "screenTopology".to_string(),
+                "latencyHistogram".to_string(),
                 "recentLogs".to_string()
             ]
         );
-        assert_eq!(
-            bundle.unavailable_sections,
-            vec!["latencyHistogram".to_string()]
-        );
+        assert_eq!(bundle.unavailable_sections, Vec::<String>::new());
+        let latency = bundle
+            .snapshot
+            .latency_histogram
+            .as_ref()
+            .expect("latency histogram");
+        assert_eq!(latency.sample_count, 3);
+        assert_eq!(latency.average_micros, 367);
         assert_eq!(bundle.recent_logs.len(), 1);
         assert_eq!(bundle.recent_logs[0].event, "session.connect.failed");
         assert_eq!(bundle.privacy, DiagnosticsPrivacySnapshot::default());
@@ -1799,7 +1869,8 @@ mod tests {
             issues: Vec::new(),
         };
 
-        let snapshot = build_diagnostics_snapshot(status, permissions, None, "akrazctl", "0.4.47");
+        let snapshot =
+            build_diagnostics_snapshot(status, permissions, None, None, "akrazctl", "0.4.47");
         let encoded = serde_json::to_string(&snapshot).expect("diagnostics snapshot JSON");
 
         assert_eq!(snapshot.screen_topology, None);

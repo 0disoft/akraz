@@ -150,6 +150,7 @@ function assertDiagnosticsSnapshot(snapshot) {
   assertCapabilities(snapshot.permissions?.capabilities, "permissions");
   assertPermissionIssues(snapshot.permissions);
   assertScreenTopology(snapshot.screenTopology);
+  assertLatencyHistogram(snapshot.latencyHistogram);
   assertPrivacy(snapshot.privacy);
   assertUnavailableSections(snapshot.unavailableSections);
   assertNoSensitiveFields(snapshot);
@@ -167,12 +168,16 @@ function assertDiagnosticsBundle(bundle, snapshot) {
       `diagnostics bundle reported tool version ${bundle.toolVersion}, expected ${appPackage.version}`,
     );
   }
-  if (JSON.stringify(bundle.snapshot) !== JSON.stringify(snapshot)) {
-    throw new Error("diagnostics bundle snapshot does not match diagnostics snapshot output");
-  }
-  const expectedIncludedSections = ["daemon", "permissions", "screenTopology", "recentLogs"];
+  assertBundleSnapshot(bundle.snapshot, snapshot);
+  const expectedIncludedSections = [
+    "daemon",
+    "permissions",
+    "screenTopology",
+    "latencyHistogram",
+    "recentLogs",
+  ];
   assertStringList(bundle.includedSections, expectedIncludedSections, "included sections");
-  assertStringList(bundle.unavailableSections, ["latencyHistogram"], "unavailable sections");
+  assertStringList(bundle.unavailableSections, [], "unavailable sections");
   assertRecentLogs(bundle.recentLogs);
   assertPrivacy(bundle.privacy);
   assertNoSensitiveFields(bundle);
@@ -185,6 +190,31 @@ function assertCapabilities(capabilities, label) {
       throw new Error(`diagnostics snapshot reported invalid ${label} ${key}`);
     }
   }
+}
+
+function assertBundleSnapshot(bundleSnapshot, previousSnapshot) {
+  if (bundleSnapshot.schemaVersion !== previousSnapshot.schemaVersion) {
+    throw new Error("diagnostics bundle snapshot schema drifted from snapshot output");
+  }
+  if (bundleSnapshot.generatedBy !== previousSnapshot.generatedBy) {
+    throw new Error("diagnostics bundle snapshot generator drifted from snapshot output");
+  }
+  if (bundleSnapshot.toolVersion !== previousSnapshot.toolVersion) {
+    throw new Error("diagnostics bundle snapshot tool version drifted from snapshot output");
+  }
+  if (bundleSnapshot.daemon?.daemonVersion !== previousSnapshot.daemon?.daemonVersion) {
+    throw new Error("diagnostics bundle snapshot daemon version drifted from snapshot output");
+  }
+  if (bundleSnapshot.daemon?.protocol?.major !== previousSnapshot.daemon?.protocol?.major) {
+    throw new Error("diagnostics bundle snapshot protocol major drifted from snapshot output");
+  }
+  if (bundleSnapshot.daemon?.protocol?.minor !== previousSnapshot.daemon?.protocol?.minor) {
+    throw new Error("diagnostics bundle snapshot protocol minor drifted from snapshot output");
+  }
+  assertCapabilities(bundleSnapshot.daemon?.capabilities, "bundle daemon");
+  assertCapabilities(bundleSnapshot.permissions?.capabilities, "bundle permissions");
+  assertScreenTopology(bundleSnapshot.screenTopology);
+  assertLatencyHistogram(bundleSnapshot.latencyHistogram);
 }
 
 function assertPermissionIssues(permissions) {
@@ -268,8 +298,25 @@ function assertPrivacy(privacy) {
 }
 
 function assertUnavailableSections(sections) {
-  const expected = ["recentLogs", "latencyHistogram"];
+  const expected = ["recentLogs"];
   assertStringList(sections, expected, "unavailable sections");
+}
+
+function assertLatencyHistogram(latency) {
+  if (!latency || typeof latency !== "object") {
+    throw new Error("diagnostics snapshot did not include latency histogram");
+  }
+  if (!Number.isInteger(latency.sampleCount) || latency.sampleCount < 2) {
+    throw new Error("diagnostics snapshot reported an invalid latency sample count");
+  }
+  for (const key of ["averageMicros", "p95Micros", "p99Micros"]) {
+    if (!Number.isInteger(latency[key]) || latency[key] < 0) {
+      throw new Error(`diagnostics snapshot reported invalid ${key}`);
+    }
+  }
+  if (latency.p95Micros < latency.averageMicros || latency.p99Micros < latency.p95Micros) {
+    throw new Error("diagnostics snapshot reported inconsistent latency percentiles");
+  }
 }
 
 function assertRecentLogs(entries) {

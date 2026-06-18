@@ -54,6 +54,13 @@ export interface DiagnosticsScreenTopology {
   virtualScreenBounds: LogicalRectSnapshot;
 }
 
+export interface DiagnosticsLatencyHistogram {
+  sampleCount: number;
+  averageMicros: number;
+  p95Micros: number;
+  p99Micros: number;
+}
+
 export interface DiagnosticsDaemonSnapshot {
   daemonVersion: string;
   mode: ControlMode;
@@ -85,6 +92,7 @@ export interface DiagnosticsSnapshot {
   daemon: DiagnosticsDaemonSnapshot;
   permissions: DiagnosticsPermissionsSnapshot;
   screenTopology?: DiagnosticsScreenTopology;
+  latencyHistogram?: DiagnosticsLatencyHistogram;
   privacy: DiagnosticsPrivacySnapshot;
   unavailableSections: string[];
 }

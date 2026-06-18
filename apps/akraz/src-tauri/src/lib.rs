@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use akraz_identity::{FileIdentityStore, PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_ipc::{
@@ -17,8 +17,8 @@ use akraz_ipc::{
     METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
     METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe,
     PermissionsProbeParams, SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
-    build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
-    resolve_current_default_endpoint,
+    build_diagnostics_latency_histogram, build_diagnostics_snapshot,
+    build_diagnostics_support_bundle, call_json_rpc, resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 use serde::{Deserialize, Serialize};
@@ -814,7 +814,8 @@ fn call_daemon_permissions_probe() -> Result<PermissionsProbe, String> {
 
 fn call_daemon_diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
     let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
-    let status = call_daemon_json_rpc::<DaemonStatus, _>(
+    let mut latency_samples = Vec::new();
+    let (status, status_latency) = call_daemon_json_rpc_timed::<DaemonStatus, _>(
         &client,
         &JsonRpcRequest::new(
             LOCAL_REQUEST_ID,
@@ -823,7 +824,8 @@ fn call_daemon_diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
         ),
         "status",
     )?;
-    let permissions = call_daemon_json_rpc::<PermissionsProbe, _>(
+    latency_samples.push(status_latency);
+    let (permissions, permissions_latency) = call_daemon_json_rpc_timed::<PermissionsProbe, _>(
         &client,
         &JsonRpcRequest::new(
             LOCAL_REQUEST_ID,
@@ -832,7 +834,8 @@ fn call_daemon_diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
         ),
         "permissions probe",
     )?;
-    let screen_topology = call_daemon_json_rpc::<DiagnosticsScreenTopology, _>(
+    latency_samples.push(permissions_latency);
+    let screen_topology = call_daemon_json_rpc_timed::<DiagnosticsScreenTopology, _>(
         &client,
         &JsonRpcRequest::new(
             LOCAL_REQUEST_ID,
@@ -841,12 +844,17 @@ fn call_daemon_diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
         ),
         "screen topology",
     )
+    .map(|(topology, latency)| {
+        latency_samples.push(latency);
+        topology
+    })
     .ok();
 
     Ok(build_diagnostics_snapshot(
         status,
         permissions,
         screen_topology,
+        build_diagnostics_latency_histogram(&latency_samples),
         "akraz-app",
         env!("CARGO_PKG_VERSION"),
     ))
@@ -891,6 +899,20 @@ where
         .map_err(|error| classify_daemon_call_error(&error, client.endpoint()).to_user_message())?;
 
     parse_json_rpc_response::<T>(&response_line, label)
+}
+
+fn call_daemon_json_rpc_timed<T, P>(
+    client: &OsLocalIpcClient,
+    request: &JsonRpcRequest<P>,
+    label: &str,
+) -> Result<(T, u128), String>
+where
+    T: for<'de> Deserialize<'de>,
+    P: Serialize,
+{
+    let started = Instant::now();
+    let result = call_daemon_json_rpc(client, request, label)?;
+    Ok((result, started.elapsed().as_micros()))
 }
 
 fn connect_daemon_session(
