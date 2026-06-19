@@ -9,6 +9,7 @@ import {
   formatRecentLogEntry,
   keyboardLayoutSummary,
   latencySummary,
+  previousDaemonCrashSummary,
   recentLogsSummary,
   screenTopologySummary,
   unavailableSectionsSummary,
@@ -129,12 +130,37 @@ describe("diagnostics snapshot helpers", () => {
     expect(latencySummary(snapshotFixture())).toBe("평균 0.45ms · p95 0.90ms · p99 0.90ms");
     expect(unavailableSectionsSummary(snapshotFixture())).toBe("recentLogs");
     expect(recentLogsSummary(bundleFixture())).toBe("1개");
+    expect(previousDaemonCrashSummary(bundleFixture())).toBe("없음");
     expect(formatRecentLogEntry(bundleFixture().recentLogs[0])).toBe(
       "#1 · Info · daemon.status · Daemon status requested.",
     );
     expect(includedSectionsSummary(bundleFixture())).toBe(
       "daemon, permissions, screenTopology, keyboardLayout, latencyHistogram, recentLogs",
     );
+  });
+
+  test("summarizes previous daemon crash markers", () => {
+    const bundle = bundleFixture();
+    bundle.previousDaemonCrash = {
+      schemaVersion: "akraz.daemonCrashMarker/v1",
+      processRole: "akraz-daemon",
+      daemonVersion: appPackage.version,
+      reason: "panic",
+      panicMessageClass: "stringPayload",
+      panicLocation: {
+        fileName: "main.rs",
+        line: 42,
+        column: 9,
+      },
+      recordedAtUnixMillis: 123456,
+      privacy: {
+        includesSecretValues: false,
+        includesFullFilePaths: false,
+        includesInputPayload: false,
+      },
+    };
+
+    expect(previousDaemonCrashSummary(bundle)).toBe(`panic · v${appPackage.version} · main.rs:42`);
   });
 
   test("summarizes missing optional data", () => {

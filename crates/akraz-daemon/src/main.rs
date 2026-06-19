@@ -1,13 +1,16 @@
+use std::any::Any;
 use std::env;
 use std::fmt::{Display, Formatter};
+use std::fs;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::panic::{self, PanicHookInfo};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use akraz_core::{
     CoreAction, DeviceId, EdgeCrossing, InjectedInputEvent, LogicalPoint, MouseButton, PeerId,
@@ -25,7 +28,11 @@ use akraz_daemon::{
     start_daemon_input_capture_with_edge_bindings_and_dispatcher,
 };
 use akraz_identity::FileIdentityStore;
-use akraz_ipc::{IpcEndpoint, IpcTransportError, resolve_current_default_endpoint};
+use akraz_ipc::{
+    DAEMON_CRASH_MARKER_PROCESS_ROLE, DAEMON_CRASH_MARKER_SCHEMA_VERSION, DaemonCrashMarker,
+    DaemonCrashMarkerPrivacy, DaemonPanicLocation, IpcEndpoint, IpcTransportError,
+    resolve_current_default_endpoint,
+};
 use akraz_platform::{
     FakePlatformAdapter, PlatformAdapter, PlatformError, runtime_platform_adapter,
 };
@@ -60,6 +67,8 @@ fn print_version() {
 }
 
 fn run_daemon(options: ServeOptions) -> ExitCode {
+    install_daemon_crash_marker_panic_hook(options.crash_marker.clone());
+
     let endpoint = match options.endpoint.clone() {
         Some(endpoint) => endpoint,
         None => match resolve_current_default_endpoint() {
@@ -153,9 +162,142 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
     let capture_result = stop_capture_worker(capture_worker);
     let peer_listener_result = stop_peer_session_listener(peer_listener_worker);
 
-    match (capture_result, peer_listener_result, result) {
-        (Ok(()), Ok(()), Ok(())) => ExitCode::SUCCESS,
-        _ => ExitCode::FAILURE,
+    if matches!(
+        (capture_result, peer_listener_result, result),
+        (Ok(()), Ok(()), Ok(()))
+    ) {
+        clear_daemon_crash_marker(options.crash_marker.as_deref());
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn install_daemon_crash_marker_panic_hook(path: Option<PathBuf>) {
+    let Some(path) = path else {
+        return;
+    };
+    let previous_hook = panic::take_hook();
+
+    panic::set_hook(Box::new(move |info| {
+        if let Err(error) = write_daemon_panic_crash_marker(&path, info) {
+            eprintln!("failed to write akraz-daemon crash marker: {error}");
+        }
+        previous_hook(info);
+    }));
+}
+
+fn write_daemon_panic_crash_marker(path: &Path, info: &PanicHookInfo<'_>) -> Result<(), String> {
+    let marker = build_daemon_crash_marker(
+        panic_payload_class(info.payload()),
+        info.location().map(|location| location.file()),
+        info.location().map(|location| location.line()),
+        info.location().map(|location| location.column()),
+        current_unix_millis(),
+    );
+    write_daemon_crash_marker_file(path, &marker)
+}
+
+fn build_daemon_crash_marker(
+    panic_message_class: impl Into<String>,
+    source_file: Option<&str>,
+    line: Option<u32>,
+    column: Option<u32>,
+    recorded_at_unix_millis: u64,
+) -> DaemonCrashMarker {
+    DaemonCrashMarker {
+        schema_version: DAEMON_CRASH_MARKER_SCHEMA_VERSION.to_string(),
+        process_role: DAEMON_CRASH_MARKER_PROCESS_ROLE.to_string(),
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        reason: "panic".to_string(),
+        panic_message_class: panic_message_class.into(),
+        panic_location: source_file
+            .and_then(sanitize_source_file_name)
+            .map(|file_name| DaemonPanicLocation {
+                file_name,
+                line: line.unwrap_or_default(),
+                column: column.unwrap_or_default(),
+            }),
+        recorded_at_unix_millis,
+        privacy: DaemonCrashMarkerPrivacy::default(),
+    }
+}
+
+fn panic_payload_class(payload: &(dyn Any + Send)) -> &'static str {
+    if payload.is::<&'static str>() {
+        "staticStrPayload"
+    } else if payload.is::<String>() {
+        "stringPayload"
+    } else {
+        "unknownPayload"
+    }
+}
+
+fn sanitize_source_file_name(source_file: &str) -> Option<String> {
+    let file_name = source_file
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())?;
+    Some(file_name.to_string())
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn write_daemon_crash_marker_file(path: &Path, marker: &DaemonCrashMarker) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create crash marker directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let bytes = serde_json::to_vec_pretty(marker)
+        .map_err(|error| format!("failed to encode daemon crash marker: {error}"))?;
+    let temp_path = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        current_unix_millis()
+    ));
+    fs::write(&temp_path, bytes).map_err(|error| {
+        format!(
+            "failed to write crash marker temp file {}: {error}",
+            temp_path.display()
+        )
+    })?;
+
+    match fs::rename(&temp_path, path) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            let _ = fs::remove_file(path);
+            fs::rename(&temp_path, path).map_err(|retry_error| {
+                let _ = fs::remove_file(&temp_path);
+                format!(
+                    "failed to replace crash marker {}: {rename_error}; retry failed: {retry_error}",
+                    path.display()
+                )
+            })
+        }
+    }
+}
+
+fn clear_daemon_crash_marker(path: Option<&Path>) {
+    let Some(path) = path else {
+        return;
+    };
+
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "failed to clear akraz-daemon crash marker {}: {error}",
+            path.display()
+        ),
     }
 }
 
@@ -921,6 +1063,7 @@ struct ServeOptions {
     endpoint: Option<IpcEndpoint>,
     once: bool,
     capture_input: bool,
+    crash_marker: Option<PathBuf>,
     edge_bindings: Vec<ScreenEdgeBinding>,
     peer_listen: Option<SocketAddr>,
     peer_session: Option<ServePeerSessionOptions>,
@@ -962,6 +1105,7 @@ where
             if argument.starts_with("--endpoint")
                 || argument == "--once"
                 || argument == "--capture-input"
+                || argument.starts_with("--crash-marker")
                 || argument.starts_with("--edge-binding")
                 || argument.starts_with("--peer-listen")
                 || argument.starts_with("--peer-session")
@@ -1002,6 +1146,13 @@ where
             options.once = true;
         } else if argument == "--capture-input" {
             options.capture_input = true;
+        } else if let Some(value) = argument.strip_prefix("--crash-marker=") {
+            options.crash_marker = Some(parse_crash_marker(value)?);
+        } else if argument == "--crash-marker" {
+            let value = args
+                .next()
+                .ok_or(DaemonUsageError::MissingCrashMarkerValue)?;
+            options.crash_marker = Some(parse_crash_marker(&value)?);
         } else if let Some(value) = argument.strip_prefix("--edge-binding=") {
             options.edge_bindings.push(parse_edge_binding(value)?);
         } else if argument == "--edge-binding" {
@@ -1127,6 +1278,15 @@ fn parse_identity_store(value: &str) -> Result<PathBuf, DaemonUsageError> {
     Ok(PathBuf::from(value))
 }
 
+fn parse_crash_marker(value: &str) -> Result<PathBuf, DaemonUsageError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DaemonUsageError::InvalidCrashMarker(value.to_string()));
+    }
+
+    Ok(PathBuf::from(value))
+}
+
 fn parse_identity_display_name(value: &str) -> Result<String, DaemonUsageError> {
     let value = value.trim();
     if value.is_empty() {
@@ -1179,6 +1339,7 @@ enum DaemonUsageError {
     MissingLocalDeviceIdValue,
     MissingIdentityStoreValue,
     MissingIdentityDisplayNameValue,
+    MissingCrashMarkerValue,
     MissingIdentityStoreForPeerTransport,
     DuplicatePeerListen,
     DuplicatePeerSession,
@@ -1189,6 +1350,7 @@ enum DaemonUsageError {
     InvalidLocalDeviceId(String),
     InvalidIdentityStore(String),
     InvalidIdentityDisplayName(String),
+    InvalidCrashMarker(String),
     UnknownArgument(String),
 }
 
@@ -1217,6 +1379,9 @@ impl Display for DaemonUsageError {
             }
             Self::MissingIdentityDisplayNameValue => {
                 formatter.write_str("missing value for --identity-display-name")
+            }
+            Self::MissingCrashMarkerValue => {
+                formatter.write_str("missing value for --crash-marker")
             }
             Self::MissingIdentityStoreForPeerTransport => {
                 formatter.write_str("--peer-listen and --peer-session require --identity-store")
@@ -1251,6 +1416,10 @@ impl Display for DaemonUsageError {
                 formatter,
                 "invalid identity display name: {value}. Expected a non-empty display name"
             ),
+            Self::InvalidCrashMarker(value) => write!(
+                formatter,
+                "invalid crash marker path: {value}. Expected a non-empty path"
+            ),
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument: {argument}"),
         }
     }
@@ -1258,7 +1427,7 @@ impl Display for DaemonUsageError {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, path::PathBuf};
+    use std::{fs, net::SocketAddr, path::PathBuf};
 
     use akraz_core::{PeerId, ScreenEdge, ScreenEdgeBinding};
     use akraz_ipc::{IpcEndpoint, IpcEndpointKind, IpcTransportError};
@@ -1266,10 +1435,19 @@ mod tests {
     use super::{
         DaemonCommand, DaemonUsageError, LoopbackTransportSmokeCommand,
         LoopbackTransportSmokeInputEvent, ServeOptions, ServePeerSessionOptions,
-        build_loopback_transport_smoke_report, build_peer_session_executor_smoke_report,
-        build_peer_session_smoke_report, build_tcp_transport_smoke_report, format_daemon_ipc_error,
-        parse_daemon_command,
+        build_daemon_crash_marker, build_loopback_transport_smoke_report,
+        build_peer_session_executor_smoke_report, build_peer_session_smoke_report,
+        build_tcp_transport_smoke_report, current_unix_millis, format_daemon_ipc_error,
+        panic_payload_class, parse_daemon_command, write_daemon_crash_marker_file,
     };
+
+    fn unique_crash_marker_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "akraz-daemon-crash-marker-{label}-{}-{}.json",
+            std::process::id(),
+            current_unix_millis()
+        ))
+    }
 
     #[test]
     fn default_command_serves_forever_on_default_endpoint() {
@@ -1279,6 +1457,7 @@ mod tests {
                 endpoint: None,
                 once: false,
                 capture_input: false,
+                crash_marker: None,
                 edge_bindings: Vec::new(),
                 peer_listen: None,
                 peer_session: None,
@@ -1309,6 +1488,7 @@ mod tests {
                 }),
                 once: true,
                 capture_input: true,
+                crash_marker: None,
                 edge_bindings: Vec::new(),
                 peer_listen: None,
                 peer_session: None,
@@ -1328,6 +1508,7 @@ mod tests {
                 }),
                 once: true,
                 capture_input: true,
+                crash_marker: None,
                 edge_bindings: Vec::new(),
                 peer_listen: None,
                 peer_session: None,
@@ -1336,6 +1517,85 @@ mod tests {
                 identity_display_name: None,
             }))
         );
+    }
+
+    #[test]
+    fn parses_crash_marker_option() {
+        assert_eq!(
+            parse_daemon_command(
+                ["--serve", "--crash-marker", "crash/daemon.json"].map(String::from)
+            ),
+            Ok(DaemonCommand::Serve(ServeOptions {
+                endpoint: None,
+                once: false,
+                capture_input: false,
+                crash_marker: Some(PathBuf::from("crash/daemon.json")),
+                edge_bindings: Vec::new(),
+                peer_listen: None,
+                peer_session: None,
+                local_device_id: None,
+                identity_store: None,
+                identity_display_name: None,
+            }))
+        );
+        assert_eq!(
+            parse_daemon_command(["--crash-marker=crash/daemon.json"].map(String::from)),
+            Ok(DaemonCommand::Serve(ServeOptions {
+                endpoint: None,
+                once: false,
+                capture_input: false,
+                crash_marker: Some(PathBuf::from("crash/daemon.json")),
+                edge_bindings: Vec::new(),
+                peer_listen: None,
+                peer_session: None,
+                local_device_id: None,
+                identity_store: None,
+                identity_display_name: None,
+            }))
+        );
+        assert_eq!(
+            parse_daemon_command(["--crash-marker"].map(String::from)),
+            Err(DaemonUsageError::MissingCrashMarkerValue)
+        );
+        assert_eq!(
+            parse_daemon_command(["--crash-marker="].map(String::from)),
+            Err(DaemonUsageError::InvalidCrashMarker("".to_string()))
+        );
+    }
+
+    #[test]
+    fn daemon_crash_marker_redacts_payload_and_full_source_path() {
+        let path = unique_crash_marker_path("redaction");
+        let marker = build_daemon_crash_marker(
+            panic_payload_class(&"actual-key-input: ctrl-alt-backspace"),
+            Some(r"C:\Users\alice\workspace\akraz\crates\akraz-daemon\src\main.rs"),
+            Some(42),
+            Some(9),
+            123_456,
+        );
+
+        write_daemon_crash_marker_file(&path, &marker).expect("crash marker write");
+        let encoded = fs::read_to_string(&path).expect("crash marker JSON");
+        let decoded: akraz_ipc::DaemonCrashMarker =
+            serde_json::from_str(&encoded).expect("decoded crash marker");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(decoded.schema_version, "akraz.daemonCrashMarker/v1");
+        assert_eq!(decoded.process_role, "akraz-daemon");
+        assert_eq!(decoded.reason, "panic");
+        assert_eq!(decoded.panic_message_class, "staticStrPayload");
+        assert_eq!(decoded.recorded_at_unix_millis, 123_456);
+        let location = decoded.panic_location.expect("panic location");
+        assert_eq!(location.file_name, "main.rs");
+        assert_eq!(location.line, 42);
+        assert_eq!(location.column, 9);
+        assert!(!decoded.privacy.includes_secret_values);
+        assert!(!decoded.privacy.includes_full_file_paths);
+        assert!(!decoded.privacy.includes_input_payload);
+        assert!(!encoded.contains("actual-key-input"));
+        assert!(!encoded.contains("Users"));
+        assert!(!encoded.contains("workspace"));
+        assert!(!encoded.contains("ctrl-alt-backspace"));
     }
 
     #[test]
@@ -1360,6 +1620,7 @@ mod tests {
                 endpoint: None,
                 once: false,
                 capture_input: true,
+                crash_marker: None,
                 edge_bindings: vec![binding.clone()],
                 peer_listen: None,
                 peer_session: None,
@@ -1376,6 +1637,7 @@ mod tests {
                 endpoint: None,
                 once: false,
                 capture_input: true,
+                crash_marker: None,
                 edge_bindings: vec![binding],
                 peer_listen: None,
                 peer_session: None,
@@ -1437,6 +1699,7 @@ mod tests {
                 endpoint: None,
                 once: false,
                 capture_input: false,
+                crash_marker: None,
                 edge_bindings: Vec::new(),
                 peer_listen: Some(
                     "127.0.0.1:24887"

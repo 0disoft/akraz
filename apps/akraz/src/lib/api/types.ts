@@ -128,9 +128,33 @@ export interface DiagnosticsSupportBundle {
   toolVersion: string;
   snapshot: DiagnosticsSnapshot;
   recentLogs: DaemonLogEntry[];
+  previousDaemonCrash?: DaemonCrashMarker;
   includedSections: string[];
   unavailableSections: string[];
   privacy: DiagnosticsPrivacySnapshot;
+}
+
+export interface DaemonCrashMarker {
+  schemaVersion: string;
+  processRole: string;
+  daemonVersion: string;
+  reason: string;
+  panicMessageClass: string;
+  panicLocation?: DaemonPanicLocation;
+  recordedAtUnixMillis: number;
+  privacy: DaemonCrashMarkerPrivacy;
+}
+
+export interface DaemonPanicLocation {
+  fileName: string;
+  line: number;
+  column: number;
+}
+
+export interface DaemonCrashMarkerPrivacy {
+  includesSecretValues: boolean;
+  includesFullFilePaths: boolean;
+  includesInputPayload: boolean;
 }
 
 export type DaemonLifecyclePhase =
@@ -145,6 +169,7 @@ export interface DaemonLifecycleSnapshot {
   status: DaemonStatus | null;
   detail: string | null;
   managedPid: number | null;
+  previousCrash?: DaemonCrashMarker;
 }
 
 export type ScreenEdge = "left" | "right" | "top" | "bottom";

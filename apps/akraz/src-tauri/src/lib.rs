@@ -9,17 +9,19 @@ use std::time::{Duration, Instant};
 
 use akraz_identity::{FileIdentityStore, PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_ipc::{
-    DaemonLogEntry, DaemonLogsTail, DaemonLogsTailParams, DaemonStatus, DaemonStatusParams,
-    DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams, DiagnosticsScreenTopology,
-    DiagnosticsScreenTopologyParams, DiagnosticsSnapshot, DiagnosticsSupportBundle,
-    InputReleaseAllParams, InputReleaseAllResult, IpcCallError, IpcEndpoint, IpcTransportError,
-    JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient,
-    METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
-    METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
-    METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe,
-    PermissionsProbeParams, SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
+    DaemonCrashMarker, DaemonLogEntry, DaemonLogsTail, DaemonLogsTailParams, DaemonStatus,
+    DaemonStatusParams, DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams,
+    DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, DiagnosticsSnapshot,
+    DiagnosticsSupportBundle, InputReleaseAllParams, InputReleaseAllResult, IpcCallError,
+    IpcEndpoint, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
+    JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
+    METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+    METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
+    METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe, PermissionsProbeParams,
+    SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
     build_diagnostics_latency_histogram, build_diagnostics_snapshot,
-    build_diagnostics_support_bundle, call_json_rpc, resolve_current_default_endpoint,
+    build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
+    resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 use serde::{Deserialize, Serialize};
@@ -40,12 +42,15 @@ const DAEMON_EDGE_BINDING_ARG: &str = "--edge-binding";
 const DAEMON_PEER_LISTEN_ARG: &str = "--peer-listen";
 const DAEMON_IDENTITY_STORE_ARG: &str = "--identity-store";
 const DAEMON_IDENTITY_DISPLAY_NAME_ARG: &str = "--identity-display-name";
+const DAEMON_CRASH_MARKER_ARG: &str = "--crash-marker";
 const DAEMON_IDENTITY_DISPLAY_NAME: &str = "Akraz Desktop";
 const DAEMON_LIFECYCLE_SMOKE_FLAG: &str = "--akraz-smoke-daemon-lifecycle";
 const DAEMON_SETTINGS_START_SMOKE_FLAG: &str = "--akraz-smoke-settings-start";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const IDENTITY_STORE_DIR_NAME: &str = "secrets";
 const IDENTITY_STORE_FILE_NAME: &str = "identity.json";
+const DAEMON_CRASH_DIR_NAME: &str = "crash";
+const DAEMON_CRASH_MARKER_FILE_NAME: &str = "daemon-crash.json";
 const DAEMON_START_RETRIES: usize = 50;
 const DAEMON_START_RETRY_DELAY: Duration = Duration::from_millis(40);
 const DAEMON_STOP_RETRIES: usize = 50;
@@ -286,12 +291,16 @@ impl DaemonLifecycleSmokeReport {
 
 #[tauri::command]
 async fn daemon_status(
+    app: tauri::AppHandle,
     managed: tauri::State<'_, ManagedDaemon>,
 ) -> Result<DaemonLifecycleSnapshot, String> {
     let managed = Arc::clone(managed.inner());
-    tauri::async_runtime::spawn_blocking(move || refresh_daemon_snapshot(&managed))
-        .await
-        .map_err(|error| format!("daemon status task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        refresh_daemon_snapshot(&managed)
+            .map(|snapshot| attach_previous_daemon_crash(&app, snapshot))
+    })
+    .await
+    .map_err(|error| format!("daemon status task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -316,8 +325,10 @@ async fn diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
 }
 
 #[tauri::command]
-async fn diagnostics_support_bundle() -> Result<DiagnosticsSupportBundle, String> {
-    tauri::async_runtime::spawn_blocking(call_daemon_diagnostics_support_bundle)
+async fn diagnostics_support_bundle(
+    app: tauri::AppHandle,
+) -> Result<DiagnosticsSupportBundle, String> {
+    tauri::async_runtime::spawn_blocking(move || call_daemon_diagnostics_support_bundle(&app))
         .await
         .map_err(|error| format!("diagnostics support bundle task failed: {error}"))?
 }
@@ -330,19 +341,25 @@ async fn daemon_start(
 ) -> Result<DaemonLifecycleSnapshot, String> {
     let managed = Arc::clone(managed.inner());
     let options = options.unwrap_or_default();
-    tauri::async_runtime::spawn_blocking(move || start_daemon(&app, &managed, options))
-        .await
-        .map_err(|error| format!("daemon start task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        start_daemon(&app, &managed, options)
+            .map(|snapshot| attach_previous_daemon_crash(&app, snapshot))
+    })
+    .await
+    .map_err(|error| format!("daemon start task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn daemon_stop(
+    app: tauri::AppHandle,
     managed: tauri::State<'_, ManagedDaemon>,
 ) -> Result<DaemonLifecycleSnapshot, String> {
     let managed = Arc::clone(managed.inner());
-    tauri::async_runtime::spawn_blocking(move || stop_daemon(&managed))
-        .await
-        .map_err(|error| format!("daemon stop task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        stop_daemon(&managed).map(|snapshot| attach_previous_daemon_crash(&app, snapshot))
+    })
+    .await
+    .map_err(|error| format!("daemon stop task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -640,6 +657,8 @@ struct DaemonLifecycleSnapshot {
     status: Option<DaemonStatus>,
     detail: Option<String>,
     managed_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_crash: Option<Box<DaemonCrashMarker>>,
 }
 
 impl DaemonLifecycleSnapshot {
@@ -649,6 +668,7 @@ impl DaemonLifecycleSnapshot {
             status: Some(status),
             detail: None,
             managed_pid,
+            previous_crash: None,
         }
     }
 
@@ -666,6 +686,7 @@ impl DaemonLifecycleSnapshot {
             status: None,
             detail: Some(detail.into()),
             managed_pid,
+            previous_crash: None,
         }
     }
 
@@ -683,6 +704,7 @@ impl DaemonLifecycleSnapshot {
             status: None,
             detail: Some(detail.into()),
             managed_pid: None,
+            previous_crash: None,
         }
     }
 
@@ -693,6 +715,11 @@ impl DaemonLifecycleSnapshot {
 
     fn with_managed_pid(mut self, managed_pid: Option<u32>) -> Self {
         self.managed_pid = managed_pid;
+        self
+    }
+
+    fn with_previous_crash(mut self, previous_crash: Option<DaemonCrashMarker>) -> Self {
+        self.previous_crash = previous_crash.map(Box::new);
         self
     }
 }
@@ -798,6 +825,36 @@ fn read_daemon_snapshot() -> DaemonLifecycleSnapshot {
         Ok(status) => DaemonLifecycleSnapshot::running(status, None),
         Err(snapshot) => snapshot,
     }
+}
+
+fn attach_previous_daemon_crash(
+    app: &tauri::AppHandle,
+    snapshot: DaemonLifecycleSnapshot,
+) -> DaemonLifecycleSnapshot {
+    snapshot.with_previous_crash(read_previous_daemon_crash(app))
+}
+
+fn read_previous_daemon_crash(app: &tauri::AppHandle) -> Option<DaemonCrashMarker> {
+    daemon_crash_marker_path(app)
+        .ok()
+        .and_then(|path| read_previous_daemon_crash_from_path(&path).ok().flatten())
+}
+
+fn read_previous_daemon_crash_from_path(path: &Path) -> Result<Option<DaemonCrashMarker>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read previous daemon crash marker {}: {error}",
+                path.display()
+            ));
+        }
+    };
+
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|error| format!("failed to parse previous daemon crash marker: {error}"))
 }
 
 fn wait_for_stopped_daemon_snapshot() -> DaemonLifecycleSnapshot {
@@ -923,13 +980,16 @@ fn call_daemon_diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
     ))
 }
 
-fn call_daemon_diagnostics_support_bundle() -> Result<DiagnosticsSupportBundle, String> {
+fn call_daemon_diagnostics_support_bundle(
+    app: &tauri::AppHandle,
+) -> Result<DiagnosticsSupportBundle, String> {
     let snapshot = call_daemon_diagnostics_snapshot()?;
     let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
 
-    Ok(build_diagnostics_support_bundle(
+    Ok(build_diagnostics_support_bundle_with_previous_crash(
         snapshot,
         collect_recent_daemon_logs(&client),
+        read_previous_daemon_crash(app),
         "akraz-app",
         env!("CARGO_PKG_VERSION"),
     ))
@@ -1117,10 +1177,25 @@ fn daemon_identity_store_path(app: &tauri::AppHandle) -> Result<PathBuf, String>
     Ok(identity_store_path_from_config_dir(directory))
 }
 
+fn daemon_crash_marker_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("failed to resolve Akraz crash marker directory: {error}"))?;
+
+    Ok(daemon_crash_marker_path_from_config_dir(directory))
+}
+
 fn identity_store_path_from_config_dir(config_dir: PathBuf) -> PathBuf {
     config_dir
         .join(IDENTITY_STORE_DIR_NAME)
         .join(IDENTITY_STORE_FILE_NAME)
+}
+
+fn daemon_crash_marker_path_from_config_dir(config_dir: PathBuf) -> PathBuf {
+    config_dir
+        .join(DAEMON_CRASH_DIR_NAME)
+        .join(DAEMON_CRASH_MARKER_FILE_NAME)
 }
 
 fn build_identity_show_result_from_path(
@@ -1469,33 +1544,43 @@ fn spawn_daemon_process(
     options: &DaemonStartOptions,
 ) -> Result<SpawnedDaemonProcess, String> {
     let identity_store_path = daemon_identity_store_path(app)?;
+    let crash_marker_path = daemon_crash_marker_path(app)?;
     if let Some(executable) = resolve_env_daemon_executable() {
-        return spawn_os_daemon_process(&executable, options, &identity_store_path).map(|child| {
-            SpawnedDaemonProcess {
-                child: ManagedDaemonChild::Os(child),
-                sidecar_events: None,
-            }
+        return spawn_os_daemon_process(
+            &executable,
+            options,
+            &identity_store_path,
+            &crash_marker_path,
+        )
+        .map(|child| SpawnedDaemonProcess {
+            child: ManagedDaemonChild::Os(child),
+            sidecar_events: None,
         });
     }
 
-    match spawn_sidecar_daemon_process(app, options, &identity_store_path) {
+    match spawn_sidecar_daemon_process(app, options, &identity_store_path, &crash_marker_path) {
         Ok((sidecar_events, child)) => Ok(SpawnedDaemonProcess {
             child: ManagedDaemonChild::Sidecar(child),
             sidecar_events: Some(sidecar_events),
         }),
         Err(sidecar_error) => {
             let executable = resolve_adjacent_daemon_executable()?;
-            spawn_os_daemon_process(&executable, options, &identity_store_path)
-                .map(|child| SpawnedDaemonProcess {
-                    child: ManagedDaemonChild::Os(child),
-                    sidecar_events: None,
-                })
-                .map_err(|fallback_error| {
-                    format!(
-                        "failed to start bundled akraz-daemon sidecar: {sidecar_error}. Also failed to start adjacent daemon at {}: {fallback_error}",
-                        executable.display()
-                    )
-                })
+            spawn_os_daemon_process(
+                &executable,
+                options,
+                &identity_store_path,
+                &crash_marker_path,
+            )
+            .map(|child| SpawnedDaemonProcess {
+                child: ManagedDaemonChild::Os(child),
+                sidecar_events: None,
+            })
+            .map_err(|fallback_error| {
+                format!(
+                    "failed to start bundled akraz-daemon sidecar: {sidecar_error}. Also failed to start adjacent daemon at {}: {fallback_error}",
+                    executable.display()
+                )
+            })
         }
     }
 }
@@ -1504,11 +1589,16 @@ fn spawn_sidecar_daemon_process(
     app: &tauri::AppHandle,
     options: &DaemonStartOptions,
     identity_store_path: &Path,
+    crash_marker_path: &Path,
 ) -> Result<(Receiver<CommandEvent>, CommandChild), String> {
     app.shell()
         .sidecar(DAEMON_SIDECAR_NAME)
         .map_err(|error| error.to_string())?
-        .args(daemon_spawn_args(options, identity_store_path)?)
+        .args(daemon_spawn_args(
+            options,
+            identity_store_path,
+            crash_marker_path,
+        )?)
         .spawn()
         .map_err(|error| error.to_string())
 }
@@ -1517,9 +1607,14 @@ fn spawn_os_daemon_process(
     executable: &PathBuf,
     options: &DaemonStartOptions,
     identity_store_path: &Path,
+    crash_marker_path: &Path,
 ) -> Result<Child, String> {
     StdCommand::new(executable)
-        .args(daemon_spawn_args(options, identity_store_path)?)
+        .args(daemon_spawn_args(
+            options,
+            identity_store_path,
+            crash_marker_path,
+        )?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1535,11 +1630,13 @@ fn spawn_os_daemon_process(
 fn daemon_spawn_args(
     options: &DaemonStartOptions,
     identity_store_path: &Path,
+    crash_marker_path: &Path,
 ) -> Result<Vec<String>, String> {
     daemon_spawn_args_from(
         options,
         std::env::var_os(DAEMON_CAPTURE_INPUT_ENV),
         Some(identity_store_path),
+        Some(crash_marker_path),
     )
 }
 
@@ -1547,6 +1644,7 @@ fn daemon_spawn_args_from(
     options: &DaemonStartOptions,
     capture_input: Option<OsString>,
     identity_store_path: Option<&Path>,
+    crash_marker_path: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     let mut args = vec![DAEMON_SERVE_ARG.to_string()];
     if let Some(identity_store_path) = identity_store_path {
@@ -1554,6 +1652,10 @@ fn daemon_spawn_args_from(
         args.push(format_daemon_path_arg(identity_store_path)?);
         args.push(DAEMON_IDENTITY_DISPLAY_NAME_ARG.to_string());
         args.push(DAEMON_IDENTITY_DISPLAY_NAME.to_string());
+    }
+    if let Some(crash_marker_path) = crash_marker_path {
+        args.push(DAEMON_CRASH_MARKER_ARG.to_string());
+        args.push(format_daemon_path_arg(crash_marker_path)?);
     }
     if options
         .capture_input
@@ -1739,30 +1841,34 @@ fn lock_managed_daemon(
 #[cfg(test)]
 mod tests {
     use std::ffi::{OsStr, OsString};
+    use std::fs;
     use std::path::PathBuf;
 
     use akraz_identity::FileIdentityStore;
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonStatus, DiagnosticsKeyboardLayout, DiagnosticsMonitorSnapshot,
-        DiagnosticsScreenTopology, InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities,
-        IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LogicalPointSnapshot,
-        LogicalRectSnapshot, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
-        SessionConnectResult, SessionStatus, to_json_line,
+        ControlModeSnapshot, DaemonCrashMarker, DaemonCrashMarkerPrivacy, DaemonStatus,
+        DiagnosticsKeyboardLayout, DiagnosticsMonitorSnapshot, DiagnosticsScreenTopology,
+        InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities, IpcTransportError,
+        JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LogicalPointSnapshot, LogicalRectSnapshot,
+        PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectResult,
+        SessionStatus, to_json_line,
     };
 
     use super::{
-        AppSettings, DAEMON_CAPTURE_INPUT_ARG, DAEMON_EDGE_BINDING_ARG,
-        DAEMON_IDENTITY_DISPLAY_NAME, DAEMON_IDENTITY_DISPLAY_NAME_ARG, DAEMON_IDENTITY_STORE_ARG,
-        DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_PEER_LISTEN_ARG, DAEMON_SERVE_ARG,
-        DAEMON_SETTINGS_START_SMOKE_FLAG, DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption,
-        DaemonLifecyclePhase, DaemonScreenEdgeOption, DaemonStartOptions, IDENTITY_STORE_DIR_NAME,
-        IDENTITY_STORE_FILE_NAME, LayoutSettings, ManualPeerAddressSetting,
-        build_identity_show_result_from_path, classify_daemon_call_error,
-        daemon_capture_input_enabled_from, daemon_executable_name, daemon_spawn_args_from,
-        default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
-        has_exact_arg, identity_store_path_from_config_dir, list_trusted_identities_from_path,
+        AppSettings, DAEMON_CAPTURE_INPUT_ARG, DAEMON_CRASH_DIR_NAME, DAEMON_CRASH_MARKER_ARG,
+        DAEMON_CRASH_MARKER_FILE_NAME, DAEMON_EDGE_BINDING_ARG, DAEMON_IDENTITY_DISPLAY_NAME,
+        DAEMON_IDENTITY_DISPLAY_NAME_ARG, DAEMON_IDENTITY_STORE_ARG, DAEMON_LIFECYCLE_SMOKE_FLAG,
+        DAEMON_PEER_LISTEN_ARG, DAEMON_SERVE_ARG, DAEMON_SETTINGS_START_SMOKE_FLAG,
+        DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase, DaemonScreenEdgeOption,
+        DaemonStartOptions, IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME, LayoutSettings,
+        ManualPeerAddressSetting, build_identity_show_result_from_path, classify_daemon_call_error,
+        daemon_capture_input_enabled_from, daemon_crash_marker_path_from_config_dir,
+        daemon_executable_name, daemon_spawn_args_from, default_pairing_capabilities,
+        forget_trusted_identity_from_path, format_edge_binding_arg, has_exact_arg,
+        identity_store_path_from_config_dir, list_trusted_identities_from_path,
         load_layout_from_path, load_settings_from_path, normalize_session_connect_options,
-        parse_daemon_status_response, parse_json_rpc_response, resolve_env_daemon_executable_from,
+        parse_daemon_status_response, parse_json_rpc_response,
+        read_previous_daemon_crash_from_path, resolve_env_daemon_executable_from,
         save_layout_to_path, save_settings_to_path, settings_start_smoke_settings,
         trust_identity_document_from_json,
     };
@@ -2006,13 +2112,14 @@ mod tests {
     #[test]
     fn daemon_spawn_args_include_capture_only_when_enabled() {
         assert_eq!(
-            daemon_spawn_args_from(&DaemonStartOptions::default(), None, None),
+            daemon_spawn_args_from(&DaemonStartOptions::default(), None, None, None),
             Ok(vec![DAEMON_SERVE_ARG.to_string()])
         );
         assert_eq!(
             daemon_spawn_args_from(
                 &DaemonStartOptions::default(),
                 Some(OsString::from("1")),
+                None,
                 None
             ),
             Ok(vec![
@@ -2029,6 +2136,7 @@ mod tests {
                 },
                 Some(OsString::from("1")),
                 None,
+                None,
             ),
             Ok(vec![DAEMON_SERVE_ARG.to_string()])
         );
@@ -2042,7 +2150,8 @@ mod tests {
             daemon_spawn_args_from(
                 &DaemonStartOptions::default(),
                 None,
-                Some(&identity_store_path)
+                Some(&identity_store_path),
+                None
             ),
             Ok(vec![
                 DAEMON_SERVE_ARG.to_string(),
@@ -2050,6 +2159,25 @@ mod tests {
                 "akraz-identity.json".to_string(),
                 DAEMON_IDENTITY_DISPLAY_NAME_ARG.to_string(),
                 DAEMON_IDENTITY_DISPLAY_NAME.to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn daemon_spawn_args_include_crash_marker_when_configured() {
+        let crash_marker_path = PathBuf::from("daemon-crash.json");
+
+        assert_eq!(
+            daemon_spawn_args_from(
+                &DaemonStartOptions::default(),
+                None,
+                None,
+                Some(&crash_marker_path)
+            ),
+            Ok(vec![
+                DAEMON_SERVE_ARG.to_string(),
+                DAEMON_CRASH_MARKER_ARG.to_string(),
+                "daemon-crash.json".to_string()
             ])
         );
     }
@@ -2067,7 +2195,7 @@ mod tests {
         };
 
         assert_eq!(
-            daemon_spawn_args_from(&options, None, None),
+            daemon_spawn_args_from(&options, None, None, None),
             Ok(vec![
                 DAEMON_SERVE_ARG.to_string(),
                 DAEMON_CAPTURE_INPUT_ARG.to_string(),
@@ -2087,7 +2215,7 @@ mod tests {
         };
 
         assert_eq!(
-            daemon_spawn_args_from(&options, None, Some(&identity_store_path)),
+            daemon_spawn_args_from(&options, None, Some(&identity_store_path), None),
             Ok(vec![
                 DAEMON_SERVE_ARG.to_string(),
                 DAEMON_IDENTITY_STORE_ARG.to_string(),
@@ -2099,7 +2227,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            daemon_spawn_args_from(&options, None, None),
+            daemon_spawn_args_from(&options, None, None, None),
             Err("peer listener requires an identity store.".to_string())
         );
     }
@@ -2112,6 +2240,43 @@ mod tests {
                 .join(IDENTITY_STORE_DIR_NAME)
                 .join(IDENTITY_STORE_FILE_NAME)
         );
+    }
+
+    #[test]
+    fn daemon_crash_marker_path_lives_under_config_crash_directory() {
+        assert_eq!(
+            daemon_crash_marker_path_from_config_dir(PathBuf::from("akraz-config")),
+            PathBuf::from("akraz-config")
+                .join(DAEMON_CRASH_DIR_NAME)
+                .join(DAEMON_CRASH_MARKER_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn reads_previous_daemon_crash_marker_from_path() {
+        let path = unique_identity_path("daemon-crash-marker");
+        let marker = DaemonCrashMarker {
+            schema_version: "akraz.daemonCrashMarker/v1".to_string(),
+            process_role: "akraz-daemon".to_string(),
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            reason: "panic".to_string(),
+            panic_message_class: "stringPayload".to_string(),
+            panic_location: None,
+            recorded_at_unix_millis: 123_456,
+            privacy: DaemonCrashMarkerPrivacy::default(),
+        };
+        fs::create_dir_all(path.parent().expect("crash marker parent"))
+            .expect("crash marker parent directory");
+        fs::write(
+            &path,
+            serde_json::to_string(&marker).expect("encoded crash marker"),
+        )
+        .expect("crash marker file");
+
+        let decoded = read_previous_daemon_crash_from_path(&path).expect("previous crash marker");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(decoded, Some(marker));
     }
 
     #[test]
@@ -2512,7 +2677,7 @@ mod tests {
         let options = DaemonStartOptions::from(settings_start_smoke_settings());
 
         assert_eq!(
-            daemon_spawn_args_from(&options, None, Some(&identity_store_path)),
+            daemon_spawn_args_from(&options, None, Some(&identity_store_path), None),
             Ok(vec![
                 DAEMON_SERVE_ARG.to_string(),
                 DAEMON_IDENTITY_STORE_ARG.to_string(),

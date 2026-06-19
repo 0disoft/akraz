@@ -50,6 +50,19 @@ export function recentLogsSummary(bundle: DiagnosticsSupportBundle): string {
   return `${bundle.recentLogs.length}개`;
 }
 
+export function previousDaemonCrashSummary(bundle: DiagnosticsSupportBundle): string {
+  const crash = bundle.previousDaemonCrash;
+  if (!crash) {
+    return "없음";
+  }
+
+  const location = crash.panicLocation
+    ? ` · ${crash.panicLocation.fileName}:${crash.panicLocation.line}`
+    : "";
+
+  return `${crash.reason} · v${crash.daemonVersion}${location}`;
+}
+
 export function formatRecentLogEntry(entry: DaemonLogEntry): string {
   return `#${entry.sequence} · ${entry.level} · ${entry.event} · ${entry.message}`;
 }

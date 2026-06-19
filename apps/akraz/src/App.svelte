@@ -13,6 +13,7 @@
     formatRecentLogEntry,
     includedSectionsSummary,
     latencySummary,
+    previousDaemonCrashSummary,
     recentLogsSummary,
     screenTopologySummary,
     unavailableSectionsSummary,
@@ -115,6 +116,9 @@
     const layoutStartIssue = layoutDaemonStartBlockingIssueForView();
     if (canStartDaemonPhase() && layoutStartIssue) {
       return layoutStartIssue.message;
+    }
+    if (daemonState.snapshot?.previousCrash) {
+      return `이전 백그라운드 프로세스 비정상 종료 · v${daemonState.snapshot.previousCrash.daemonVersion}`;
     }
 
     return daemonState.snapshot?.detail ?? '백그라운드 연결을 시작할 수 있어.';
@@ -741,6 +745,10 @@
             <div>
               <dt>포함</dt>
               <dd>{includedSectionsSummary(diagnosticsState.bundle)}</dd>
+            </div>
+            <div>
+              <dt>이전 종료</dt>
+              <dd>{previousDaemonCrashSummary(diagnosticsState.bundle)}</dd>
             </div>
           {/if}
         </dl>

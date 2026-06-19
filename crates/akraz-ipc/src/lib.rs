@@ -49,6 +49,12 @@ pub const DIAGNOSTICS_SNAPSHOT_SCHEMA_VERSION: &str = "akraz.diagnostics.snapsho
 /// Diagnostics support bundle schema marker emitted by clients.
 pub const DIAGNOSTICS_SUPPORT_BUNDLE_SCHEMA_VERSION: &str = "akraz.diagnostics.supportBundle/v1";
 
+/// Daemon crash marker schema written by akraz-daemon panic hooks.
+pub const DAEMON_CRASH_MARKER_SCHEMA_VERSION: &str = "akraz.daemonCrashMarker/v1";
+
+/// Process role value used by akraz-daemon crash markers.
+pub const DAEMON_CRASH_MARKER_PROCESS_ROLE: &str = "akraz-daemon";
+
 const DIAGNOSTICS_ALWAYS_UNAVAILABLE_SECTIONS: &[&str] = &["recentLogs", "latencyHistogram"];
 const DIAGNOSTICS_BASE_INCLUDED_SECTIONS: &[&str] = &["daemon", "permissions"];
 
@@ -1156,9 +1162,44 @@ pub struct DiagnosticsSupportBundle {
     pub tool_version: String,
     pub snapshot: DiagnosticsSnapshot,
     pub recent_logs: Vec<DaemonLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_daemon_crash: Option<DaemonCrashMarker>,
     pub included_sections: Vec<String>,
     pub unavailable_sections: Vec<String>,
     pub privacy: DiagnosticsPrivacySnapshot,
+}
+
+/// Sanitized crash marker persisted when akraz-daemon exits through a panic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonCrashMarker {
+    pub schema_version: String,
+    pub process_role: String,
+    pub daemon_version: String,
+    pub reason: String,
+    pub panic_message_class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panic_location: Option<DaemonPanicLocation>,
+    pub recorded_at_unix_millis: u64,
+    pub privacy: DaemonCrashMarkerPrivacy,
+}
+
+/// Sanitized panic location without full source paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonPanicLocation {
+    pub file_name: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// Privacy flags for daemon crash markers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonCrashMarkerPrivacy {
+    pub includes_secret_values: bool,
+    pub includes_full_file_paths: bool,
+    pub includes_input_payload: bool,
 }
 
 /// Sanitized daemon facts inside a diagnostics snapshot.
@@ -1338,6 +1379,23 @@ pub fn build_diagnostics_support_bundle(
     generated_by: impl Into<String>,
     tool_version: impl Into<String>,
 ) -> DiagnosticsSupportBundle {
+    build_diagnostics_support_bundle_with_previous_crash(
+        snapshot,
+        recent_logs,
+        None,
+        generated_by,
+        tool_version,
+    )
+}
+
+/// Build a sanitized support bundle with an optional previous daemon crash marker.
+pub fn build_diagnostics_support_bundle_with_previous_crash(
+    snapshot: DiagnosticsSnapshot,
+    recent_logs: Vec<DaemonLogEntry>,
+    previous_daemon_crash: Option<DaemonCrashMarker>,
+    generated_by: impl Into<String>,
+    tool_version: impl Into<String>,
+) -> DiagnosticsSupportBundle {
     let mut included_sections = DIAGNOSTICS_BASE_INCLUDED_SECTIONS
         .iter()
         .map(|section| (*section).to_string())
@@ -1354,6 +1412,9 @@ pub fn build_diagnostics_support_bundle(
     if !recent_logs.is_empty() {
         included_sections.push("recentLogs".to_string());
     }
+    if previous_daemon_crash.is_some() {
+        included_sections.push("previousDaemonCrash".to_string());
+    }
 
     let unavailable_sections = snapshot
         .unavailable_sections
@@ -1369,6 +1430,7 @@ pub fn build_diagnostics_support_bundle(
         included_sections,
         unavailable_sections,
         privacy: snapshot.privacy.clone(),
+        previous_daemon_crash,
         recent_logs,
         snapshot,
     }
@@ -1542,21 +1604,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlModeSnapshot, DaemonLogEntry, DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams,
-        DaemonStatus, DaemonStatusParams, DiagnosticsKeyboardLayout,
-        DiagnosticsKeyboardLayoutParams, DiagnosticsMonitorSnapshot, DiagnosticsPrivacySnapshot,
-        DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, InProcessIpcClient,
-        IpcEndpoint, IpcEndpointEnvironment, IpcEndpointError, IpcEndpointKind, IpcOperatingSystem,
-        IpcPlatformCapabilities, IpcRequest, IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS,
-        JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess,
-        LocalIpcClient, LocalIpcServer, LogicalPointSnapshot, LogicalRectSnapshot,
-        METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
-        METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT,
-        METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PeerStatus, PermissionIssue, PermissionsProbe,
-        ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult,
-        SessionDisconnectParams, SessionDisconnectResult, SessionStatus,
-        build_diagnostics_latency_histogram, build_diagnostics_snapshot,
-        build_diagnostics_support_bundle, call_json_rpc, parse_request_line,
+        ControlModeSnapshot, DaemonCrashMarker, DaemonCrashMarkerPrivacy, DaemonLogEntry,
+        DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams, DaemonPanicLocation, DaemonStatus,
+        DaemonStatusParams, DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams,
+        DiagnosticsMonitorSnapshot, DiagnosticsPrivacySnapshot, DiagnosticsScreenTopology,
+        DiagnosticsScreenTopologyParams, InProcessIpcClient, IpcEndpoint, IpcEndpointEnvironment,
+        IpcEndpointError, IpcEndpointKind, IpcOperatingSystem, IpcPlatformCapabilities, IpcRequest,
+        IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS, JSONRPC_ERROR_METHOD_NOT_FOUND,
+        JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient, LocalIpcServer,
+        LogicalPointSnapshot, LogicalRectSnapshot, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
+        METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
+        OsLocalIpcClient, PeerStatus, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
+        SessionConnectParams, SessionConnectResult, SessionDisconnectParams,
+        SessionDisconnectResult, SessionStatus, build_diagnostics_latency_histogram,
+        build_diagnostics_snapshot, build_diagnostics_support_bundle,
+        build_diagnostics_support_bundle_with_previous_crash, call_json_rpc, parse_request_line,
         resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
     };
     use serde_json::json;
@@ -2021,6 +2084,81 @@ mod tests {
         assert!(!encoded.contains("identitySecretKey"));
         assert!(!encoded.contains("actualKeyInput"));
         assert!(!encoded.contains("textInput"));
+    }
+
+    #[test]
+    fn diagnostics_support_bundle_can_include_sanitized_previous_daemon_crash() {
+        let capabilities = IpcPlatformCapabilities {
+            can_capture_pointer: true,
+            can_capture_keyboard: true,
+            can_inject_pointer: true,
+            can_inject_keyboard: true,
+        };
+        let snapshot = build_diagnostics_snapshot(
+            DaemonStatus {
+                daemon_version: CURRENT_TEST_VERSION.to_string(),
+                mode: ControlModeSnapshot::Local,
+                protocol: ProtocolVersionSnapshot { major: 1, minor: 4 },
+                peers: Vec::new(),
+                capabilities: capabilities.clone(),
+            },
+            PermissionsProbe {
+                adapter_name: "windows".to_string(),
+                capabilities,
+                issues: Vec::new(),
+            },
+            None,
+            None,
+            None,
+            "akraz-app",
+            CURRENT_TEST_VERSION,
+        );
+        let previous_crash = DaemonCrashMarker {
+            schema_version: "akraz.daemonCrashMarker/v1".to_string(),
+            process_role: "akraz-daemon".to_string(),
+            daemon_version: CURRENT_TEST_VERSION.to_string(),
+            reason: "panic".to_string(),
+            panic_message_class: "stringPayload".to_string(),
+            panic_location: Some(DaemonPanicLocation {
+                file_name: "main.rs".to_string(),
+                line: 42,
+                column: 9,
+            }),
+            recorded_at_unix_millis: 123_456,
+            privacy: DaemonCrashMarkerPrivacy::default(),
+        };
+
+        let bundle = build_diagnostics_support_bundle_with_previous_crash(
+            snapshot,
+            Vec::new(),
+            Some(previous_crash),
+            "akraz-app",
+            CURRENT_TEST_VERSION,
+        );
+        let encoded = serde_json::to_string(&bundle).expect("support bundle JSON");
+
+        assert!(
+            bundle
+                .included_sections
+                .contains(&"previousDaemonCrash".to_string())
+        );
+        assert_eq!(
+            bundle
+                .previous_daemon_crash
+                .as_ref()
+                .expect("previous daemon crash")
+                .panic_location
+                .as_ref()
+                .expect("panic location")
+                .file_name,
+            "main.rs"
+        );
+        assert!(!encoded.contains("privateKey"));
+        assert!(!encoded.contains("identitySecretKey"));
+        assert!(!encoded.contains("actualKeyInput"));
+        assert!(!encoded.contains("textInput"));
+        assert!(!encoded.contains("C:\\"));
+        assert!(!encoded.contains("/home/"));
     }
 
     #[test]
