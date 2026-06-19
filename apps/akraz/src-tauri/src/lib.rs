@@ -871,15 +871,12 @@ fn stop_daemon(managed: &ManagedDaemon) -> Result<DaemonStopOutcome, String> {
     }
 
     let shutdown = call_daemon_shutdown().ok();
-    if let Some(shutdown_result) = &shutdown {
-        let snapshot = wait_for_stopped_daemon_snapshot();
-        if snapshot.phase == DaemonLifecyclePhase::NotRunning {
-            clear_managed_child(managed)?;
-            return Ok(DaemonStopOutcome::graceful(
-                snapshot.with_detail("Akraz stopped."),
-                shutdown_result.clone(),
-            ));
-        }
+    if let Some(shutdown_result) = &shutdown
+        && let Some(outcome) =
+            graceful_stop_outcome_if_settled(shutdown_result, wait_for_stopped_daemon_snapshot())
+    {
+        clear_managed_child(managed)?;
+        return Ok(outcome);
     }
 
     let Some(child) = take_managed_child(managed)? else {
@@ -907,6 +904,20 @@ fn stop_daemon(managed: &ManagedDaemon) -> Result<DaemonStopOutcome, String> {
             shutdown,
         )),
     }
+}
+
+fn graceful_stop_outcome_if_settled(
+    shutdown: &DaemonShutdownResult,
+    snapshot: DaemonLifecycleSnapshot,
+) -> Option<DaemonStopOutcome> {
+    if snapshot.phase == DaemonLifecyclePhase::NotRunning {
+        return Some(DaemonStopOutcome::graceful(
+            snapshot.with_detail("Akraz stopped."),
+            shutdown.clone(),
+        ));
+    }
+
+    None
 }
 
 fn read_daemon_snapshot() -> DaemonLifecycleSnapshot {
@@ -1974,9 +1985,9 @@ mod tests {
         classify_daemon_call_error, daemon_capture_input_enabled_from,
         daemon_crash_marker_path_from_config_dir, daemon_executable_name, daemon_spawn_args_from,
         default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
-        has_exact_arg, identity_store_path_from_config_dir, list_trusted_identities_from_path,
-        load_layout_from_path, load_settings_from_path, normalize_session_connect_options,
-        parse_daemon_status_response, parse_json_rpc_response,
+        graceful_stop_outcome_if_settled, has_exact_arg, identity_store_path_from_config_dir,
+        list_trusted_identities_from_path, load_layout_from_path, load_settings_from_path,
+        normalize_session_connect_options, parse_daemon_status_response, parse_json_rpc_response,
         read_previous_daemon_crash_from_path, resolve_env_daemon_executable_from,
         save_layout_to_path, save_settings_to_path, settings_start_smoke_settings,
         trust_identity_document_from_json,
@@ -2823,6 +2834,40 @@ mod tests {
         assert_eq!(value["shutdown"]["requested"], true);
         assert_eq!(value["shutdown"]["releasedInputs"], true);
         assert_eq!(value["shutdown"]["disconnectedPeerSession"], false);
+    }
+
+    #[test]
+    fn daemon_lifecycle_smoke_report_records_forced_kill_fallback_evidence() {
+        let shutdown = DaemonShutdownResult {
+            requested: true,
+            released_inputs: true,
+            disconnected_peer_session: true,
+            mode: ControlModeSnapshot::Remote,
+        };
+        let unsettled_snapshot = DaemonLifecycleSnapshot::running(status_fixture(), Some(42));
+        let mut report =
+            DaemonLifecycleSmokeReport::new(DaemonLifecycleSnapshot::not_running("initial"));
+
+        assert_eq!(
+            graceful_stop_outcome_if_settled(&shutdown, unsettled_snapshot),
+            None
+        );
+
+        report.started = Some(DaemonLifecycleSnapshot::running(status_fixture(), Some(42)));
+        report.record_stop(DaemonStopOutcome::forced(
+            DaemonLifecycleSnapshot::not_running(
+                "Akraz graceful stop did not settle, so the managed process was stopped.",
+            ),
+            Some(shutdown),
+        ));
+
+        let value = serde_json::to_value(&report).expect("smoke report JSON");
+        assert_eq!(value["stopped"]["phase"], "not_running");
+        assert_eq!(value["stopMethod"], "forced_kill");
+        assert_eq!(value["shutdown"]["requested"], true);
+        assert_eq!(value["shutdown"]["releasedInputs"], true);
+        assert_eq!(value["shutdown"]["disconnectedPeerSession"], true);
+        assert_eq!(value["shutdown"]["mode"], "Remote");
     }
 
     #[test]
