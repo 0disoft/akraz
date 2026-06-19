@@ -76,6 +76,13 @@ export interface DiagnosticsLatencyHistogram {
   p99Micros: number;
 }
 
+export interface DiagnosticsRuntimeEnvironment {
+  os: string;
+  family: string;
+  arch: string;
+  sessionType?: string;
+}
+
 export interface DiagnosticsDaemonSnapshot {
   daemonVersion: string;
   mode: ControlMode;
@@ -104,6 +111,7 @@ export interface DiagnosticsSnapshot {
   schemaVersion: string;
   generatedBy: string;
   toolVersion: string;
+  runtimeEnvironment: DiagnosticsRuntimeEnvironment;
   daemon: DiagnosticsDaemonSnapshot;
   permissions: DiagnosticsPermissionsSnapshot;
   screenTopology?: DiagnosticsScreenTopology;
@@ -126,6 +134,7 @@ export interface DiagnosticsSupportBundle {
   schemaVersion: string;
   generatedBy: string;
   toolVersion: string;
+  runtimeEnvironment: DiagnosticsRuntimeEnvironment;
   snapshot?: DiagnosticsSnapshot;
   daemonLifecycle?: DaemonLifecycleSnapshot;
   recentLogs: DaemonLogEntry[];

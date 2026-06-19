@@ -1,4 +1,9 @@
-import type { DaemonLogEntry, DiagnosticsSnapshot, DiagnosticsSupportBundle } from "../api/types";
+import type {
+  DaemonLogEntry,
+  DiagnosticsRuntimeEnvironment,
+  DiagnosticsSnapshot,
+  DiagnosticsSupportBundle,
+} from "../api/types";
 
 export function formatDiagnosticsSnapshot(snapshot: DiagnosticsSnapshot): string {
   return JSON.stringify(snapshot, null, 2);
@@ -40,6 +45,11 @@ export function latencySummary(snapshot: DiagnosticsSnapshot): string {
   }
 
   return `평균 ${formatMicrosAsMillis(latency.averageMicros)} · p95 ${formatMicrosAsMillis(latency.p95Micros)} · p99 ${formatMicrosAsMillis(latency.p99Micros)}`;
+}
+
+export function runtimeEnvironmentSummary(environment: DiagnosticsRuntimeEnvironment): string {
+  const session = environment.sessionType ? ` · ${environment.sessionType}` : "";
+  return `${environment.os}/${environment.arch}${session}`;
 }
 
 export function includedSectionsSummary(bundle: DiagnosticsSupportBundle): string {

@@ -11,8 +11,8 @@ use akraz_identity::{FileIdentityStore, PairingIdentityDocument, TrustedPeerIden
 use akraz_ipc::{
     DaemonCrashMarker, DaemonLogEntry, DaemonLogsTail, DaemonLogsTailParams, DaemonShutdownParams,
     DaemonShutdownResult, DaemonStatus, DaemonStatusParams, DiagnosticsKeyboardLayout,
-    DiagnosticsKeyboardLayoutParams, DiagnosticsPrivacySnapshot, DiagnosticsScreenTopology,
-    DiagnosticsScreenTopologyParams, DiagnosticsSnapshot,
+    DiagnosticsKeyboardLayoutParams, DiagnosticsPrivacySnapshot, DiagnosticsRuntimeEnvironment,
+    DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, DiagnosticsSnapshot,
     DiagnosticsSupportBundle as IpcDiagnosticsSupportBundle, InputReleaseAllParams,
     InputReleaseAllResult, IpcCallError, IpcEndpoint, IpcTransportError, JSONRPC_VERSION,
     JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_LOGS_TAIL,
@@ -20,9 +20,9 @@ use akraz_ipc::{
     METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
     METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe,
     PermissionsProbeParams, SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
-    build_diagnostics_latency_histogram, build_diagnostics_snapshot,
-    build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
-    resolve_current_default_endpoint,
+    build_diagnostics_latency_histogram, build_diagnostics_runtime_environment,
+    build_diagnostics_snapshot, build_diagnostics_support_bundle_with_previous_crash,
+    call_json_rpc, resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 use serde::{Deserialize, Serialize};
@@ -769,6 +769,7 @@ struct AppDiagnosticsSupportBundle {
     schema_version: String,
     generated_by: String,
     tool_version: String,
+    runtime_environment: DiagnosticsRuntimeEnvironment,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<DiagnosticsSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -796,6 +797,7 @@ impl AppDiagnosticsSupportBundle {
             schema_version: bundle.schema_version,
             generated_by: bundle.generated_by,
             tool_version: bundle.tool_version,
+            runtime_environment: bundle.runtime_environment,
             snapshot: Some(bundle.snapshot),
             daemon_lifecycle: Some(Box::new(lifecycle)),
             recent_logs: bundle.recent_logs,
@@ -811,11 +813,13 @@ impl AppDiagnosticsSupportBundle {
             schema_version: "akraz.diagnostics.supportBundle/v1".to_string(),
             generated_by: "akraz-app".to_string(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            runtime_environment: build_diagnostics_runtime_environment(),
             snapshot: None,
             previous_daemon_crash: lifecycle.previous_crash.as_deref().cloned().map(Box::new),
             daemon_lifecycle: Some(Box::new(lifecycle)),
             recent_logs: Vec::new(),
             included_sections: vec![
+                "runtimeEnvironment".to_string(),
                 "daemonLifecycle".to_string(),
                 "previousDaemonCrash".to_string(),
             ],
@@ -2638,6 +2642,7 @@ mod tests {
         assert_eq!(
             bundle.included_sections,
             vec![
+                "runtimeEnvironment".to_string(),
                 "daemonLifecycle".to_string(),
                 "previousDaemonCrash".to_string()
             ]

@@ -11,6 +11,7 @@ import {
   latencySummary,
   previousDaemonCrashSummary,
   recentLogsSummary,
+  runtimeEnvironmentSummary,
   screenTopologySummary,
   unavailableSectionsSummary,
 } from "../src/lib/diagnostics/diagnosticsSnapshot";
@@ -27,6 +28,12 @@ function snapshotFixture(): DiagnosticsSnapshot {
     schemaVersion: "akraz.diagnostics.snapshot/v1",
     generatedBy: "akraz-app",
     toolVersion: appPackage.version,
+    runtimeEnvironment: {
+      os: "windows",
+      family: "windows",
+      arch: "x86_64",
+      sessionType: "windows-desktop",
+    },
     daemon: {
       daemonVersion: appPackage.version,
       mode: "Local",
@@ -92,6 +99,7 @@ function bundleFixture(): DiagnosticsSupportBundle {
     schemaVersion: "akraz.diagnostics.supportBundle/v1",
     generatedBy: "akraz-app",
     toolVersion: appPackage.version,
+    runtimeEnvironment: snapshot.runtimeEnvironment,
     snapshot,
     recentLogs: [
       {
@@ -102,6 +110,7 @@ function bundleFixture(): DiagnosticsSupportBundle {
       },
     ],
     includedSections: [
+      "runtimeEnvironment",
       "daemon",
       "permissions",
       "screenTopology",
@@ -136,6 +145,12 @@ function lifecycleOnlyBundleFixture(): DiagnosticsSupportBundle {
     schemaVersion: "akraz.diagnostics.supportBundle/v1",
     generatedBy: "akraz-app",
     toolVersion: appPackage.version,
+    runtimeEnvironment: {
+      os: "windows",
+      family: "windows",
+      arch: "x86_64",
+      sessionType: "windows-desktop",
+    },
     daemonLifecycle: {
       phase: "not_running",
       status: null,
@@ -145,7 +160,7 @@ function lifecycleOnlyBundleFixture(): DiagnosticsSupportBundle {
     },
     previousDaemonCrash: previousCrash,
     recentLogs: [],
-    includedSections: ["daemonLifecycle", "previousDaemonCrash"],
+    includedSections: ["runtimeEnvironment", "daemonLifecycle", "previousDaemonCrash"],
     unavailableSections: [
       "daemon",
       "permissions",
@@ -172,6 +187,9 @@ describe("diagnostics snapshot helpers", () => {
     expect(screenTopologySummary(snapshotFixture())).toBe("1920x1080 @ 0,0");
     expect(keyboardLayoutSummary(snapshotFixture())).toBe("0x0412 · 00000412 · 0x0000000004120412");
     expect(latencySummary(snapshotFixture())).toBe("평균 0.45ms · p95 0.90ms · p99 0.90ms");
+    expect(runtimeEnvironmentSummary(snapshotFixture().runtimeEnvironment)).toBe(
+      "windows/x86_64 · windows-desktop",
+    );
     expect(unavailableSectionsSummary(snapshotFixture())).toBe("recentLogs");
     expect(recentLogsSummary(bundleFixture())).toBe("1개");
     expect(previousDaemonCrashSummary(bundleFixture())).toBe("없음");
@@ -179,7 +197,7 @@ describe("diagnostics snapshot helpers", () => {
       "#1 · Info · daemon.status · Daemon status requested.",
     );
     expect(includedSectionsSummary(bundleFixture())).toBe(
-      "daemon, permissions, screenTopology, keyboardLayout, latencyHistogram, recentLogs",
+      "runtimeEnvironment, daemon, permissions, screenTopology, keyboardLayout, latencyHistogram, recentLogs",
     );
   });
 
@@ -240,7 +258,9 @@ describe("diagnostics snapshot helpers", () => {
     expect(formatted).toContain('"daemonLifecycle": {');
     expect(formatted).toContain('"previousDaemonCrash": {');
     expect(formatted).not.toContain('"snapshot": {');
-    expect(includedSectionsSummary(bundle)).toBe("daemonLifecycle, previousDaemonCrash");
+    expect(includedSectionsSummary(bundle)).toBe(
+      "runtimeEnvironment, daemonLifecycle, previousDaemonCrash",
+    );
     expect(previousDaemonCrashSummary(bundle)).toBe(`panic · v${appPackage.version}`);
   });
 });

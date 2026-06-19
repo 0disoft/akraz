@@ -15,6 +15,7 @@
     latencySummary,
     previousDaemonCrashSummary,
     recentLogsSummary,
+    runtimeEnvironmentSummary,
     screenTopologySummary,
     unavailableSectionsSummary,
   } from './lib/diagnostics/diagnosticsSnapshot';
@@ -755,6 +756,10 @@
               </dd>
             </div>
             <div>
+              <dt>환경</dt>
+              <dd>{runtimeEnvironmentSummary(diagnosticsState.snapshot.runtimeEnvironment)}</dd>
+            </div>
+            <div>
               <dt>화면</dt>
               <dd>{screenTopologySummary(diagnosticsState.snapshot)}</dd>
             </div>
@@ -782,6 +787,10 @@
             <div>
               <dt>생성</dt>
               <dd>{diagnosticsState.bundle.generatedBy} · v{diagnosticsState.bundle.toolVersion}</dd>
+            </div>
+            <div>
+              <dt>환경</dt>
+              <dd>{runtimeEnvironmentSummary(diagnosticsState.bundle.runtimeEnvironment)}</dd>
             </div>
             <div>
               <dt>포함</dt>

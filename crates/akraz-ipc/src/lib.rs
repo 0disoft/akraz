@@ -56,7 +56,8 @@ pub const DAEMON_CRASH_MARKER_SCHEMA_VERSION: &str = "akraz.daemonCrashMarker/v1
 pub const DAEMON_CRASH_MARKER_PROCESS_ROLE: &str = "akraz-daemon";
 
 const DIAGNOSTICS_ALWAYS_UNAVAILABLE_SECTIONS: &[&str] = &["recentLogs", "latencyHistogram"];
-const DIAGNOSTICS_BASE_INCLUDED_SECTIONS: &[&str] = &["daemon", "permissions"];
+const DIAGNOSTICS_BASE_INCLUDED_SECTIONS: &[&str] =
+    &["runtimeEnvironment", "daemon", "permissions"];
 
 /// JSON-RPC method for daemon status.
 pub const METHOD_DAEMON_STATUS: &str = "daemon.status";
@@ -1162,6 +1163,7 @@ pub struct DiagnosticsSnapshot {
     pub schema_version: String,
     pub generated_by: String,
     pub tool_version: String,
+    pub runtime_environment: DiagnosticsRuntimeEnvironment,
     pub daemon: DiagnosticsDaemonSnapshot,
     pub permissions: DiagnosticsPermissionsSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1181,6 +1183,7 @@ pub struct DiagnosticsSupportBundle {
     pub schema_version: String,
     pub generated_by: String,
     pub tool_version: String,
+    pub runtime_environment: DiagnosticsRuntimeEnvironment,
     pub snapshot: DiagnosticsSnapshot,
     pub recent_logs: Vec<DaemonLogEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1252,6 +1255,17 @@ pub struct DiagnosticsLatencyHistogram {
     pub average_micros: u64,
     pub p95_micros: u64,
     pub p99_micros: u64,
+}
+
+/// Sanitized local runtime environment facts included in diagnostics output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsRuntimeEnvironment {
+    pub os: String,
+    pub family: String,
+    pub arch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_type: Option<String>,
 }
 
 /// Privacy flags describing which sensitive classes are included in a diagnostics snapshot.
@@ -1340,6 +1354,7 @@ pub fn build_diagnostics_snapshot(
         schema_version: DIAGNOSTICS_SNAPSHOT_SCHEMA_VERSION.to_string(),
         generated_by: generated_by.into(),
         tool_version: tool_version.into(),
+        runtime_environment: build_diagnostics_runtime_environment(),
         daemon: DiagnosticsDaemonSnapshot {
             daemon_version: status.daemon_version,
             mode: status.mode,
@@ -1359,6 +1374,65 @@ pub fn build_diagnostics_snapshot(
         privacy: DiagnosticsPrivacySnapshot::default(),
         unavailable_sections,
     }
+}
+
+/// Build sanitized OS and session facts for diagnostics output.
+pub fn build_diagnostics_runtime_environment() -> DiagnosticsRuntimeEnvironment {
+    DiagnosticsRuntimeEnvironment {
+        os: env::consts::OS.to_string(),
+        family: env::consts::FAMILY.to_string(),
+        arch: env::consts::ARCH.to_string(),
+        session_type: diagnostics_session_type_from_values(
+            env::consts::OS,
+            env::var("XDG_SESSION_TYPE").ok().as_deref(),
+            env::var("WAYLAND_DISPLAY").ok().as_deref(),
+            env::var("DISPLAY").ok().as_deref(),
+        ),
+    }
+}
+
+fn diagnostics_session_type_from_values(
+    os: &str,
+    xdg_session_type: Option<&str>,
+    wayland_display: Option<&str>,
+    display: Option<&str>,
+) -> Option<String> {
+    match os {
+        "windows" => return Some("windows-desktop".to_string()),
+        "macos" => return Some("macos-aqua".to_string()),
+        _ => {}
+    }
+
+    if let Some(session_type) = sanitize_session_type(xdg_session_type) {
+        return Some(session_type);
+    }
+    if non_empty_value(wayland_display).is_some() {
+        return Some("wayland".to_string());
+    }
+    if non_empty_value(display).is_some() {
+        return Some("x11".to_string());
+    }
+
+    None
+}
+
+fn sanitize_session_type(value: Option<&str>) -> Option<String> {
+    let value = non_empty_value(value)?.to_ascii_lowercase();
+    if value.len() > 32 {
+        return None;
+    }
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn non_empty_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 /// Build stable latency summary values from elapsed microsecond samples.
@@ -1448,6 +1522,7 @@ pub fn build_diagnostics_support_bundle_with_previous_crash(
         schema_version: DIAGNOSTICS_SUPPORT_BUNDLE_SCHEMA_VERSION.to_string(),
         generated_by: generated_by.into(),
         tool_version: tool_version.into(),
+        runtime_environment: snapshot.runtime_environment.clone(),
         included_sections,
         unavailable_sections,
         privacy: snapshot.privacy.clone(),
@@ -1642,8 +1717,9 @@ mod tests {
         SessionConnectParams, SessionConnectResult, SessionDisconnectParams,
         SessionDisconnectResult, SessionStatus, build_diagnostics_latency_histogram,
         build_diagnostics_snapshot, build_diagnostics_support_bundle,
-        build_diagnostics_support_bundle_with_previous_crash, call_json_rpc, parse_request_line,
-        resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
+        build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
+        diagnostics_session_type_from_values, parse_request_line, resolve_default_endpoint,
+        serve_os_local_ipc_once, to_json_line,
     };
     use serde_json::json;
 
@@ -1683,6 +1759,39 @@ mod tests {
             language_id: "0x0412".to_string(),
             layout_name: Some("00000412".to_string()),
         }
+    }
+
+    #[test]
+    fn diagnostics_runtime_environment_classifies_session_without_raw_display_values() {
+        assert_eq!(
+            diagnostics_session_type_from_values("windows", None, None, None),
+            Some("windows-desktop".to_string())
+        );
+        assert_eq!(
+            diagnostics_session_type_from_values("macos", None, None, None),
+            Some("macos-aqua".to_string())
+        );
+        assert_eq!(
+            diagnostics_session_type_from_values("linux", Some("Wayland"), None, None),
+            Some("wayland".to_string())
+        );
+        assert_eq!(
+            diagnostics_session_type_from_values(
+                "linux",
+                Some("bad value"),
+                Some("wayland-0"),
+                None
+            ),
+            Some("wayland".to_string())
+        );
+        assert_eq!(
+            diagnostics_session_type_from_values("linux", None, None, Some(":0")),
+            Some("x11".to_string())
+        );
+        assert_eq!(
+            diagnostics_session_type_from_values("linux", None, None, None),
+            None
+        );
     }
 
     #[derive(Debug, Clone)]
@@ -1976,6 +2085,12 @@ mod tests {
         assert_eq!(snapshot.schema_version, "akraz.diagnostics.snapshot/v1");
         assert_eq!(snapshot.generated_by, "akrazctl");
         assert_eq!(snapshot.tool_version, "0.4.47");
+        assert_eq!(snapshot.runtime_environment.os, std::env::consts::OS);
+        assert_eq!(
+            snapshot.runtime_environment.family,
+            std::env::consts::FAMILY
+        );
+        assert_eq!(snapshot.runtime_environment.arch, std::env::consts::ARCH);
         assert_eq!(snapshot.daemon.peer_count, 2);
         assert_eq!(snapshot.daemon.connected_peer_count, 1);
         assert_eq!(snapshot.permissions.adapter_name, "windows");
@@ -2076,9 +2191,13 @@ mod tests {
         assert_eq!(bundle.schema_version, "akraz.diagnostics.supportBundle/v1");
         assert_eq!(bundle.generated_by, "akrazctl");
         assert_eq!(bundle.tool_version, CURRENT_TEST_VERSION);
+        assert_eq!(bundle.runtime_environment.os, std::env::consts::OS);
+        assert_eq!(bundle.runtime_environment.family, std::env::consts::FAMILY);
+        assert_eq!(bundle.runtime_environment.arch, std::env::consts::ARCH);
         assert_eq!(
             bundle.included_sections,
             vec![
+                "runtimeEnvironment".to_string(),
                 "daemon".to_string(),
                 "permissions".to_string(),
                 "screenTopology".to_string(),
