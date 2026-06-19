@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.4.82",
+  "version": "0.4.83",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
     "prepare:sidecar": "bun scripts/prepare-sidecar.mjs",
     "prepare:sidecar:release": "bun scripts/prepare-sidecar.mjs --release",
     "qa:windows-mvp-plan": "bun scripts/windows-mvp-qa-plan.mjs",
+    "qa:windows-mvp-report": "bun scripts/windows-mvp-qa-report.mjs",
     "release:signing-preflight": "bun scripts/smoke-signing-preflight.mjs",
     "release:updater-config-preflight": "bun scripts/smoke-updater-config-preflight.mjs",
     "smoke:daemon-lifecycle": "bun scripts/smoke-daemon-lifecycle.mjs",
