@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.4.81",
+  "version": "0.4.82",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "dev": "vite --host 127.0.0.1",
     "prepare:sidecar": "bun scripts/prepare-sidecar.mjs",
     "prepare:sidecar:release": "bun scripts/prepare-sidecar.mjs --release",
+    "qa:windows-mvp-plan": "bun scripts/windows-mvp-qa-plan.mjs",
     "release:signing-preflight": "bun scripts/smoke-signing-preflight.mjs",
     "release:updater-config-preflight": "bun scripts/smoke-updater-config-preflight.mjs",
     "smoke:daemon-lifecycle": "bun scripts/smoke-daemon-lifecycle.mjs",
