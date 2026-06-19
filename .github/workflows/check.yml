@@ -66,3 +66,15 @@ jobs:
       - run: bun run smoke:diagnostics-snapshot
       - run: bun run smoke:daemon-lifecycle
       - run: bun run smoke:settings-start
+      - name: Run Windows MVP soak smoke
+        shell: pwsh
+        run: |
+          bun run smoke:windows-mvp-soak -- --duration-ms 1 --max-cycles 1 --report-file reports/windows-mvp-soak-smoke.json
+      - name: Upload Windows MVP soak report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-mvp-soak-smoke-report
+          path: apps/akraz/reports/windows-mvp-soak-smoke.json
+          if-no-files-found: warn
+          retention-days: 14
