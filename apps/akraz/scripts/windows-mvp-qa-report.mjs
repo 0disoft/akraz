@@ -25,6 +25,7 @@ export function evaluateWindowsMvpQaReport(report, plan = buildWindowsMvpQaPlan(
   const checks = [
     evaluateReportSchema(report),
     evaluateReportPlanSchema(report),
+    evaluateReportExecutionMetadata(report),
     evaluateReportPrivacy(report),
     ...evaluateReportResults(report, plan),
   ];
@@ -53,6 +54,11 @@ export function buildWindowsMvpQaReportTemplate(options = {}) {
     planSchemaVersion: WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
     generatedFrom: "qa:windows-mvp-report-template",
     executedAt: null,
+    environment: {
+      sourceOs: null,
+      targetOs: null,
+      hardware: null,
+    },
     results: plan.cases.map((testCase) => ({
       caseId: testCase.id,
       result: "blocked",
@@ -181,6 +187,48 @@ function evaluateReportPlanSchema(report) {
   }
 
   return buildCheck("planSchema", "pass");
+}
+
+function evaluateReportExecutionMetadata(report) {
+  const environment = report?.environment;
+
+  if (!hasStrictIsoUtcTimestamp(report?.executedAt)) {
+    return buildCheck("executionMetadata", "invalid", {
+      detail: "executedAtMustBeStrictIsoUtc",
+    });
+  }
+
+  if (!environment || typeof environment !== "object") {
+    return buildCheck("executionMetadata", "missing", {
+      detail: "environmentMissing",
+      fields: ["sourceOs", "targetOs", "hardware"],
+    });
+  }
+
+  const missingFields = ["sourceOs", "targetOs", "hardware"].filter(
+    (field) => !hasText(environment[field]),
+  );
+  if (missingFields.length > 0) {
+    return buildCheck("executionMetadata", "missing", {
+      detail: "environmentFieldsMissing",
+      fields: missingFields,
+    });
+  }
+
+  if (
+    containsUnsafeReportText([
+      environment.sourceOs,
+      environment.targetOs,
+      environment.hardware,
+      environment.notes,
+    ])
+  ) {
+    return buildCheck("executionMetadata", "invalid", {
+      detail: "environmentContainsSensitiveOrLocalPathData",
+    });
+  }
+
+  return buildCheck("executionMetadata", "pass");
 }
 
 function evaluateReportPrivacy(report) {
@@ -338,11 +386,11 @@ function hasEvidence(result) {
 }
 
 function containsUnsafeEvidence(result) {
-  const serialized = JSON.stringify({
-    evidence: result?.evidence ?? [],
-    reason: result?.reason ?? "",
-  });
+  return containsUnsafeReportText([result?.evidence ?? [], result?.reason ?? ""]);
+}
 
+function containsUnsafeReportText(values) {
+  const serialized = JSON.stringify(values);
   return (
     /[A-Z]:\\/i.test(serialized) ||
     /\\\\[^\\]+\\/i.test(serialized) ||
@@ -350,6 +398,19 @@ function containsUnsafeEvidence(result) {
     /PRIVATE KEY/i.test(serialized) ||
     /안녕|こんにちは|konnichi/i.test(serialized)
   );
+}
+
+function hasStrictIsoUtcTimestamp(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) {
+    return false;
+  }
+
+  const timestamp = new Date(value);
+  return !Number.isNaN(timestamp.getTime()) && timestamp.toISOString() === value;
 }
 
 function buildCheck(id, status, extra = {}) {

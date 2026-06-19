@@ -21,6 +21,11 @@ function passingReport() {
     schemaVersion: WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION,
     planSchemaVersion: WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
     executedAt: "2026-06-20T00:00:00.000Z",
+    environment: {
+      sourceOs: "Windows 11",
+      targetOs: "Windows 11",
+      hardware: "two physical Windows endpoints",
+    },
     results: listWindowsMvpQaCaseIds().map((caseId) => ({
       caseId,
       result: "pass",
@@ -175,6 +180,11 @@ describe("Windows MVP QA report evaluation", () => {
       planSchemaVersion: WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
       generatedFrom: "qa:windows-mvp-report-template",
       executedAt: null,
+      environment: {
+        sourceOs: null,
+        targetOs: null,
+        hardware: null,
+      },
       privacy: {
         includesTypedContent: false,
         includesSecretValues: false,
@@ -192,6 +202,10 @@ describe("Windows MVP QA report evaluation", () => {
       failed: 0,
       blocked: 5,
       skipped: 0,
+    });
+    expect(evaluation.checks.find((check) => check.id === "executionMetadata")).toMatchObject({
+      status: "invalid",
+      detail: "executedAtMustBeStrictIsoUtc",
     });
   });
 
@@ -217,6 +231,39 @@ describe("Windows MVP QA report evaluation", () => {
     expect(() => parseWindowsMvpQaReportArgs(["--case-id", "WIN-007"])).toThrow(
       "--case-id can only be used with --template",
     );
+  });
+
+  test("requires strict execution timestamp and sanitized environment metadata", () => {
+    const missingMetadataReport = passingReport();
+    delete missingMetadataReport.environment;
+    const invalidTimestampReport = passingReport();
+    invalidTimestampReport.executedAt = "2026-06-20";
+    const unsafeEnvironmentReport = passingReport();
+    unsafeEnvironmentReport.environment.hardware = "C:\\Users\\cherr\\Desktop\\qa.json";
+
+    const missingMetadataEvaluation = evaluateWindowsMvpQaReport(missingMetadataReport);
+    const invalidTimestampEvaluation = evaluateWindowsMvpQaReport(invalidTimestampReport);
+    const unsafeEnvironmentEvaluation = evaluateWindowsMvpQaReport(unsafeEnvironmentReport);
+
+    expect(
+      missingMetadataEvaluation.checks.find((check) => check.id === "executionMetadata"),
+    ).toMatchObject({
+      status: "missing",
+      detail: "environmentMissing",
+      fields: ["sourceOs", "targetOs", "hardware"],
+    });
+    expect(
+      invalidTimestampEvaluation.checks.find((check) => check.id === "executionMetadata"),
+    ).toMatchObject({
+      status: "invalid",
+      detail: "executedAtMustBeStrictIsoUtc",
+    });
+    expect(
+      unsafeEnvironmentEvaluation.checks.find((check) => check.id === "executionMetadata"),
+    ).toMatchObject({
+      status: "invalid",
+      detail: "environmentContainsSensitiveOrLocalPathData",
+    });
   });
 
   test("parses and writes template or evaluation JSON to an output file", () => {
