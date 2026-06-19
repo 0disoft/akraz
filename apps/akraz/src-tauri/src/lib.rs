@@ -743,6 +743,7 @@ impl DaemonLifecycleSnapshot {
 enum DaemonStopMethod {
     GracefulShutdown,
     ForcedKill,
+    Detached,
     Unmanaged,
 }
 
@@ -772,6 +773,10 @@ impl DaemonStopOutcome {
 
     fn forced(snapshot: DaemonLifecycleSnapshot, shutdown: Option<DaemonShutdownResult>) -> Self {
         Self::new(snapshot, DaemonStopMethod::ForcedKill, shutdown)
+    }
+
+    fn detached(snapshot: DaemonLifecycleSnapshot, shutdown: Option<DaemonShutdownResult>) -> Self {
+        Self::new(snapshot, DaemonStopMethod::Detached, shutdown)
     }
 
     fn unmanaged(snapshot: DaemonLifecycleSnapshot) -> Self {
@@ -880,15 +885,9 @@ fn stop_daemon(managed: &ManagedDaemon) -> Result<DaemonStopOutcome, String> {
     }
 
     let Some(child) = take_managed_child(managed)? else {
-        let method = if shutdown.is_some() {
-            DaemonStopMethod::GracefulShutdown
-        } else {
-            DaemonStopMethod::Unmanaged
-        };
-        return Ok(DaemonStopOutcome::new(
-            read_daemon_snapshot().with_detail("Akraz stopped."),
-            method,
+        return Ok(stop_outcome_without_managed_child(
             shutdown,
+            read_daemon_snapshot(),
         ));
     };
 
@@ -904,6 +903,35 @@ fn stop_daemon(managed: &ManagedDaemon) -> Result<DaemonStopOutcome, String> {
             shutdown,
         )),
     }
+}
+
+fn stop_outcome_without_managed_child(
+    shutdown: Option<DaemonShutdownResult>,
+    snapshot: DaemonLifecycleSnapshot,
+) -> DaemonStopOutcome {
+    if snapshot.phase == DaemonLifecyclePhase::NotRunning {
+        let snapshot = snapshot.with_detail("Akraz stopped.");
+        return match shutdown {
+            Some(shutdown) => DaemonStopOutcome::graceful(snapshot, shutdown),
+            None => DaemonStopOutcome::unmanaged(snapshot),
+        };
+    }
+
+    let detail = match (shutdown.is_some(), snapshot.phase) {
+        (true, DaemonLifecyclePhase::Running) => {
+            "Akraz stop was requested, but this app no longer owns a process handle and the daemon is still reachable."
+        }
+        (false, DaemonLifecyclePhase::Running) => {
+            "This app no longer owns the Akraz background process, and the daemon is still reachable."
+        }
+        (true, _) => {
+            "Akraz stop was requested, but this app no longer owns a process handle and the daemon state could not be confirmed."
+        }
+        (false, _) => {
+            "This app no longer owns the Akraz background process, and the daemon state could not be confirmed."
+        }
+    };
+    DaemonStopOutcome::detached(snapshot.with_detail(detail), shutdown)
 }
 
 fn graceful_stop_outcome_if_settled(
@@ -1980,17 +2008,18 @@ mod tests {
         DAEMON_PEER_LISTEN_ARG, DAEMON_SERVE_ARG, DAEMON_SETTINGS_START_SMOKE_FLAG,
         DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase,
         DaemonLifecycleSmokeReport, DaemonLifecycleSnapshot, DaemonScreenEdgeOption,
-        DaemonStartOptions, DaemonStopOutcome, IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME,
-        LayoutSettings, ManualPeerAddressSetting, build_identity_show_result_from_path,
-        classify_daemon_call_error, daemon_capture_input_enabled_from,
-        daemon_crash_marker_path_from_config_dir, daemon_executable_name, daemon_spawn_args_from,
-        default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
+        DaemonStartOptions, DaemonStopMethod, DaemonStopOutcome, IDENTITY_STORE_DIR_NAME,
+        IDENTITY_STORE_FILE_NAME, LayoutSettings, ManualPeerAddressSetting,
+        build_identity_show_result_from_path, classify_daemon_call_error,
+        daemon_capture_input_enabled_from, daemon_crash_marker_path_from_config_dir,
+        daemon_executable_name, daemon_spawn_args_from, default_pairing_capabilities,
+        forget_trusted_identity_from_path, format_edge_binding_arg,
         graceful_stop_outcome_if_settled, has_exact_arg, identity_store_path_from_config_dir,
         list_trusted_identities_from_path, load_layout_from_path, load_settings_from_path,
         normalize_session_connect_options, parse_daemon_status_response, parse_json_rpc_response,
         read_previous_daemon_crash_from_path, resolve_env_daemon_executable_from,
         save_layout_to_path, save_settings_to_path, settings_start_smoke_settings,
-        trust_identity_document_from_json,
+        stop_outcome_without_managed_child, trust_identity_document_from_json,
     };
 
     fn monitor_snapshots() -> Vec<DiagnosticsMonitorSnapshot> {
@@ -2868,6 +2897,71 @@ mod tests {
         assert_eq!(value["shutdown"]["releasedInputs"], true);
         assert_eq!(value["shutdown"]["disconnectedPeerSession"], true);
         assert_eq!(value["shutdown"]["mode"], "Remote");
+    }
+
+    #[test]
+    fn stop_without_managed_child_reports_detached_when_daemon_is_still_running() {
+        let shutdown = DaemonShutdownResult {
+            requested: true,
+            released_inputs: true,
+            disconnected_peer_session: false,
+            mode: ControlModeSnapshot::Local,
+        };
+
+        let outcome = stop_outcome_without_managed_child(
+            Some(shutdown.clone()),
+            DaemonLifecycleSnapshot::running(status_fixture(), None),
+        );
+
+        assert_eq!(outcome.method, DaemonStopMethod::Detached);
+        assert_eq!(outcome.shutdown, Some(shutdown));
+        assert_eq!(outcome.snapshot.phase, DaemonLifecyclePhase::Running);
+        assert_eq!(
+            outcome.snapshot.detail,
+            Some(
+                "Akraz stop was requested, but this app no longer owns a process handle and the daemon is still reachable."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn stop_without_managed_child_reports_stopped_when_endpoint_is_gone() {
+        let shutdown = DaemonShutdownResult {
+            requested: true,
+            released_inputs: true,
+            disconnected_peer_session: false,
+            mode: ControlModeSnapshot::Local,
+        };
+
+        let outcome = stop_outcome_without_managed_child(
+            Some(shutdown.clone()),
+            DaemonLifecycleSnapshot::not_running("old detail"),
+        );
+
+        assert_eq!(outcome.method, DaemonStopMethod::GracefulShutdown);
+        assert_eq!(outcome.shutdown, Some(shutdown));
+        assert_eq!(outcome.snapshot.phase, DaemonLifecyclePhase::NotRunning);
+        assert_eq!(outcome.snapshot.detail, Some("Akraz stopped.".to_string()));
+    }
+
+    #[test]
+    fn stop_without_managed_child_does_not_claim_reachable_for_ambiguous_state() {
+        let outcome = stop_outcome_without_managed_child(
+            None,
+            DaemonLifecycleSnapshot::unreachable("pipe closed"),
+        );
+
+        assert_eq!(outcome.method, DaemonStopMethod::Detached);
+        assert_eq!(outcome.shutdown, None);
+        assert_eq!(outcome.snapshot.phase, DaemonLifecyclePhase::Unreachable);
+        assert_eq!(
+            outcome.snapshot.detail,
+            Some(
+                "This app no longer owns the Akraz background process, and the daemon state could not be confirmed."
+                    .to_string()
+            )
+        );
     }
 
     #[test]
