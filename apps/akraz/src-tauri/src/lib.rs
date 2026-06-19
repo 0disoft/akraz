@@ -129,7 +129,7 @@ fn run_daemon_lifecycle_smoke() -> Result<(), String> {
     let started = start_daemon(&handle, &managed, DaemonStartOptions::default())?;
     report.started = Some(started.clone());
     if started.phase != DaemonLifecyclePhase::Running {
-        report.stopped = Some(stop_daemon(&managed)?);
+        report.record_stop(stop_daemon(&managed)?);
         print_smoke_report(&report)?;
         return Err(format!(
             "daemon lifecycle smoke expected running after start, got {:?}",
@@ -142,9 +142,10 @@ fn run_daemon_lifecycle_smoke() -> Result<(), String> {
     }
 
     let stopped = stop_daemon(&managed)?;
-    report.stopped = Some(stopped.clone());
+    let stopped_phase = stopped.snapshot.phase;
+    report.record_stop(stopped);
     print_smoke_report(&report)?;
-    if stopped.phase == DaemonLifecyclePhase::Running {
+    if stopped_phase == DaemonLifecyclePhase::Running {
         return Err(
             "daemon lifecycle smoke expected daemon to stop, but it is still running.".to_string(),
         );
@@ -187,7 +188,7 @@ fn run_daemon_settings_start_smoke() -> Result<(), String> {
     let started = start_daemon(&handle, &managed, DaemonStartOptions::from(loaded_settings))?;
     report.started = Some(started.clone());
     if started.phase != DaemonLifecyclePhase::Running {
-        report.stopped = Some(stop_daemon(&managed)?);
+        report.record_stop(stop_daemon(&managed)?);
         print_smoke_report(&report)?;
         return Err(format!(
             "daemon settings smoke expected running after configured start, got {:?}",
@@ -200,9 +201,10 @@ fn run_daemon_settings_start_smoke() -> Result<(), String> {
     }
 
     let stopped = stop_daemon(&managed)?;
-    report.stopped = Some(stopped.clone());
+    let stopped_phase = stopped.snapshot.phase;
+    report.record_stop(stopped);
     print_smoke_report(&report)?;
-    if stopped.phase == DaemonLifecyclePhase::Running {
+    if stopped_phase == DaemonLifecyclePhase::Running {
         return Err(
             "daemon settings smoke expected daemon to stop, but it is still running.".to_string(),
         );
@@ -237,7 +239,7 @@ fn record_smoke_permissions(
             Ok(())
         }
         Err(error) => {
-            report.stopped = Some(stop_daemon(managed)?);
+            report.record_stop(stop_daemon(managed)?);
             Err(format!("daemon smoke permissions probe failed: {error}"))
         }
     }
@@ -275,6 +277,10 @@ struct DaemonLifecycleSmokeReport {
     permissions: Option<PermissionsProbe>,
     started: Option<DaemonLifecycleSnapshot>,
     stopped: Option<DaemonLifecycleSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_method: Option<DaemonStopMethod>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shutdown: Option<DaemonShutdownResult>,
 }
 
 impl DaemonLifecycleSmokeReport {
@@ -285,7 +291,15 @@ impl DaemonLifecycleSmokeReport {
             permissions: None,
             started: None,
             stopped: None,
+            stop_method: None,
+            shutdown: None,
         }
+    }
+
+    fn record_stop(&mut self, outcome: DaemonStopOutcome) {
+        self.stop_method = Some(outcome.method);
+        self.shutdown = outcome.shutdown;
+        self.stopped = Some(outcome.snapshot);
     }
 }
 
@@ -356,7 +370,7 @@ async fn daemon_stop(
 ) -> Result<DaemonLifecycleSnapshot, String> {
     let managed = Arc::clone(managed.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        stop_daemon(&managed).map(|snapshot| attach_previous_daemon_crash(&app, snapshot))
+        stop_daemon(&managed).map(|outcome| attach_previous_daemon_crash(&app, outcome.snapshot))
     })
     .await
     .map_err(|error| format!("daemon stop task failed: {error}"))?
@@ -724,6 +738,47 @@ impl DaemonLifecycleSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DaemonStopMethod {
+    GracefulShutdown,
+    ForcedKill,
+    Unmanaged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonStopOutcome {
+    snapshot: DaemonLifecycleSnapshot,
+    method: DaemonStopMethod,
+    shutdown: Option<DaemonShutdownResult>,
+}
+
+impl DaemonStopOutcome {
+    fn new(
+        snapshot: DaemonLifecycleSnapshot,
+        method: DaemonStopMethod,
+        shutdown: Option<DaemonShutdownResult>,
+    ) -> Self {
+        Self {
+            snapshot,
+            method,
+            shutdown,
+        }
+    }
+
+    fn graceful(snapshot: DaemonLifecycleSnapshot, shutdown: DaemonShutdownResult) -> Self {
+        Self::new(snapshot, DaemonStopMethod::GracefulShutdown, Some(shutdown))
+    }
+
+    fn forced(snapshot: DaemonLifecycleSnapshot, shutdown: Option<DaemonShutdownResult>) -> Self {
+        Self::new(snapshot, DaemonStopMethod::ForcedKill, shutdown)
+    }
+
+    fn unmanaged(snapshot: DaemonLifecycleSnapshot) -> Self {
+        Self::new(snapshot, DaemonStopMethod::Unmanaged, None)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DaemonCallFailure {
     NotRunning(String),
@@ -807,29 +862,50 @@ fn start_daemon(
     ))
 }
 
-fn stop_daemon(managed: &ManagedDaemon) -> Result<DaemonLifecycleSnapshot, String> {
+fn stop_daemon(managed: &ManagedDaemon) -> Result<DaemonStopOutcome, String> {
     if managed_daemon_pid(managed)?.is_none() {
-        return Ok(read_daemon_snapshot()
-            .with_detail("This app did not start the current Akraz background process."));
+        return Ok(DaemonStopOutcome::unmanaged(
+            read_daemon_snapshot()
+                .with_detail("This app did not start the current Akraz background process."),
+        ));
     }
 
-    if let Ok(_shutdown) = call_daemon_shutdown() {
+    let shutdown = call_daemon_shutdown().ok();
+    if let Some(shutdown_result) = &shutdown {
         let snapshot = wait_for_stopped_daemon_snapshot();
         if snapshot.phase == DaemonLifecyclePhase::NotRunning {
             clear_managed_child(managed)?;
-            return Ok(snapshot.with_detail("Akraz stopped."));
+            return Ok(DaemonStopOutcome::graceful(
+                snapshot.with_detail("Akraz stopped."),
+                shutdown_result.clone(),
+            ));
         }
     }
 
     let Some(child) = take_managed_child(managed)? else {
-        return Ok(read_daemon_snapshot().with_detail("Akraz stopped."));
+        let method = if shutdown.is_some() {
+            DaemonStopMethod::GracefulShutdown
+        } else {
+            DaemonStopMethod::Unmanaged
+        };
+        return Ok(DaemonStopOutcome::new(
+            read_daemon_snapshot().with_detail("Akraz stopped."),
+            method,
+            shutdown,
+        ));
     };
 
     match child.kill() {
-        Ok(()) => Ok(wait_for_stopped_daemon_snapshot().with_detail(
-            "Akraz graceful stop did not settle, so the managed process was stopped.",
+        Ok(()) => Ok(DaemonStopOutcome::forced(
+            wait_for_stopped_daemon_snapshot().with_detail(
+                "Akraz graceful stop did not settle, so the managed process was stopped.",
+            ),
+            shutdown,
         )),
-        Err(error) => Ok(DaemonLifecycleSnapshot::failed(error)),
+        Err(error) => Ok(DaemonStopOutcome::forced(
+            DaemonLifecycleSnapshot::failed(error),
+            shutdown,
+        )),
     }
 }
 
@@ -1891,13 +1967,14 @@ mod tests {
         DAEMON_CRASH_MARKER_FILE_NAME, DAEMON_EDGE_BINDING_ARG, DAEMON_IDENTITY_DISPLAY_NAME,
         DAEMON_IDENTITY_DISPLAY_NAME_ARG, DAEMON_IDENTITY_STORE_ARG, DAEMON_LIFECYCLE_SMOKE_FLAG,
         DAEMON_PEER_LISTEN_ARG, DAEMON_SERVE_ARG, DAEMON_SETTINGS_START_SMOKE_FLAG,
-        DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase, DaemonScreenEdgeOption,
-        DaemonStartOptions, IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME, LayoutSettings,
-        ManualPeerAddressSetting, build_identity_show_result_from_path, classify_daemon_call_error,
-        daemon_capture_input_enabled_from, daemon_crash_marker_path_from_config_dir,
-        daemon_executable_name, daemon_spawn_args_from, default_pairing_capabilities,
-        forget_trusted_identity_from_path, format_edge_binding_arg, has_exact_arg,
-        identity_store_path_from_config_dir, list_trusted_identities_from_path,
+        DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase,
+        DaemonLifecycleSmokeReport, DaemonLifecycleSnapshot, DaemonScreenEdgeOption,
+        DaemonStartOptions, DaemonStopOutcome, IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME,
+        LayoutSettings, ManualPeerAddressSetting, build_identity_show_result_from_path,
+        classify_daemon_call_error, daemon_capture_input_enabled_from,
+        daemon_crash_marker_path_from_config_dir, daemon_executable_name, daemon_spawn_args_from,
+        default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
+        has_exact_arg, identity_store_path_from_config_dir, list_trusted_identities_from_path,
         load_layout_from_path, load_settings_from_path, normalize_session_connect_options,
         parse_daemon_status_response, parse_json_rpc_response,
         read_previous_daemon_crash_from_path, resolve_env_daemon_executable_from,
@@ -2720,6 +2797,32 @@ mod tests {
             parse_json_rpc_response::<DaemonShutdownResult>(&line, "daemon shutdown"),
             Ok(result)
         );
+    }
+
+    #[test]
+    fn daemon_lifecycle_smoke_report_records_graceful_stop_evidence() {
+        let shutdown = DaemonShutdownResult {
+            requested: true,
+            released_inputs: true,
+            disconnected_peer_session: false,
+            mode: ControlModeSnapshot::Local,
+        };
+        let mut report =
+            DaemonLifecycleSmokeReport::new(DaemonLifecycleSnapshot::not_running("initial"));
+
+        report.started = Some(DaemonLifecycleSnapshot::running(status_fixture(), Some(42)));
+        report.record_stop(DaemonStopOutcome::graceful(
+            DaemonLifecycleSnapshot::not_running("Akraz stopped."),
+            shutdown,
+        ));
+
+        let value = serde_json::to_value(&report).expect("smoke report JSON");
+        assert_eq!(value["started"]["phase"], "running");
+        assert_eq!(value["stopped"]["phase"], "not_running");
+        assert_eq!(value["stopMethod"], "graceful_shutdown");
+        assert_eq!(value["shutdown"]["requested"], true);
+        assert_eq!(value["shutdown"]["releasedInputs"], true);
+        assert_eq!(value["shutdown"]["disconnectedPeerSession"], false);
     }
 
     #[test]

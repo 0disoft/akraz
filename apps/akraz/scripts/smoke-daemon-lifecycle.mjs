@@ -70,6 +70,7 @@ const report = JSON.parse(reportLine);
 assertPhase(report.initial?.phase, "not_running", "initial");
 assertPhase(report.started?.phase, "running", "started");
 assertPhase(report.stopped?.phase, "not_running", "stopped");
+assertGracefulStop(report);
 assertPermissions(report.permissions);
 if (smokeProfile.expectSettings) {
   assertSettings(report.settings);
@@ -87,6 +88,26 @@ console.log(`${smokeProfile.label[0].toUpperCase()}${smokeProfile.label.slice(1)
 function assertPhase(actual, expected, label) {
   if (actual !== expected) {
     throw new Error(`${smokeProfile.label} expected ${label} phase ${expected}, got ${actual}`);
+  }
+}
+
+function assertGracefulStop(smokeReport) {
+  if (smokeReport.stopMethod !== "graceful_shutdown") {
+    throw new Error(
+      `${smokeProfile.label} expected graceful shutdown stop method, got ${smokeReport.stopMethod}`,
+    );
+  }
+  if (!smokeReport.shutdown?.requested) {
+    throw new Error(`${smokeProfile.label} did not report a requested daemon shutdown`);
+  }
+  if (typeof smokeReport.shutdown.releasedInputs !== "boolean") {
+    throw new Error(`${smokeProfile.label} reported invalid shutdown releasedInputs`);
+  }
+  if (typeof smokeReport.shutdown.disconnectedPeerSession !== "boolean") {
+    throw new Error(`${smokeProfile.label} reported invalid shutdown disconnectedPeerSession`);
+  }
+  if (typeof smokeReport.shutdown.mode !== "string" || smokeReport.shutdown.mode.length === 0) {
+    throw new Error(`${smokeProfile.label} reported invalid shutdown mode`);
   }
 }
 
