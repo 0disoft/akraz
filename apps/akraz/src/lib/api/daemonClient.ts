@@ -15,6 +15,10 @@ export const daemonClient = {
     return invoke<DaemonLifecycleSnapshot>("daemon_status");
   },
 
+  acknowledgeCrash(): Promise<DaemonLifecycleSnapshot> {
+    return invoke<DaemonLifecycleSnapshot>("daemon_crash_acknowledge");
+  },
+
   probePermissions(): Promise<PermissionsProbe> {
     return invoke<PermissionsProbe>("permissions_probe");
   },

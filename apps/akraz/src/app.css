@@ -162,6 +162,30 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+.previous-crash-banner {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid #e4b5a5;
+  border-radius: 8px;
+  background: #fff0ea;
+}
+
+.previous-crash-banner div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.previous-crash-banner span {
+  color: #6f584f;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1018,6 +1042,15 @@ h3 {
   .control-button {
     min-width: 0;
     padding: 0 10px;
+  }
+
+  .previous-crash-banner {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .previous-crash-banner .control-button {
+    align-self: flex-start;
   }
 
   .grid {

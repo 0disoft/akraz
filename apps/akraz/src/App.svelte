@@ -697,6 +697,25 @@
       </div>
     {/if}
 
+    {#if daemonState.snapshot?.previousCrash}
+      <div class="previous-crash-banner" role="status">
+        <div>
+          <strong>이전 비정상 종료</strong>
+          <span>
+            {daemonState.snapshot.previousCrash.reason} · v{daemonState.snapshot.previousCrash.daemonVersion}
+          </span>
+        </div>
+        <button
+          type="button"
+          class="control-button secondary compact"
+          disabled={daemonState.isBusy}
+          onclick={() => daemonState.acknowledgeCrash()}
+        >
+          {daemonState.operation === 'acknowledgeCrash' ? '확인 중' : '확인함'}
+        </button>
+      </div>
+    {/if}
+
     <section class="section-block diagnostics-block" aria-labelledby="diagnostics-title">
       <div class="section-heading-row">
         <h2 id="diagnostics-title">진단</h2>

@@ -80,6 +80,7 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
         .manage(managed)
         .invoke_handler(tauri::generate_handler![
             daemon_status,
+            daemon_crash_acknowledge,
             permissions_probe,
             screen_topology_probe,
             diagnostics_snapshot,
@@ -315,6 +316,23 @@ async fn daemon_status(
     })
     .await
     .map_err(|error| format!("daemon status task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn daemon_crash_acknowledge(
+    app: tauri::AppHandle,
+    managed: tauri::State<'_, ManagedDaemon>,
+) -> Result<DaemonLifecycleSnapshot, String> {
+    let managed = Arc::clone(managed.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        acknowledge_previous_daemon_crash(&app)?;
+        Ok(attach_previous_daemon_crash(
+            &app,
+            refresh_daemon_snapshot(&managed)?,
+        ))
+    })
+    .await
+    .map_err(|error| format!("daemon crash acknowledge task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -968,6 +986,11 @@ fn read_previous_daemon_crash(app: &tauri::AppHandle) -> Option<DaemonCrashMarke
         .and_then(|path| read_previous_daemon_crash_from_path(&path).ok().flatten())
 }
 
+fn acknowledge_previous_daemon_crash(app: &tauri::AppHandle) -> Result<bool, String> {
+    let path = daemon_crash_marker_path(app)?;
+    acknowledge_previous_daemon_crash_from_path(&path)
+}
+
 fn read_previous_daemon_crash_from_path(path: &Path) -> Result<Option<DaemonCrashMarker>, String> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -983,6 +1006,17 @@ fn read_previous_daemon_crash_from_path(path: &Path) -> Result<Option<DaemonCras
     serde_json::from_str(&content)
         .map(Some)
         .map_err(|error| format!("failed to parse previous daemon crash marker: {error}"))
+}
+
+fn acknowledge_previous_daemon_crash_from_path(path: &Path) -> Result<bool, String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "failed to clear previous daemon crash marker {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 fn wait_for_stopped_daemon_snapshot() -> DaemonLifecycleSnapshot {
@@ -2010,10 +2044,10 @@ mod tests {
         DaemonLifecycleSmokeReport, DaemonLifecycleSnapshot, DaemonScreenEdgeOption,
         DaemonStartOptions, DaemonStopMethod, DaemonStopOutcome, IDENTITY_STORE_DIR_NAME,
         IDENTITY_STORE_FILE_NAME, LayoutSettings, ManualPeerAddressSetting,
-        build_identity_show_result_from_path, classify_daemon_call_error,
-        daemon_capture_input_enabled_from, daemon_crash_marker_path_from_config_dir,
-        daemon_executable_name, daemon_spawn_args_from, default_pairing_capabilities,
-        forget_trusted_identity_from_path, format_edge_binding_arg,
+        acknowledge_previous_daemon_crash_from_path, build_identity_show_result_from_path,
+        classify_daemon_call_error, daemon_capture_input_enabled_from,
+        daemon_crash_marker_path_from_config_dir, daemon_executable_name, daemon_spawn_args_from,
+        default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
         graceful_stop_outcome_if_settled, has_exact_arg, identity_store_path_from_config_dir,
         list_trusted_identities_from_path, load_layout_from_path, load_settings_from_path,
         normalize_session_connect_options, parse_daemon_status_response, parse_json_rpc_response,
@@ -2426,6 +2460,31 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         assert_eq!(decoded, Some(marker));
+    }
+
+    #[test]
+    fn acknowledges_previous_daemon_crash_marker_by_deleting_file() {
+        let path = unique_identity_path("daemon-crash-acknowledge");
+        fs::create_dir_all(path.parent().expect("crash marker parent"))
+            .expect("crash marker parent directory");
+        fs::write(&path, "{not-json").expect("crash marker file");
+
+        let acknowledged =
+            acknowledge_previous_daemon_crash_from_path(&path).expect("crash marker acknowledge");
+
+        assert!(acknowledged);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn acknowledging_missing_daemon_crash_marker_is_a_noop() {
+        let path = unique_identity_path("daemon-crash-acknowledge-missing");
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            !acknowledge_previous_daemon_crash_from_path(&path)
+                .expect("missing crash marker acknowledge")
+        );
     }
 
     #[test]

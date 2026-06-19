@@ -8,6 +8,7 @@ import type {
 
 type DaemonOperation =
   | "refresh"
+  | "acknowledgeCrash"
   | "start"
   | "stop"
   | "connectSession"
@@ -29,6 +30,10 @@ export class DaemonState {
 
   async refresh() {
     await this.run("refresh", () => daemonClient.status());
+  }
+
+  async acknowledgeCrash() {
+    await this.run("acknowledgeCrash", () => daemonClient.acknowledgeCrash());
   }
 
   async start(options: DaemonStartOptions = {}) {
