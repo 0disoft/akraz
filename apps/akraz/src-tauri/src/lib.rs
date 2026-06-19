@@ -55,6 +55,8 @@ const DAEMON_START_RETRIES: usize = 50;
 const DAEMON_START_RETRY_DELAY: Duration = Duration::from_millis(40);
 const DAEMON_STOP_RETRIES: usize = 50;
 const DAEMON_STOP_RETRY_DELAY: Duration = Duration::from_millis(40);
+const PREVIOUS_DAEMON_CRASH_START_BLOCKED_DETAIL: &str =
+    "Akraz needs the previous daemon crash to be reviewed before starting again.";
 
 type ManagedDaemon = Arc<Mutex<DaemonProcessState>>;
 
@@ -854,6 +856,9 @@ fn start_daemon(
             Some(pid),
         ));
     }
+    if let Some(previous_crash) = read_previous_daemon_crash(app) {
+        return Ok(previous_daemon_crash_start_blocked_snapshot(previous_crash));
+    }
 
     let spawned = match spawn_daemon_process(app, &options) {
         Ok(spawned) => spawned,
@@ -984,6 +989,13 @@ fn read_previous_daemon_crash(app: &tauri::AppHandle) -> Option<DaemonCrashMarke
     daemon_crash_marker_path(app)
         .ok()
         .and_then(|path| read_previous_daemon_crash_from_path(&path).ok().flatten())
+}
+
+fn previous_daemon_crash_start_blocked_snapshot(
+    previous_crash: DaemonCrashMarker,
+) -> DaemonLifecycleSnapshot {
+    DaemonLifecycleSnapshot::not_running(PREVIOUS_DAEMON_CRASH_START_BLOCKED_DETAIL)
+        .with_previous_crash(Some(previous_crash))
 }
 
 fn acknowledge_previous_daemon_crash(app: &tauri::AppHandle) -> Result<bool, String> {
@@ -2044,16 +2056,18 @@ mod tests {
         DaemonLifecycleSmokeReport, DaemonLifecycleSnapshot, DaemonScreenEdgeOption,
         DaemonStartOptions, DaemonStopMethod, DaemonStopOutcome, IDENTITY_STORE_DIR_NAME,
         IDENTITY_STORE_FILE_NAME, LayoutSettings, ManualPeerAddressSetting,
-        acknowledge_previous_daemon_crash_from_path, build_identity_show_result_from_path,
-        classify_daemon_call_error, daemon_capture_input_enabled_from,
-        daemon_crash_marker_path_from_config_dir, daemon_executable_name, daemon_spawn_args_from,
-        default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
+        PREVIOUS_DAEMON_CRASH_START_BLOCKED_DETAIL, acknowledge_previous_daemon_crash_from_path,
+        build_identity_show_result_from_path, classify_daemon_call_error,
+        daemon_capture_input_enabled_from, daemon_crash_marker_path_from_config_dir,
+        daemon_executable_name, daemon_spawn_args_from, default_pairing_capabilities,
+        forget_trusted_identity_from_path, format_edge_binding_arg,
         graceful_stop_outcome_if_settled, has_exact_arg, identity_store_path_from_config_dir,
         list_trusted_identities_from_path, load_layout_from_path, load_settings_from_path,
         normalize_session_connect_options, parse_daemon_status_response, parse_json_rpc_response,
-        read_previous_daemon_crash_from_path, resolve_env_daemon_executable_from,
-        save_layout_to_path, save_settings_to_path, settings_start_smoke_settings,
-        stop_outcome_without_managed_child, trust_identity_document_from_json,
+        previous_daemon_crash_start_blocked_snapshot, read_previous_daemon_crash_from_path,
+        resolve_env_daemon_executable_from, save_layout_to_path, save_settings_to_path,
+        settings_start_smoke_settings, stop_outcome_without_managed_child,
+        trust_identity_document_from_json,
     };
 
     fn monitor_snapshots() -> Vec<DiagnosticsMonitorSnapshot> {
@@ -2485,6 +2499,29 @@ mod tests {
             !acknowledge_previous_daemon_crash_from_path(&path)
                 .expect("missing crash marker acknowledge")
         );
+    }
+
+    #[test]
+    fn previous_daemon_crash_blocks_restart_until_reviewed() {
+        let marker = DaemonCrashMarker {
+            schema_version: "akraz.daemonCrashMarker/v1".to_string(),
+            process_role: "akraz-daemon".to_string(),
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            reason: "panic".to_string(),
+            panic_message_class: "stringPayload".to_string(),
+            panic_location: None,
+            recorded_at_unix_millis: 123_456,
+            privacy: DaemonCrashMarkerPrivacy::default(),
+        };
+
+        let snapshot = previous_daemon_crash_start_blocked_snapshot(marker.clone());
+
+        assert_eq!(snapshot.phase, DaemonLifecyclePhase::NotRunning);
+        assert_eq!(
+            snapshot.detail.as_deref(),
+            Some(PREVIOUS_DAEMON_CRASH_START_BLOCKED_DETAIL)
+        );
+        assert_eq!(snapshot.previous_crash.as_deref(), Some(&marker));
     }
 
     #[test]

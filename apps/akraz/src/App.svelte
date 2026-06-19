@@ -101,7 +101,11 @@
   }
 
   function canStartDaemon() {
-    return canStartDaemonPhase() && layoutDaemonStartBlockingIssueForView() === null;
+    return (
+      canStartDaemonPhase() &&
+      daemonState.snapshot?.previousCrash === undefined &&
+      layoutDaemonStartBlockingIssueForView() === null
+    );
   }
 
   function canStopDaemon() {
@@ -113,12 +117,13 @@
       return daemonState.lastError;
     }
 
+    if (daemonState.snapshot?.previousCrash) {
+      return `이전 백그라운드 프로세스 비정상 종료 · 확인 후 다시 시작 가능`;
+    }
+
     const layoutStartIssue = layoutDaemonStartBlockingIssueForView();
     if (canStartDaemonPhase() && layoutStartIssue) {
       return layoutStartIssue.message;
-    }
-    if (daemonState.snapshot?.previousCrash) {
-      return `이전 백그라운드 프로세스 비정상 종료 · v${daemonState.snapshot.previousCrash.daemonVersion}`;
     }
 
     return daemonState.snapshot?.detail ?? '백그라운드 연결을 시작할 수 있어.';
@@ -702,7 +707,7 @@
         <div>
           <strong>이전 비정상 종료</strong>
           <span>
-            {daemonState.snapshot.previousCrash.reason} · v{daemonState.snapshot.previousCrash.daemonVersion}
+            {daemonState.snapshot.previousCrash.reason} · v{daemonState.snapshot.previousCrash.daemonVersion} · 확인 후 다시 시작
           </span>
         </div>
         <button
