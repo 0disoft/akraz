@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.4.83",
+  "version": "0.4.84",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -16,6 +16,7 @@
     "lint:fix": "oxlint --fix . --no-error-on-unmatched-pattern",
     "qa:windows-mvp-plan": "bun run --cwd apps/akraz qa:windows-mvp-plan",
     "qa:windows-mvp-report": "bun run --cwd apps/akraz qa:windows-mvp-report",
+    "qa:windows-mvp-report-template": "bun run --cwd apps/akraz qa:windows-mvp-report-template",
     "release:signing-preflight": "bun run --cwd apps/akraz release:signing-preflight",
     "release:updater-config-preflight": "bun run --cwd apps/akraz release:updater-config-preflight",
     "smoke:daemon-lifecycle": "bun run --cwd apps/akraz smoke:daemon-lifecycle",

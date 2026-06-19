@@ -34,21 +34,69 @@ export function evaluateWindowsMvpQaReport(report, plan = buildWindowsMvpQaPlan(
   };
 }
 
+export function buildWindowsMvpQaReportTemplate(options = {}) {
+  const plan = buildWindowsMvpQaPlan({ caseIds: options.caseIds ?? [] });
+
+  return {
+    schemaVersion: WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION,
+    planSchemaVersion: WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
+    generatedFrom: "qa:windows-mvp-report-template",
+    executedAt: null,
+    results: plan.cases.map((testCase) => ({
+      caseId: testCase.id,
+      result: "blocked",
+      reason: "not run yet",
+      evidence: [],
+    })),
+    privacy: {
+      includesTypedContent: false,
+      includesSecretValues: false,
+      includesFullFilePaths: false,
+    },
+  };
+}
+
 export function readWindowsMvpQaReport(reportFile) {
   return JSON.parse(readFileSync(reportFile, "utf8"));
 }
 
 export function parseWindowsMvpQaReportArgs(args) {
+  const options = {
+    template: false,
+    reportFile: undefined,
+    caseIds: [],
+  };
+
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (arg === "--report-file") {
-      return { reportFile: readValue(args, ++index, arg) };
+    switch (arg) {
+      case "--template":
+        options.template = true;
+        break;
+      case "--report-file":
+        options.reportFile = readValue(args, ++index, arg);
+        break;
+      case "--case-id":
+        options.caseIds.push(readValue(args, ++index, arg));
+        break;
+      default:
+        throw new Error(`unknown argument: ${arg}`);
     }
-
-    throw new Error(`unknown argument: ${arg}`);
   }
 
-  throw new Error("--report-file is required");
+  if (options.template && options.reportFile !== undefined) {
+    throw new Error("--template cannot be combined with --report-file");
+  }
+
+  if (!options.template && options.caseIds.length > 0) {
+    throw new Error("--case-id can only be used with --template");
+  }
+
+  if (!options.template && options.reportFile === undefined) {
+    throw new Error("--report-file is required");
+  }
+
+  return options;
 }
 
 export function exitCodeForWindowsMvpQaReport(evaluation) {
@@ -275,6 +323,13 @@ function readValue(args, index, flag) {
 
 if (import.meta.main) {
   const options = parseWindowsMvpQaReportArgs(process.argv.slice(2));
+  if (options.template) {
+    process.stdout.write(
+      `${JSON.stringify(buildWindowsMvpQaReportTemplate({ caseIds: options.caseIds }), null, 2)}\n`,
+    );
+    process.exit(0);
+  }
+
   const evaluation = evaluateWindowsMvpQaReport(readWindowsMvpQaReport(options.reportFile));
   process.stdout.write(`${JSON.stringify(evaluation, null, 2)}\n`);
   process.exit(exitCodeForWindowsMvpQaReport(evaluation));

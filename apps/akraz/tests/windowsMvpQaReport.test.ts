@@ -6,6 +6,7 @@ import {
 } from "../scripts/windows-mvp-qa-plan.mjs";
 import {
   WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION,
+  buildWindowsMvpQaReportTemplate,
   evaluateWindowsMvpQaReport,
   exitCodeForWindowsMvpQaReport,
   parseWindowsMvpQaReportArgs,
@@ -153,8 +154,62 @@ describe("Windows MVP QA report evaluation", () => {
 
   test("parses report file argument", () => {
     expect(parseWindowsMvpQaReportArgs(["--report-file", "qa-report.json"])).toEqual({
+      template: false,
       reportFile: "qa-report.json",
+      caseIds: [],
     });
     expect(() => parseWindowsMvpQaReportArgs([])).toThrow("--report-file is required");
+  });
+
+  test("builds a sanitized blocked report template for every QA case", () => {
+    const template = buildWindowsMvpQaReportTemplate();
+    const evaluation = evaluateWindowsMvpQaReport(template);
+
+    expect(template).toMatchObject({
+      schemaVersion: WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION,
+      planSchemaVersion: WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
+      generatedFrom: "qa:windows-mvp-report-template",
+      executedAt: null,
+      privacy: {
+        includesTypedContent: false,
+        includesSecretValues: false,
+        includesFullFilePaths: false,
+      },
+    });
+    expect(template.results.map((result) => result.caseId)).toEqual(listWindowsMvpQaCaseIds());
+    expect(template.results.every((result) => result.result === "blocked")).toBe(true);
+    expect(template.results.every((result) => result.reason === "not run yet")).toBe(true);
+    expect(template.results.every((result) => result.evidence.length === 0)).toBe(true);
+    expect(evaluation.ready).toBe(false);
+    expect(evaluation.summary).toEqual({
+      total: 5,
+      passed: 0,
+      failed: 0,
+      blocked: 5,
+      skipped: 0,
+    });
+  });
+
+  test("builds and parses a filtered report template", () => {
+    const template = buildWindowsMvpQaReportTemplate({ caseIds: ["WIN-007"] });
+
+    expect(template.results.map((result) => result.caseId)).toEqual(["WIN-007"]);
+    expect(parseWindowsMvpQaReportArgs(["--template", "--case-id", "WIN-007"])).toEqual({
+      template: true,
+      reportFile: undefined,
+      caseIds: ["WIN-007"],
+    });
+    expect(() => buildWindowsMvpQaReportTemplate({ caseIds: ["NOPE-999"] })).toThrow(
+      "unknown Windows MVP QA case id(s): NOPE-999",
+    );
+  });
+
+  test("rejects conflicting template and report evaluation arguments", () => {
+    expect(() =>
+      parseWindowsMvpQaReportArgs(["--template", "--report-file", "qa-report.json"]),
+    ).toThrow("--template cannot be combined with --report-file");
+    expect(() => parseWindowsMvpQaReportArgs(["--case-id", "WIN-007"])).toThrow(
+      "--case-id can only be used with --template",
+    );
   });
 });
