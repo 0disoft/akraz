@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.4.68",
+  "version": "0.4.69",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -9,7 +9,7 @@
   "type": "module",
   "scripts": {
     "build": "bun run --cwd apps/akraz build",
-    "check": "bun run format:check && bun run lint && bun run --cwd apps/akraz check && bun run build",
+    "check": "bun run verify:release-metadata && bun run format:check && bun run lint && bun run --cwd apps/akraz check && bun run build",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint . --no-error-on-unmatched-pattern",
@@ -25,7 +25,8 @@
     "smoke:settings-start": "bun run --cwd apps/akraz smoke:settings-start",
     "smoke:tcp-transport": "bun run --cwd apps/akraz smoke:tcp-transport",
     "smoke:windows-mvp-soak": "bun run --cwd apps/akraz smoke:windows-mvp-soak",
-    "test": "bun test"
+    "test": "bun test",
+    "verify:release-metadata": "bun run --cwd apps/akraz verify:release-metadata"
   },
   "devDependencies": {
     "oxfmt": "^0.54.0",

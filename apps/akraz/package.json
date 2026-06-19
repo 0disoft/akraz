@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.4.68",
+  "version": "0.4.69",
   "private": true,
   "type": "module",
   "scripts": {
@@ -20,7 +20,8 @@
     "smoke:settings-start": "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
     "smoke:tcp-transport": "bun scripts/smoke-tcp-transport.mjs",
     "smoke:windows-mvp-soak": "bun scripts/smoke-windows-mvp-soak.mjs",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "verify:release-metadata": "bun scripts/verify-release-metadata.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0"
