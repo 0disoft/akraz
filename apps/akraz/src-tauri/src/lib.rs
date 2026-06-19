@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 
 use akraz_identity::{FileIdentityStore, PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_ipc::{
-    DaemonCrashMarker, DaemonLogEntry, DaemonLogsTail, DaemonLogsTailParams, DaemonStatus,
-    DaemonStatusParams, DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams,
-    DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, DiagnosticsSnapshot,
-    DiagnosticsSupportBundle, InputReleaseAllParams, InputReleaseAllResult, IpcCallError,
-    IpcEndpoint, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
-    JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
-    METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+    DaemonCrashMarker, DaemonLogEntry, DaemonLogsTail, DaemonLogsTailParams, DaemonShutdownParams,
+    DaemonShutdownResult, DaemonStatus, DaemonStatusParams, DiagnosticsKeyboardLayout,
+    DiagnosticsKeyboardLayoutParams, DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams,
+    DiagnosticsSnapshot, DiagnosticsSupportBundle, InputReleaseAllParams, InputReleaseAllResult,
+    IpcCallError, IpcEndpoint, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
+    JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_SHUTDOWN,
+    METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
     METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
     METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe, PermissionsProbeParams,
     SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
@@ -808,16 +808,29 @@ fn start_daemon(
 }
 
 fn stop_daemon(managed: &ManagedDaemon) -> Result<DaemonLifecycleSnapshot, String> {
-    let Some(child) = take_managed_child(managed)? else {
+    if managed_daemon_pid(managed)?.is_none() {
         return Ok(read_daemon_snapshot()
             .with_detail("This app did not start the current Akraz background process."));
-    };
-
-    if let Err(error) = child.kill() {
-        return Ok(DaemonLifecycleSnapshot::failed(error));
     }
 
-    Ok(wait_for_stopped_daemon_snapshot())
+    if let Ok(_shutdown) = call_daemon_shutdown() {
+        let snapshot = wait_for_stopped_daemon_snapshot();
+        if snapshot.phase == DaemonLifecyclePhase::NotRunning {
+            clear_managed_child(managed)?;
+            return Ok(snapshot.with_detail("Akraz stopped."));
+        }
+    }
+
+    let Some(child) = take_managed_child(managed)? else {
+        return Ok(read_daemon_snapshot().with_detail("Akraz stopped."));
+    };
+
+    match child.kill() {
+        Ok(()) => Ok(wait_for_stopped_daemon_snapshot().with_detail(
+            "Akraz graceful stop did not settle, so the managed process was stopped.",
+        )),
+        Err(error) => Ok(DaemonLifecycleSnapshot::failed(error)),
+    }
 }
 
 fn read_daemon_snapshot() -> DaemonLifecycleSnapshot {
@@ -889,6 +902,19 @@ fn call_daemon_status_result() -> Result<DaemonStatus, DaemonCallFailure> {
 
     parse_json_rpc_response::<DaemonStatus>(&response_line, "status")
         .map_err(DaemonCallFailure::Failed)
+}
+
+fn call_daemon_shutdown() -> Result<DaemonShutdownResult, String> {
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    let request = JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_DAEMON_SHUTDOWN,
+        DaemonShutdownParams::default(),
+    );
+    let response_line = call_json_rpc(&client, &request)
+        .map_err(|error| classify_daemon_call_error(&error, client.endpoint()).to_user_message())?;
+
+    parse_json_rpc_response::<DaemonShutdownResult>(&response_line, "daemon shutdown")
 }
 
 fn call_daemon_permissions_probe() -> Result<PermissionsProbe, String> {
@@ -1820,6 +1846,12 @@ fn take_managed_child(managed: &ManagedDaemon) -> Result<Option<ManagedDaemonChi
     }
 }
 
+fn clear_managed_child(managed: &ManagedDaemon) -> Result<(), String> {
+    let mut state = lock_managed_daemon(managed)?;
+    state.child = None;
+    Ok(())
+}
+
 fn clear_managed_child_if_pid(managed: &ManagedDaemon, pid: u32) {
     let Ok(mut state) = managed.lock() else {
         return;
@@ -1846,12 +1878,12 @@ mod tests {
 
     use akraz_identity::FileIdentityStore;
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonCrashMarker, DaemonCrashMarkerPrivacy, DaemonStatus,
-        DiagnosticsKeyboardLayout, DiagnosticsMonitorSnapshot, DiagnosticsScreenTopology,
-        InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities, IpcTransportError,
-        JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LogicalPointSnapshot, LogicalRectSnapshot,
-        PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectResult,
-        SessionStatus, to_json_line,
+        ControlModeSnapshot, DaemonCrashMarker, DaemonCrashMarkerPrivacy, DaemonShutdownResult,
+        DaemonStatus, DiagnosticsKeyboardLayout, DiagnosticsMonitorSnapshot,
+        DiagnosticsScreenTopology, InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities,
+        IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LogicalPointSnapshot,
+        LogicalRectSnapshot, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
+        SessionConnectResult, SessionStatus, to_json_line,
     };
 
     use super::{
@@ -2667,6 +2699,25 @@ mod tests {
 
         assert_eq!(
             parse_json_rpc_response::<InputReleaseAllResult>(&line, "input release all"),
+            Ok(result)
+        );
+    }
+
+    #[test]
+    fn parses_daemon_shutdown_success_response() {
+        let result = DaemonShutdownResult {
+            requested: true,
+            released_inputs: true,
+            disconnected_peer_session: false,
+            mode: ControlModeSnapshot::Local,
+        };
+        let line = match to_json_line(&JsonRpcSuccess::new("tauri", result.clone())) {
+            Ok(line) => line,
+            Err(error) => panic!("expected daemon shutdown JSON: {error}"),
+        };
+
+        assert_eq!(
+            parse_json_rpc_response::<DaemonShutdownResult>(&line, "daemon shutdown"),
             Ok(result)
         );
     }

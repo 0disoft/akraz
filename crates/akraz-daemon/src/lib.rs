@@ -22,10 +22,10 @@ use akraz_identity::{
     TrustedPeer,
 };
 use akraz_ipc::{
-    ControlModeSnapshot, DaemonLogEntry, DaemonLogLevel, DaemonLogsTail, DaemonStatus,
-    DiagnosticsKeyboardLayout, DiagnosticsScreenTopology, InputReleaseAllResult, IpcCodecError,
-    IpcPlatformCapabilities, IpcRequest, IpcTransportError, JsonRpcError, JsonRpcFailure,
-    JsonRpcSuccess, LocalIpcServer, PeerStatus, PermissionIssue, PermissionsProbe,
+    ControlModeSnapshot, DaemonLogEntry, DaemonLogLevel, DaemonLogsTail, DaemonShutdownResult,
+    DaemonStatus, DiagnosticsKeyboardLayout, DiagnosticsScreenTopology, InputReleaseAllResult,
+    IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError, JsonRpcError,
+    JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PeerStatus, PermissionIssue, PermissionsProbe,
     ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult, SessionDisconnectResult,
     SessionStatus, parse_request_line, serve_os_local_ipc_once, to_json_line,
 };
@@ -2096,6 +2096,7 @@ pub struct DaemonIpcServer<P> {
     dispatcher: SharedCoreActionDispatcher,
     peer_sessions: ManagedPeerSessionTransport,
     logs: SharedDaemonLogBuffer,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl<P> DaemonIpcServer<P>
@@ -2163,12 +2164,18 @@ impl<P> DaemonIpcServer<P> {
             dispatcher,
             peer_sessions,
             logs,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Return the runtime state shared by daemon background workers.
     pub fn shared_state(&self) -> SharedRuntimeInputState {
         Arc::clone(&self.state)
+    }
+
+    /// Return whether a graceful shutdown was requested through local IPC.
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
     }
 }
 
@@ -2188,6 +2195,7 @@ where
             &self.peer_sessions,
             request_line,
             Some(&self.logs),
+            Some(&self.shutdown_requested),
         )
         .map_err(|error| IpcTransportError::request_failed(error.to_string()))
     }
@@ -2218,6 +2226,9 @@ where
 
         serve_os_local_ipc_once(config.endpoint(), server)?;
         handled_requests += 1;
+        if server.shutdown_requested() {
+            return Ok(());
+        }
     }
 }
 
@@ -2731,6 +2742,7 @@ pub fn handle_ipc_request_line(
         &ManagedPeerSessionTransport::new(),
         line,
         None,
+        None,
     )
 }
 
@@ -2742,11 +2754,18 @@ pub fn handle_ipc_request_line_with_peer_sessions(
     peer_sessions: &ManagedPeerSessionTransport,
     line: &str,
     logs: Option<&SharedDaemonLogBuffer>,
+    shutdown_requested: Option<&AtomicBool>,
 ) -> Result<String, DaemonIpcError> {
     match parse_request_line(line) {
-        Ok(request) => {
-            handle_ipc_request(state, platform, dispatcher, peer_sessions, logs, request)
-        }
+        Ok(request) => handle_ipc_request(
+            state,
+            platform,
+            dispatcher,
+            peer_sessions,
+            logs,
+            shutdown_requested,
+            request,
+        ),
         Err(failure) => encode_response(&failure),
     }
 }
@@ -2757,6 +2776,7 @@ fn handle_ipc_request(
     dispatcher: &impl CoreActionDispatcher,
     peer_sessions: &ManagedPeerSessionTransport,
     logs: Option<&SharedDaemonLogBuffer>,
+    shutdown_requested: Option<&AtomicBool>,
     request: IpcRequest,
 ) -> Result<String, DaemonIpcError> {
     match request {
@@ -2846,6 +2866,42 @@ fn handle_ipc_request(
             let entries = daemon_log_tail(logs, request.params.limit);
             encode_response(&JsonRpcSuccess::new(request.id, DaemonLogsTail { entries }))
         }
+        IpcRequest::DaemonShutdown(request) => {
+            let Some(shutdown_requested) = shutdown_requested else {
+                record_daemon_event(
+                    logs,
+                    DaemonLogLevel::Error,
+                    "daemon.shutdown.failed",
+                    "Daemon shutdown failed.",
+                );
+                return encode_platform_error(
+                    request.id,
+                    "daemon shutdown unavailable",
+                    PlatformError::new("shutdown control flag is unavailable"),
+                );
+            };
+            match shutdown_daemon(state, dispatcher, peer_sessions) {
+                Ok(result) => {
+                    shutdown_requested.store(true, Ordering::Release);
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Warn,
+                        "daemon.shutdown",
+                        "Daemon shutdown requested.",
+                    );
+                    encode_response(&JsonRpcSuccess::new(request.id, result))
+                }
+                Err(error) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Error,
+                        "daemon.shutdown.failed",
+                        "Daemon shutdown failed.",
+                    );
+                    encode_platform_error(request.id, "daemon shutdown unavailable", error)
+                }
+            }
+        }
         IpcRequest::InputReleaseAll(request) => {
             match recover_local_control_and_release_inputs(state, dispatcher) {
                 Ok(result) => {
@@ -2913,6 +2969,25 @@ fn handle_ipc_request(
             }
         }
     }
+}
+
+fn shutdown_daemon(
+    state: &mut RuntimeInputState,
+    dispatcher: &impl CoreActionDispatcher,
+    peer_sessions: &ManagedPeerSessionTransport,
+) -> Result<DaemonShutdownResult, PlatformError> {
+    let active_session_before_recovery = peer_sessions.active_session()?;
+    let recovery = recover_local_control_and_release_inputs(state, dispatcher)?;
+    let detached_session = peer_sessions
+        .disconnect_session()?
+        .or(active_session_before_recovery);
+
+    Ok(DaemonShutdownResult {
+        requested: true,
+        released_inputs: recovery.released,
+        disconnected_peer_session: detached_session.is_some(),
+        mode: recovery.mode,
+    })
 }
 
 fn record_daemon_event(
@@ -3160,15 +3235,15 @@ mod tests {
         TrustedPeer, TrustedPeerIdentity, fingerprint_for_public_key,
     };
     use akraz_ipc::{
-        ControlModeSnapshot, DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams, DaemonStatus,
-        DaemonStatusParams, DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams,
-        DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, InputReleaseAllParams,
-        InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities, JsonRpcFailure,
-        JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_LOGS_TAIL,
-        METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
-        METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT,
-        OsLocalIpcClient, PeerStatus, SessionConnectParams, SessionDisconnectResult, SessionStatus,
-        call_json_rpc, to_json_line,
+        ControlModeSnapshot, DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams,
+        DaemonShutdownParams, DaemonShutdownResult, DaemonStatus, DaemonStatusParams,
+        DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams, DiagnosticsScreenTopology,
+        DiagnosticsScreenTopologyParams, InputReleaseAllParams, InputReleaseAllResult, IpcEndpoint,
+        IpcPlatformCapabilities, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer,
+        METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS,
+        METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, OsLocalIpcClient, PeerStatus,
+        SessionConnectParams, SessionDisconnectResult, SessionStatus, call_json_rpc, to_json_line,
     };
     use akraz_platform::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
@@ -5352,6 +5427,72 @@ mod tests {
         assert_eq!(response.id, "req_1");
         assert_eq!(response.result.daemon_version, DAEMON_VERSION);
         assert_eq!(response.result.mode, ControlModeSnapshot::Local);
+    }
+
+    #[test]
+    fn daemon_ipc_server_handles_shutdown_request() {
+        let platform = FakePlatformAdapter::default();
+        let server = DaemonIpcServer::new(RuntimeInputState::new(), platform);
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_DAEMON_SHUTDOWN,
+            DaemonShutdownParams::default(),
+        );
+        let request_line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        let response_line = match server.handle_request_line(&request_line) {
+            Ok(line) => line,
+            Err(error) => panic!("expected daemon shutdown response: {error}"),
+        };
+        let response: JsonRpcSuccess<DaemonShutdownResult> =
+            match serde_json::from_str(&response_line) {
+                Ok(response) => response,
+                Err(error) => panic!("expected daemon shutdown response JSON: {error}"),
+            };
+
+        assert!(server.shutdown_requested());
+        assert_eq!(response.id, "req_1");
+        assert!(response.result.requested);
+        assert!(response.result.released_inputs);
+        assert!(!response.result.disconnected_peer_session);
+        assert_eq!(response.result.mode, ControlModeSnapshot::Local);
+    }
+
+    #[test]
+    fn ipc_dispatch_rejects_shutdown_without_server_control_flag() {
+        let mut state = RuntimeInputState::new();
+        let platform = FakePlatformAdapter::default();
+        let dispatcher =
+            LocalPlatformCoreActionDispatcher::new(platform.clone(), NoopCoreActionDispatcher);
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_DAEMON_SHUTDOWN,
+            DaemonShutdownParams::default(),
+        );
+        let request_line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        let response_line =
+            match handle_ipc_request_line(&mut state, &platform, &dispatcher, &request_line) {
+                Ok(line) => line,
+                Err(error) => panic!("expected daemon shutdown failure response: {error}"),
+            };
+        let response: JsonRpcFailure = match serde_json::from_str(&response_line) {
+            Ok(response) => response,
+            Err(error) => panic!("expected daemon shutdown failure JSON: {error}"),
+        };
+
+        assert_eq!(response.id.as_deref(), Some("req_1"));
+        assert_eq!(response.error.code, JSONRPC_DAEMON_ERROR);
+        assert_eq!(
+            response.error.message,
+            "daemon shutdown unavailable: shutdown control flag is unavailable"
+        );
     }
 
     #[test]

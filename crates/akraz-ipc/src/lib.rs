@@ -64,6 +64,9 @@ pub const METHOD_DAEMON_STATUS: &str = "daemon.status";
 /// JSON-RPC method for sanitized daemon log tailing.
 pub const METHOD_DAEMON_LOGS_TAIL: &str = "daemon.logs.tail";
 
+/// JSON-RPC method for graceful daemon shutdown.
+pub const METHOD_DAEMON_SHUTDOWN: &str = "daemon.shutdown";
+
 /// JSON-RPC method for platform permission probing.
 pub const METHOD_PERMISSIONS_PROBE: &str = "permissions.probe";
 
@@ -772,6 +775,7 @@ impl<P> JsonRpcRequest<P> {
 pub enum IpcRequest {
     DaemonStatus(JsonRpcRequest<DaemonStatusParams>),
     DaemonLogsTail(JsonRpcRequest<DaemonLogsTailParams>),
+    DaemonShutdown(JsonRpcRequest<DaemonShutdownParams>),
     PermissionsProbe(JsonRpcRequest<PermissionsProbeParams>),
     DiagnosticsScreenTopology(JsonRpcRequest<DiagnosticsScreenTopologyParams>),
     DiagnosticsKeyboardLayout(JsonRpcRequest<DiagnosticsKeyboardLayoutParams>),
@@ -786,6 +790,7 @@ impl IpcRequest {
         match self {
             Self::DaemonStatus(request) => &request.id,
             Self::DaemonLogsTail(request) => &request.id,
+            Self::DaemonShutdown(request) => &request.id,
             Self::PermissionsProbe(request) => &request.id,
             Self::DiagnosticsScreenTopology(request) => &request.id,
             Self::DiagnosticsKeyboardLayout(request) => &request.id,
@@ -800,6 +805,7 @@ impl IpcRequest {
         match self {
             Self::DaemonStatus(request) => &request.method,
             Self::DaemonLogsTail(request) => &request.method,
+            Self::DaemonShutdown(request) => &request.method,
             Self::PermissionsProbe(request) => &request.method,
             Self::DiagnosticsScreenTopology(request) => &request.method,
             Self::DiagnosticsKeyboardLayout(request) => &request.method,
@@ -894,6 +900,11 @@ pub struct DaemonLogsTailParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
 }
+
+/// Empty params for `daemon.shutdown`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonShutdownParams {}
 
 /// Empty params for `permissions.probe`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1132,6 +1143,16 @@ pub struct DaemonLogEntry {
 #[serde(rename_all = "camelCase")]
 pub struct DaemonLogsTail {
     pub entries: Vec<DaemonLogEntry>,
+}
+
+/// `daemon.shutdown` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonShutdownResult {
+    pub requested: bool,
+    pub released_inputs: bool,
+    pub disconnected_peer_session: bool,
+    pub mode: ControlModeSnapshot,
 }
 
 /// Sanitized local diagnostics snapshot assembled by akraz clients.
@@ -1549,6 +1570,7 @@ pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
     match raw.method.as_str() {
         METHOD_DAEMON_STATUS => parse_typed_request(raw).map(IpcRequest::DaemonStatus),
         METHOD_DAEMON_LOGS_TAIL => parse_typed_request(raw).map(IpcRequest::DaemonLogsTail),
+        METHOD_DAEMON_SHUTDOWN => parse_typed_request(raw).map(IpcRequest::DaemonShutdown),
         METHOD_PERMISSIONS_PROBE => parse_typed_request(raw).map(IpcRequest::PermissionsProbe),
         METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY => {
             parse_typed_request(raw).map(IpcRequest::DiagnosticsScreenTopology)
@@ -1605,14 +1627,15 @@ where
 mod tests {
     use super::{
         ControlModeSnapshot, DaemonCrashMarker, DaemonCrashMarkerPrivacy, DaemonLogEntry,
-        DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams, DaemonPanicLocation, DaemonStatus,
-        DaemonStatusParams, DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams,
-        DiagnosticsMonitorSnapshot, DiagnosticsPrivacySnapshot, DiagnosticsScreenTopology,
-        DiagnosticsScreenTopologyParams, InProcessIpcClient, IpcEndpoint, IpcEndpointEnvironment,
-        IpcEndpointError, IpcEndpointKind, IpcOperatingSystem, IpcPlatformCapabilities, IpcRequest,
-        IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS, JSONRPC_ERROR_METHOD_NOT_FOUND,
-        JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient, LocalIpcServer,
-        LogicalPointSnapshot, LogicalRectSnapshot, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
+        DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams, DaemonPanicLocation,
+        DaemonShutdownParams, DaemonStatus, DaemonStatusParams, DiagnosticsKeyboardLayout,
+        DiagnosticsKeyboardLayoutParams, DiagnosticsMonitorSnapshot, DiagnosticsPrivacySnapshot,
+        DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams, InProcessIpcClient,
+        IpcEndpoint, IpcEndpointEnvironment, IpcEndpointError, IpcEndpointKind, IpcOperatingSystem,
+        IpcPlatformCapabilities, IpcRequest, IpcTransportError, JSONRPC_ERROR_INVALID_PARAMS,
+        JSONRPC_ERROR_METHOD_NOT_FOUND, JSONRPC_ERROR_PARSE, JsonRpcRequest, JsonRpcSuccess,
+        LocalIpcClient, LocalIpcServer, LogicalPointSnapshot, LogicalRectSnapshot,
+        METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS,
         METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
         METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
         OsLocalIpcClient, PeerStatus, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
@@ -2458,6 +2481,24 @@ mod tests {
         assert_eq!(
             parse_request_line(&line),
             Ok(IpcRequest::DaemonLogsTail(request))
+        );
+    }
+
+    #[test]
+    fn parses_daemon_shutdown_request_line() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_DAEMON_SHUTDOWN,
+            DaemonShutdownParams::default(),
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(IpcRequest::DaemonShutdown(request))
         );
     }
 
