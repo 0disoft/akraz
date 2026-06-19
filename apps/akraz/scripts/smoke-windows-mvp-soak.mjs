@@ -12,6 +12,7 @@ import {
   parseLastJsonObject,
   parseSoakOptions,
   selectSoakScenarios,
+  writeSoakSummaryReportFile,
 } from "./windows-mvp-soak-report.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -131,5 +132,9 @@ const summary = buildSoakSummary({
 });
 
 console.log(JSON.stringify(summary, null, 2));
+const reportFile = writeSoakSummaryReportFile(options.reportFile, summary);
+if (reportFile) {
+  console.log(`Windows MVP soak report written to ${reportFile}.`);
+}
 assertSoakSummaryHealthy(summary);
 console.log("Windows MVP soak passed.");

@@ -1,3 +1,15 @@
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, resolve } from "node:path";
+
 export const WINDOWS_MVP_SOAK_SCHEMA_VERSION = "akraz.windowsMvpSoak/v1";
 export const SESSION_CONNECT_LIFECYCLE_SMOKE_SCHEMA_VERSION =
   "akraz.sessionConnectLifecycleSmoke/v1";
@@ -34,6 +46,7 @@ export function parseSoakOptions(args) {
     durationMs: DEFAULT_DURATION_MS,
     list: false,
     maxCycles: Number.POSITIVE_INFINITY,
+    reportFile: undefined,
     scenarioTimeoutMs: DEFAULT_SCENARIO_TIMEOUT_MS,
     scenarios: new Set(),
   };
@@ -56,6 +69,9 @@ export function parseSoakOptions(args) {
         break;
       case "--max-cycles":
         parsedOptions.maxCycles = parsePositiveInteger(readValue(args, ++index, arg), arg);
+        break;
+      case "--report-file":
+        parsedOptions.reportFile = parseReportFile(readValue(args, ++index, arg), arg);
         break;
       case "--scenario":
         parsedOptions.scenarios.add(readValue(args, ++index, arg));
@@ -245,6 +261,42 @@ export function assertSoakSummaryHealthy(summary) {
   }
 }
 
+export function writeSoakSummaryReportFile(reportFile, summary) {
+  if (!reportFile) {
+    return undefined;
+  }
+
+  const resolvedReportFile = resolve(reportFile);
+  const reportDirectory = dirname(resolvedReportFile);
+  const tempFile = resolve(
+    reportDirectory,
+    `.${basename(resolvedReportFile)}.${process.pid}.${Date.now()}.tmp`,
+  );
+  const payload = `${JSON.stringify(summary, null, 2)}\n`;
+
+  mkdirSync(reportDirectory, { recursive: true });
+
+  let fileDescriptor;
+  try {
+    fileDescriptor = openSync(tempFile, "w", 0o600);
+    writeFileSync(fileDescriptor, payload, "utf8");
+    fsyncSync(fileDescriptor);
+    closeSync(fileDescriptor);
+    fileDescriptor = undefined;
+    renameSync(tempFile, resolvedReportFile);
+  } catch (error) {
+    if (fileDescriptor !== undefined) {
+      closeSync(fileDescriptor);
+    }
+    if (existsSync(tempFile)) {
+      rmSync(tempFile, { force: true });
+    }
+    throw error;
+  }
+
+  return resolvedReportFile;
+}
+
 function collectCommandMetrics(metrics, commands) {
   if (!Array.isArray(commands)) {
     return;
@@ -334,4 +386,12 @@ function parsePositiveInteger(value, flag) {
   }
 
   return parsed;
+}
+
+function parseReportFile(value, flag) {
+  if (value.trim().length === 0) {
+    throw new Error(`${flag} requires a non-empty path`);
+  }
+
+  return value;
 }

@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   DEFAULT_DURATION_MS,
@@ -13,6 +16,7 @@ import {
   parseLastJsonObject,
   parseSoakOptions,
   selectSoakScenarios,
+  writeSoakSummaryReportFile,
 } from "../scripts/windows-mvp-soak-report.mjs";
 
 describe("Windows MVP soak reporting", () => {
@@ -25,11 +29,19 @@ describe("Windows MVP soak reporting", () => {
   });
 
   test("selects named scenarios and rejects unknown scenarios", () => {
-    const options = parseSoakOptions(["--scenario", "peer-session", "--max-cycles", "3"]);
+    const options = parseSoakOptions([
+      "--scenario",
+      "peer-session",
+      "--max-cycles",
+      "3",
+      "--report-file",
+      "soak-report.json",
+    ]);
     const selected = selectSoakScenarios(options);
 
     expect(selected.map((scenario) => scenario.name)).toEqual(["peer-session"]);
     expect(options.maxCycles).toBe(3);
+    expect(options.reportFile).toBe("soak-report.json");
     expect(() => selectSoakScenarios(parseSoakOptions(["--scenario", "missing"]))).toThrow(
       "unknown soak scenario",
     );
@@ -136,5 +148,37 @@ describe("Windows MVP soak reporting", () => {
       ],
     };
     expect(() => assertSoakSummaryHealthy(failed)).toThrow("peer-session");
+  });
+
+  test("writes soak summaries atomically with a trailing newline", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-soak-report-test-"));
+    const reportFile = join(tempDir, "nested", "report.json");
+    const staleTempFile = join(tempDir, "nested", ".report.json.stale.tmp");
+    const summary = buildSoakSummary({
+      completedCycles: 1,
+      completedRuns: 1,
+      failures: [],
+      finishedAt: new Date("2026-06-20T00:00:01.000Z"),
+      metrics: { ...createEmptySoakMetrics(), scenarioPasses: 1 },
+      options: parseSoakOptions(["--duration-ms", "1000", "--max-cycles", "1"]),
+      scenarios: [{ name: "peer-session-executor" }],
+      startedAt: new Date("2026-06-20T00:00:00.000Z"),
+    });
+
+    try {
+      const writtenFile = writeSoakSummaryReportFile(reportFile, summary);
+      const reportText = readFileSync(reportFile, "utf8");
+
+      expect(writtenFile).toBe(reportFile);
+      expect(reportText.endsWith("\n")).toBe(true);
+      expect(JSON.parse(reportText)).toEqual(summary);
+
+      writeFileSync(staleTempFile, "stale", "utf8");
+      writeSoakSummaryReportFile(reportFile, { ...summary, completedRuns: 2 });
+      expect(JSON.parse(readFileSync(reportFile, "utf8")).completedRuns).toBe(2);
+      expect(existsSync(staleTempFile)).toBe(true);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
   });
 });
