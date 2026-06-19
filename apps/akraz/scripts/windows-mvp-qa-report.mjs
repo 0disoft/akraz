@@ -1,4 +1,15 @@
-import { readFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 
 import {
   WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
@@ -60,10 +71,47 @@ export function readWindowsMvpQaReport(reportFile) {
   return JSON.parse(readFileSync(reportFile, "utf8"));
 }
 
+export function writeWindowsMvpQaReportOutputFile(outFile, payload) {
+  if (!outFile) {
+    return undefined;
+  }
+
+  const resolvedOutFile = resolve(outFile);
+  const outDirectory = dirname(resolvedOutFile);
+  const tempFile = resolve(
+    outDirectory,
+    `.${basename(resolvedOutFile)}.${process.pid}.${Date.now()}.tmp`,
+  );
+  const serializedPayload = `${JSON.stringify(payload, null, 2)}\n`;
+
+  mkdirSync(outDirectory, { recursive: true });
+
+  let fileDescriptor;
+  try {
+    fileDescriptor = openSync(tempFile, "w", 0o600);
+    writeFileSync(fileDescriptor, serializedPayload, "utf8");
+    fsyncSync(fileDescriptor);
+    closeSync(fileDescriptor);
+    fileDescriptor = undefined;
+    renameSync(tempFile, resolvedOutFile);
+  } catch (error) {
+    if (fileDescriptor !== undefined) {
+      closeSync(fileDescriptor);
+    }
+    if (existsSync(tempFile)) {
+      rmSync(tempFile, { force: true });
+    }
+    throw error;
+  }
+
+  return resolvedOutFile;
+}
+
 export function parseWindowsMvpQaReportArgs(args) {
   const options = {
     template: false,
     reportFile: undefined,
+    outFile: undefined,
     caseIds: [],
   };
 
@@ -75,6 +123,9 @@ export function parseWindowsMvpQaReportArgs(args) {
         break;
       case "--report-file":
         options.reportFile = readValue(args, ++index, arg);
+        break;
+      case "--out-file":
+        options.outFile = readValue(args, ++index, arg);
         break;
       case "--case-id":
         options.caseIds.push(readValue(args, ++index, arg));
@@ -324,13 +375,14 @@ function readValue(args, index, flag) {
 if (import.meta.main) {
   const options = parseWindowsMvpQaReportArgs(process.argv.slice(2));
   if (options.template) {
-    process.stdout.write(
-      `${JSON.stringify(buildWindowsMvpQaReportTemplate({ caseIds: options.caseIds }), null, 2)}\n`,
-    );
+    const template = buildWindowsMvpQaReportTemplate({ caseIds: options.caseIds });
+    writeWindowsMvpQaReportOutputFile(options.outFile, template);
+    process.stdout.write(`${JSON.stringify(template, null, 2)}\n`);
     process.exit(0);
   }
 
   const evaluation = evaluateWindowsMvpQaReport(readWindowsMvpQaReport(options.reportFile));
+  writeWindowsMvpQaReportOutputFile(options.outFile, evaluation);
   process.stdout.write(`${JSON.stringify(evaluation, null, 2)}\n`);
   process.exit(exitCodeForWindowsMvpQaReport(evaluation));
 }

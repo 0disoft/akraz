@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
@@ -10,6 +13,7 @@ import {
   evaluateWindowsMvpQaReport,
   exitCodeForWindowsMvpQaReport,
   parseWindowsMvpQaReportArgs,
+  writeWindowsMvpQaReportOutputFile,
 } from "../scripts/windows-mvp-qa-report.mjs";
 
 function passingReport() {
@@ -156,6 +160,7 @@ describe("Windows MVP QA report evaluation", () => {
     expect(parseWindowsMvpQaReportArgs(["--report-file", "qa-report.json"])).toEqual({
       template: false,
       reportFile: "qa-report.json",
+      outFile: undefined,
       caseIds: [],
     });
     expect(() => parseWindowsMvpQaReportArgs([])).toThrow("--report-file is required");
@@ -197,6 +202,7 @@ describe("Windows MVP QA report evaluation", () => {
     expect(parseWindowsMvpQaReportArgs(["--template", "--case-id", "WIN-007"])).toEqual({
       template: true,
       reportFile: undefined,
+      outFile: undefined,
       caseIds: ["WIN-007"],
     });
     expect(() => buildWindowsMvpQaReportTemplate({ caseIds: ["NOPE-999"] })).toThrow(
@@ -211,5 +217,39 @@ describe("Windows MVP QA report evaluation", () => {
     expect(() => parseWindowsMvpQaReportArgs(["--case-id", "WIN-007"])).toThrow(
       "--case-id can only be used with --template",
     );
+  });
+
+  test("parses and writes template or evaluation JSON to an output file", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-qa-report-"));
+    const templateFile = join(tempDirectory, "nested", "template.json");
+    const evaluationFile = join(tempDirectory, "evaluation.json");
+
+    try {
+      expect(
+        parseWindowsMvpQaReportArgs([
+          "--template",
+          "--case-id",
+          "WIN-007",
+          "--out-file",
+          templateFile,
+        ]),
+      ).toEqual({
+        template: true,
+        reportFile: undefined,
+        outFile: templateFile,
+        caseIds: ["WIN-007"],
+      });
+
+      const template = buildWindowsMvpQaReportTemplate({ caseIds: ["WIN-007"] });
+      expect(writeWindowsMvpQaReportOutputFile(templateFile, template)).toBe(templateFile);
+      expect(JSON.parse(readFileSync(templateFile, "utf8"))).toEqual(template);
+      expect(readFileSync(templateFile, "utf8").endsWith("\n")).toBe(true);
+
+      const evaluation = evaluateWindowsMvpQaReport(passingReport());
+      expect(writeWindowsMvpQaReportOutputFile(evaluationFile, evaluation)).toBe(evaluationFile);
+      expect(JSON.parse(readFileSync(evaluationFile, "utf8"))).toEqual(evaluation);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
   });
 });
