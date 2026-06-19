@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { SESSION_CONNECT_LIFECYCLE_SMOKE_SCHEMA_VERSION } from "./windows-mvp-soak-report.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const appRoot = dirname(scriptDir);
@@ -125,6 +126,16 @@ try {
   assertStatusMode(afterDisconnect, "Local", "source disconnected status");
   assertPeerCount(afterDisconnect, 0, "source disconnected status");
 
+  console.log(
+    JSON.stringify({
+      schemaVersion: SESSION_CONNECT_LIFECYCLE_SMOKE_SCHEMA_VERSION,
+      daemonVersion: appPackage.version,
+      connected: connected.result.connected === true,
+      disconnected: disconnectedResponse.result.disconnected === true,
+      finalMode: afterDisconnect.result.mode,
+      finalPeerCount: afterDisconnect.result.peers.length,
+    }),
+  );
   console.log("Session connect lifecycle smoke passed.");
 } finally {
   if (!disconnected) {

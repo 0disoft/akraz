@@ -1,0 +1,337 @@
+export const WINDOWS_MVP_SOAK_SCHEMA_VERSION = "akraz.windowsMvpSoak/v1";
+export const SESSION_CONNECT_LIFECYCLE_SMOKE_SCHEMA_VERSION =
+  "akraz.sessionConnectLifecycleSmoke/v1";
+export const DEFAULT_DURATION_MS = 120 * 60 * 1000;
+export const DEFAULT_CYCLE_DELAY_MS = 1000;
+export const DEFAULT_SCENARIO_TIMEOUT_MS = 10 * 60 * 1000;
+
+export const windowsMvpSoakScenarios = [
+  {
+    name: "loopback-transport",
+    script: "smoke-loopback-transport.mjs",
+  },
+  {
+    name: "peer-session",
+    script: "smoke-peer-session.mjs",
+  },
+  {
+    name: "peer-session-executor",
+    script: "smoke-peer-session-executor.mjs",
+  },
+  {
+    name: "tcp-transport",
+    script: "smoke-tcp-transport.mjs",
+  },
+  {
+    name: "session-connect-lifecycle",
+    script: "smoke-session-connect-lifecycle.mjs",
+  },
+];
+
+export function parseSoakOptions(args) {
+  const parsedOptions = {
+    cycleDelayMs: DEFAULT_CYCLE_DELAY_MS,
+    durationMs: DEFAULT_DURATION_MS,
+    list: false,
+    maxCycles: Number.POSITIVE_INFINITY,
+    scenarioTimeoutMs: DEFAULT_SCENARIO_TIMEOUT_MS,
+    scenarios: new Set(),
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    switch (arg) {
+      case "--cycle-delay-ms":
+        parsedOptions.cycleDelayMs = parsePositiveInteger(readValue(args, ++index, arg), arg);
+        break;
+      case "--duration-minutes":
+        parsedOptions.durationMs =
+          parsePositiveInteger(readValue(args, ++index, arg), arg) * 60 * 1000;
+        break;
+      case "--duration-ms":
+        parsedOptions.durationMs = parsePositiveInteger(readValue(args, ++index, arg), arg);
+        break;
+      case "--list":
+        parsedOptions.list = true;
+        break;
+      case "--max-cycles":
+        parsedOptions.maxCycles = parsePositiveInteger(readValue(args, ++index, arg), arg);
+        break;
+      case "--scenario":
+        parsedOptions.scenarios.add(readValue(args, ++index, arg));
+        break;
+      case "--scenario-timeout-ms":
+        parsedOptions.scenarioTimeoutMs = parsePositiveInteger(readValue(args, ++index, arg), arg);
+        break;
+      default:
+        throw new Error(`unknown soak option: ${arg}`);
+    }
+  }
+
+  return parsedOptions;
+}
+
+export function listSoakScenarioNames(scenarios = windowsMvpSoakScenarios) {
+  return scenarios.map((scenario) => scenario.name);
+}
+
+export function selectSoakScenarios(options, scenarios = windowsMvpSoakScenarios) {
+  const availableScenarioNames = listSoakScenarioNames(scenarios);
+  const unknownScenarios = [...options.scenarios].filter(
+    (scenario) => !availableScenarioNames.includes(scenario),
+  );
+
+  if (unknownScenarios.length > 0) {
+    throw new Error(
+      `unknown soak scenario(s): ${unknownScenarios.join(
+        ", ",
+      )}; available scenarios: ${availableScenarioNames.join(", ")}`,
+    );
+  }
+
+  return options.scenarios.size === 0
+    ? scenarios
+    : scenarios.filter((scenario) => options.scenarios.has(scenario.name));
+}
+
+export function createEmptySoakMetrics() {
+  return {
+    scenarioPasses: 0,
+    scenarioFailures: 0,
+    scenarioTimeouts: 0,
+    remoteSessionStarts: 0,
+    remoteSessionStops: 0,
+    forwardedInputCommands: 0,
+    forwardedInputOutcomes: 0,
+    injectedInputEvents: 0,
+    releaseAllCommands: 0,
+    releaseAllOutcomes: 0,
+    platformReleaseAllCalls: 0,
+    sessionConnects: 0,
+    sessionDisconnects: 0,
+    finalPeerLeaks: 0,
+    stuckInputSuspicions: 0,
+  };
+}
+
+export function mergeSoakMetrics(target, source) {
+  for (const [key, value] of Object.entries(source)) {
+    target[key] = (target[key] ?? 0) + value;
+  }
+  return target;
+}
+
+export function parseLastJsonObject(output) {
+  const lines = String(output ?? "").split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index].trim();
+    if (!line.startsWith("{")) {
+      continue;
+    }
+
+    try {
+      return JSON.parse(line);
+    } catch {
+      continue;
+    }
+  }
+
+  return undefined;
+}
+
+export function collectScenarioMetrics(scenarioName, report) {
+  if (!report || typeof report !== "object") {
+    throw new Error(`${scenarioName} did not emit a machine-readable JSON report`);
+  }
+
+  const metrics = createEmptySoakMetrics();
+  collectCommandMetrics(metrics, report.commands);
+  collectOutcomeMetrics(metrics, report.outcomes);
+
+  if (Array.isArray(report.injectedInputs)) {
+    metrics.injectedInputEvents += report.injectedInputs.length;
+  }
+  if (Number.isSafeInteger(report.releaseAllCount) && report.releaseAllCount > 0) {
+    metrics.platformReleaseAllCalls += report.releaseAllCount;
+  }
+  if (report.schemaVersion === SESSION_CONNECT_LIFECYCLE_SMOKE_SCHEMA_VERSION) {
+    if (report.connected === true) {
+      metrics.sessionConnects += 1;
+    }
+    if (report.disconnected === true) {
+      metrics.sessionDisconnects += 1;
+    }
+    if (Number.isSafeInteger(report.finalPeerCount) && report.finalPeerCount > 0) {
+      metrics.finalPeerLeaks += report.finalPeerCount;
+    }
+  }
+
+  metrics.stuckInputSuspicions = countStuckInputSuspicions(metrics);
+
+  return metrics;
+}
+
+export function buildScenarioFailure({
+  cycle,
+  elapsedMs,
+  errorCode,
+  errorMessage,
+  exitCode,
+  scenario,
+  signal,
+  timedOut,
+}) {
+  return {
+    cycle,
+    scenario,
+    exitCode,
+    signal,
+    elapsedMs,
+    timedOut,
+    ...(errorCode ? { errorCode } : {}),
+    ...(errorMessage ? { errorMessage } : {}),
+  };
+}
+
+export function buildSoakSummary({
+  completedCycles,
+  completedRuns,
+  failures,
+  finishedAt,
+  metrics,
+  options,
+  scenarios,
+  startedAt,
+}) {
+  const elapsedMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
+  const finalMetrics = {
+    ...metrics,
+    scenarioFailures: failures.length,
+    scenarioTimeouts: failures.filter((failure) => failure.timedOut).length,
+  };
+
+  return {
+    schemaVersion: WINDOWS_MVP_SOAK_SCHEMA_VERSION,
+    startedAt: startedAt.toISOString(),
+    finishedAt: finishedAt.toISOString(),
+    requestedDurationMs: options.durationMs,
+    elapsedMs,
+    maxCycles: Number.isFinite(options.maxCycles) ? options.maxCycles : null,
+    cycleDelayMs: options.cycleDelayMs,
+    scenarioTimeoutMs: options.scenarioTimeoutMs,
+    scenarios: scenarios.map((scenario) => scenario.name),
+    completedCycles,
+    completedRuns,
+    metrics: finalMetrics,
+    failures,
+  };
+}
+
+export function assertSoakSummaryHealthy(summary) {
+  if (summary.failures.length > 0) {
+    const [failure] = summary.failures;
+    throw new Error(`Windows MVP soak failed in cycle ${failure.cycle} during ${failure.scenario}`);
+  }
+  if (summary.completedRuns <= 0) {
+    throw new Error("Windows MVP soak did not run any scenario");
+  }
+  if (summary.metrics.stuckInputSuspicions > 0) {
+    throw new Error(
+      `Windows MVP soak reported ${summary.metrics.stuckInputSuspicions} stuck input suspicion(s)`,
+    );
+  }
+  if (summary.metrics.finalPeerLeaks > 0) {
+    throw new Error(`Windows MVP soak reported ${summary.metrics.finalPeerLeaks} leaked peer(s)`);
+  }
+}
+
+function collectCommandMetrics(metrics, commands) {
+  if (!Array.isArray(commands)) {
+    return;
+  }
+
+  for (const command of commands) {
+    switch (command?.kind) {
+      case "startRemoteSession":
+        metrics.remoteSessionStarts += 1;
+        break;
+      case "forwardInput":
+        metrics.forwardedInputCommands += 1;
+        break;
+      case "releaseAllInputs":
+        metrics.releaseAllCommands += 1;
+        break;
+      case "stopRemoteSession":
+        metrics.remoteSessionStops += 1;
+        break;
+    }
+  }
+}
+
+function collectOutcomeMetrics(metrics, outcomes) {
+  if (!Array.isArray(outcomes)) {
+    return;
+  }
+
+  for (const outcome of outcomes) {
+    switch (outcome?.kind) {
+      case "remoteSessionStarted":
+        metrics.remoteSessionStarts += 1;
+        break;
+      case "inputForwarded":
+        metrics.forwardedInputOutcomes += 1;
+        break;
+      case "inputsReleased":
+        metrics.releaseAllOutcomes += 1;
+        break;
+      case "remoteSessionStopped":
+        metrics.remoteSessionStops += 1;
+        break;
+    }
+  }
+}
+
+function countStuckInputSuspicions(metrics) {
+  const forwardedInputs =
+    metrics.forwardedInputCommands + metrics.forwardedInputOutcomes + metrics.injectedInputEvents;
+  const releaseSignals =
+    metrics.releaseAllCommands + metrics.releaseAllOutcomes + metrics.platformReleaseAllCalls;
+  let suspicionCount = 0;
+
+  if (metrics.remoteSessionStarts > 0 && releaseSignals === 0) {
+    suspicionCount += 1;
+  }
+  if (forwardedInputs > 0 && releaseSignals === 0) {
+    suspicionCount += 1;
+  }
+  if (metrics.sessionConnects > metrics.sessionDisconnects) {
+    suspicionCount += metrics.sessionConnects - metrics.sessionDisconnects;
+  }
+  if (metrics.finalPeerLeaks > 0) {
+    suspicionCount += metrics.finalPeerLeaks;
+  }
+
+  return suspicionCount;
+}
+
+function readValue(args, index, flag) {
+  const value = args[index];
+  if (!value || value.startsWith("--")) {
+    throw new Error(`${flag} requires a value`);
+  }
+
+  return value;
+}
+
+function parsePositiveInteger(value, flag) {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${flag} must be a positive integer`);
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${flag} must be a positive safe integer`);
+  }
+
+  return parsed;
+}
