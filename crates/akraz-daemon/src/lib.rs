@@ -2173,6 +2173,11 @@ impl<P> DaemonIpcServer<P> {
         Arc::clone(&self.state)
     }
 
+    /// Return the diagnostics log buffer shared by daemon background workers.
+    pub fn shared_logs(&self) -> SharedDaemonLogBuffer {
+        Arc::clone(&self.logs)
+    }
+
     /// Return whether a graceful shutdown was requested through local IPC.
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::Acquire)
@@ -2373,6 +2378,30 @@ where
     )
 }
 
+/// Start daemon input capture with configured edges, dispatcher, and diagnostics logs.
+pub fn start_daemon_input_capture_with_edge_bindings_dispatcher_and_logs<D>(
+    state: SharedRuntimeInputState,
+    platform: &impl PlatformAdapter,
+    config: DaemonInputCaptureConfig,
+    edge_bindings: Vec<ScreenEdgeBinding>,
+    dispatcher: D,
+    logs: SharedDaemonLogBuffer,
+) -> Result<DaemonInputCaptureWorker, PlatformError>
+where
+    D: CoreActionDispatcher,
+{
+    let geometry = platform.read_desktop_geometry()?;
+
+    start_daemon_input_capture_with_routing_dispatcher_and_logs(
+        state,
+        platform,
+        config,
+        DaemonInputRoutingConfig::from_desktop_geometry(geometry, edge_bindings),
+        dispatcher,
+        Some(logs),
+    )
+}
+
 /// Start daemon input capture with explicit pointer routing configuration.
 pub fn start_daemon_input_capture_with_routing(
     state: SharedRuntimeInputState,
@@ -2400,6 +2429,22 @@ pub fn start_daemon_input_capture_with_routing_and_dispatcher<D>(
 where
     D: CoreActionDispatcher,
 {
+    start_daemon_input_capture_with_routing_dispatcher_and_logs(
+        state, platform, config, routing, dispatcher, None,
+    )
+}
+
+fn start_daemon_input_capture_with_routing_dispatcher_and_logs<D>(
+    state: SharedRuntimeInputState,
+    platform: &impl PlatformAdapter,
+    config: DaemonInputCaptureConfig,
+    routing: DaemonInputRoutingConfig,
+    dispatcher: D,
+    logs: Option<SharedDaemonLogBuffer>,
+) -> Result<DaemonInputCaptureWorker, PlatformError>
+where
+    D: CoreActionDispatcher,
+{
     let capture = platform.start_input_capture(config.input_capture)?;
     sync_capture_policy_with_state(&capture, &state)?;
     let running = Arc::new(AtomicBool::new(true));
@@ -2414,6 +2459,7 @@ where
                 config,
                 routing,
                 dispatcher,
+                logs,
             )
         })
         .map_err(|error| {
@@ -2432,6 +2478,7 @@ fn run_daemon_input_capture_worker<D>(
     config: DaemonInputCaptureConfig,
     routing: DaemonInputRoutingConfig,
     dispatcher: D,
+    logs: Option<SharedDaemonLogBuffer>,
 ) -> Result<(), PlatformError>
 where
     D: CoreActionDispatcher,
@@ -2449,9 +2496,10 @@ where
             Ok(event) => {
                 let now = Instant::now();
                 if power_resume_watchdog.record_poll(now) {
-                    dispatch_core_action_batch(
+                    recover_runtime_after_system_resume_and_dispatch(
+                        &state,
                         &dispatcher,
-                        recover_runtime_after_system_resume(&state)?,
+                        logs.as_ref(),
                     )?;
                 }
                 idle_watchdog.record_progress(now);
@@ -2475,15 +2523,20 @@ where
                 let now = Instant::now();
                 sync_capture_policy_with_state(&capture, &state)?;
                 if power_resume_watchdog.record_poll(now) {
-                    dispatch_core_action_batch(
+                    recover_runtime_after_system_resume_and_dispatch(
+                        &state,
                         &dispatcher,
-                        recover_runtime_after_system_resume(&state)?,
+                        logs.as_ref(),
                     )?;
                     idle_watchdog.record_progress(now);
                     continue;
                 }
                 if let Some(action) = idle_watchdog.record_idle_poll(now) {
-                    dispatch_core_action_batch(&dispatcher, vec![action])?;
+                    dispatch_input_capture_idle_watchdog_action(
+                        &dispatcher,
+                        logs.as_ref(),
+                        action,
+                    )?;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
@@ -2555,6 +2608,47 @@ fn recover_runtime_after_system_resume(
     state
         .apply_event(RuntimeEvent::SystemResumed)
         .map_err(resume_transition_error)
+}
+
+fn recover_runtime_after_system_resume_and_dispatch(
+    state: &SharedRuntimeInputState,
+    dispatcher: &impl CoreActionDispatcher,
+    logs: Option<&SharedDaemonLogBuffer>,
+) -> Result<(), PlatformError> {
+    match recover_runtime_after_system_resume(state) {
+        Ok(actions) => {
+            record_daemon_event(
+                logs,
+                DaemonLogLevel::Warn,
+                "input.capture.resume",
+                "Input capture recovered after a system resume or long poll gap.",
+            );
+            dispatch_core_action_batch(dispatcher, actions)
+        }
+        Err(error) => {
+            record_daemon_event(
+                logs,
+                DaemonLogLevel::Error,
+                "input.capture.resume.failed",
+                "Input capture recovery failed after a system resume or long poll gap.",
+            );
+            Err(error)
+        }
+    }
+}
+
+fn dispatch_input_capture_idle_watchdog_action(
+    dispatcher: &impl CoreActionDispatcher,
+    logs: Option<&SharedDaemonLogBuffer>,
+    action: CoreAction,
+) -> Result<(), PlatformError> {
+    record_daemon_event(
+        logs,
+        DaemonLogLevel::Warn,
+        "input.capture.idle",
+        "Input capture made no progress before the watchdog timeout.",
+    );
+    dispatch_core_action_batch(dispatcher, vec![action])
 }
 
 fn resume_transition_error(error: CoreTransitionError) -> PlatformError {
@@ -3268,13 +3362,13 @@ mod tests {
         TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
         build_daemon_status_with_peer_sessions, build_diagnostics_keyboard_layout,
         build_diagnostics_screen_topology, build_permissions_probe, connect_peer_session,
-        disconnect_peer_session, drain_capture_events,
+        disconnect_peer_session, dispatch_input_capture_idle_watchdog_action, drain_capture_events,
         execute_authenticated_peer_transport_session_stream_until_closed,
         execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
         execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
         handle_ipc_request_line, input_capture_policy_for_control_mode,
-        recover_local_control_and_release_inputs, serve_daemon_ipc,
-        serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
+        recover_local_control_and_release_inputs, recover_runtime_after_system_resume_and_dispatch,
+        serve_daemon_ipc, serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
         serve_tcp_peer_transport_session_and_execute,
         serve_tcp_peer_transport_session_and_execute_until_closed,
         serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout,
@@ -3999,6 +4093,68 @@ mod tests {
         assert!(!watchdog.record_poll(now + Duration::from_secs(4)));
         assert!(watchdog.record_poll(now + Duration::from_secs(9)));
         assert!(!watchdog.record_poll(now + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn resume_recovery_logs_sanitized_watchdog_event() {
+        let mut initial_state = RuntimeInputState::new();
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("secret-peer-id"),
+            })
+            .expect("remote entry request");
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("secret-session-id"),
+            })
+            .expect("remote entry confirmed");
+        let state = shared_runtime_state(initial_state);
+        let dispatcher = RecordingCoreActionDispatcher::default();
+        let logs = shared_daemon_log_buffer(8);
+
+        recover_runtime_after_system_resume_and_dispatch(&state, &dispatcher, Some(&logs))
+            .expect("resume recovery");
+
+        let entries = logs.lock().expect("daemon logs lock").tail(8);
+        let encoded = serde_json::to_string(&entries).expect("daemon logs JSON");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].level, DaemonLogLevel::Warn);
+        assert_eq!(entries[0].event, "input.capture.resume");
+        assert!(
+            dispatcher
+                .snapshot()
+                .contains(&CoreAction::ReleaseLocalInputs)
+        );
+        assert!(!encoded.contains("secret-peer-id"));
+        assert!(!encoded.contains("secret-session-id"));
+    }
+
+    #[test]
+    fn capture_idle_recovery_logs_sanitized_watchdog_event() {
+        let dispatcher = RecordingCoreActionDispatcher::default();
+        let logs = shared_daemon_log_buffer(8);
+
+        dispatch_input_capture_idle_watchdog_action(
+            &dispatcher,
+            Some(&logs),
+            CoreAction::InputCaptureIdle,
+        )
+        .expect("idle watchdog dispatch");
+
+        let entries = logs.lock().expect("daemon logs lock").tail(8);
+        let encoded = serde_json::to_string(&entries).expect("daemon logs JSON");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].level, DaemonLogLevel::Warn);
+        assert_eq!(entries[0].event, "input.capture.idle");
+        assert!(
+            dispatcher
+                .snapshot()
+                .contains(&CoreAction::InputCaptureIdle)
+        );
+        assert!(!encoded.contains("privateKey"));
+        assert!(!encoded.contains("actualKeyInput"));
     }
 
     #[test]
