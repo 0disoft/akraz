@@ -114,6 +114,50 @@ function bundleFixture(): DiagnosticsSupportBundle {
   };
 }
 
+function previousCrashFixture() {
+  return {
+    schemaVersion: "akraz.daemonCrashMarker/v1",
+    processRole: "akraz-daemon",
+    daemonVersion: appPackage.version,
+    reason: "panic",
+    panicMessageClass: "stringPayload",
+    recordedAtUnixMillis: 123456,
+    privacy: {
+      includesSecretValues: false,
+      includesFullFilePaths: false,
+      includesInputPayload: false,
+    },
+  };
+}
+
+function lifecycleOnlyBundleFixture(): DiagnosticsSupportBundle {
+  const previousCrash = previousCrashFixture();
+  return {
+    schemaVersion: "akraz.diagnostics.supportBundle/v1",
+    generatedBy: "akraz-app",
+    toolVersion: appPackage.version,
+    daemonLifecycle: {
+      phase: "not_running",
+      status: null,
+      detail: "Akraz needs the previous daemon crash to be reviewed before starting again.",
+      managedPid: null,
+      previousCrash,
+    },
+    previousDaemonCrash: previousCrash,
+    recentLogs: [],
+    includedSections: ["daemonLifecycle", "previousDaemonCrash"],
+    unavailableSections: [
+      "daemon",
+      "permissions",
+      "screenTopology",
+      "keyboardLayout",
+      "latencyHistogram",
+      "recentLogs",
+    ],
+    privacy: snapshotFixture().privacy,
+  };
+}
+
 describe("diagnostics snapshot helpers", () => {
   test("formats stable pretty JSON", () => {
     const formatted = formatDiagnosticsSnapshot(snapshotFixture());
@@ -186,5 +230,17 @@ describe("diagnostics snapshot helpers", () => {
     expect(formatted).not.toContain("identitySecretKey");
     expect(formatted).not.toContain("actualKeyInput");
     expect(formatted).not.toContain("textInput");
+  });
+
+  test("formats lifecycle-only support bundle without a daemon snapshot", () => {
+    const bundle = lifecycleOnlyBundleFixture();
+    const formatted = formatDiagnosticsSupportBundle(bundle);
+
+    expect(bundle.snapshot).toBeUndefined();
+    expect(formatted).toContain('"daemonLifecycle": {');
+    expect(formatted).toContain('"previousDaemonCrash": {');
+    expect(formatted).not.toContain('"snapshot": {');
+    expect(includedSectionsSummary(bundle)).toBe("daemonLifecycle, previousDaemonCrash");
+    expect(previousDaemonCrashSummary(bundle)).toBe(`panic · v${appPackage.version}`);
   });
 });

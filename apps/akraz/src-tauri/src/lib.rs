@@ -11,14 +11,15 @@ use akraz_identity::{FileIdentityStore, PairingIdentityDocument, TrustedPeerIden
 use akraz_ipc::{
     DaemonCrashMarker, DaemonLogEntry, DaemonLogsTail, DaemonLogsTailParams, DaemonShutdownParams,
     DaemonShutdownResult, DaemonStatus, DaemonStatusParams, DiagnosticsKeyboardLayout,
-    DiagnosticsKeyboardLayoutParams, DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams,
-    DiagnosticsSnapshot, DiagnosticsSupportBundle, InputReleaseAllParams, InputReleaseAllResult,
-    IpcCallError, IpcEndpoint, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
-    JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_SHUTDOWN,
-    METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
-    METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
-    METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe, PermissionsProbeParams,
-    SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
+    DiagnosticsKeyboardLayoutParams, DiagnosticsPrivacySnapshot, DiagnosticsScreenTopology,
+    DiagnosticsScreenTopologyParams, DiagnosticsSnapshot,
+    DiagnosticsSupportBundle as IpcDiagnosticsSupportBundle, InputReleaseAllParams,
+    InputReleaseAllResult, IpcCallError, IpcEndpoint, IpcTransportError, JSONRPC_VERSION,
+    JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_LOGS_TAIL,
+    METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
+    METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
+    METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe,
+    PermissionsProbeParams, SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
     build_diagnostics_latency_histogram, build_diagnostics_snapshot,
     build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
     resolve_current_default_endpoint,
@@ -361,10 +362,14 @@ async fn diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
 #[tauri::command]
 async fn diagnostics_support_bundle(
     app: tauri::AppHandle,
-) -> Result<DiagnosticsSupportBundle, String> {
-    tauri::async_runtime::spawn_blocking(move || call_daemon_diagnostics_support_bundle(&app))
-        .await
-        .map_err(|error| format!("diagnostics support bundle task failed: {error}"))?
+    managed: tauri::State<'_, ManagedDaemon>,
+) -> Result<AppDiagnosticsSupportBundle, String> {
+    let managed = Arc::clone(managed.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        call_app_diagnostics_support_bundle(&app, &managed)
+    })
+    .await
+    .map_err(|error| format!("diagnostics support bundle task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -755,6 +760,75 @@ impl DaemonLifecycleSnapshot {
     fn with_previous_crash(mut self, previous_crash: Option<DaemonCrashMarker>) -> Self {
         self.previous_crash = previous_crash.map(Box::new);
         self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppDiagnosticsSupportBundle {
+    schema_version: String,
+    generated_by: String,
+    tool_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot: Option<DiagnosticsSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_lifecycle: Option<Box<DaemonLifecycleSnapshot>>,
+    recent_logs: Vec<DaemonLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_daemon_crash: Option<Box<DaemonCrashMarker>>,
+    included_sections: Vec<String>,
+    unavailable_sections: Vec<String>,
+    privacy: DiagnosticsPrivacySnapshot,
+}
+
+impl AppDiagnosticsSupportBundle {
+    fn from_daemon_bundle(
+        bundle: IpcDiagnosticsSupportBundle,
+        lifecycle: DaemonLifecycleSnapshot,
+    ) -> Self {
+        let previous_daemon_crash = bundle
+            .previous_daemon_crash
+            .or_else(|| lifecycle.previous_crash.as_deref().cloned());
+        let mut included_sections = bundle.included_sections;
+        included_sections.push("daemonLifecycle".to_string());
+
+        Self {
+            schema_version: bundle.schema_version,
+            generated_by: bundle.generated_by,
+            tool_version: bundle.tool_version,
+            snapshot: Some(bundle.snapshot),
+            daemon_lifecycle: Some(Box::new(lifecycle)),
+            recent_logs: bundle.recent_logs,
+            previous_daemon_crash: previous_daemon_crash.map(Box::new),
+            included_sections,
+            unavailable_sections: bundle.unavailable_sections,
+            privacy: bundle.privacy,
+        }
+    }
+
+    fn from_lifecycle_only(lifecycle: DaemonLifecycleSnapshot) -> Self {
+        Self {
+            schema_version: "akraz.diagnostics.supportBundle/v1".to_string(),
+            generated_by: "akraz-app".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            snapshot: None,
+            previous_daemon_crash: lifecycle.previous_crash.as_deref().cloned().map(Box::new),
+            daemon_lifecycle: Some(Box::new(lifecycle)),
+            recent_logs: Vec::new(),
+            included_sections: vec![
+                "daemonLifecycle".to_string(),
+                "previousDaemonCrash".to_string(),
+            ],
+            unavailable_sections: vec![
+                "daemon".to_string(),
+                "permissions".to_string(),
+                "screenTopology".to_string(),
+                "keyboardLayout".to_string(),
+                "latencyHistogram".to_string(),
+                "recentLogs".to_string(),
+            ],
+            privacy: DiagnosticsPrivacySnapshot::default(),
+        }
     }
 }
 
@@ -1169,7 +1243,7 @@ fn call_daemon_diagnostics_snapshot() -> Result<DiagnosticsSnapshot, String> {
 
 fn call_daemon_diagnostics_support_bundle(
     app: &tauri::AppHandle,
-) -> Result<DiagnosticsSupportBundle, String> {
+) -> Result<IpcDiagnosticsSupportBundle, String> {
     let snapshot = call_daemon_diagnostics_snapshot()?;
     let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
 
@@ -1180,6 +1254,22 @@ fn call_daemon_diagnostics_support_bundle(
         "akraz-app",
         env!("CARGO_PKG_VERSION"),
     ))
+}
+
+fn call_app_diagnostics_support_bundle(
+    app: &tauri::AppHandle,
+    managed: &ManagedDaemon,
+) -> Result<AppDiagnosticsSupportBundle, String> {
+    let lifecycle = attach_previous_daemon_crash(app, refresh_daemon_snapshot(managed)?);
+    match call_daemon_diagnostics_support_bundle(app) {
+        Ok(bundle) => Ok(AppDiagnosticsSupportBundle::from_daemon_bundle(
+            bundle, lifecycle,
+        )),
+        Err(_) if lifecycle.previous_crash.is_some() => {
+            Ok(AppDiagnosticsSupportBundle::from_lifecycle_only(lifecycle))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn collect_recent_daemon_logs(client: &OsLocalIpcClient) -> Vec<DaemonLogEntry> {
@@ -2048,19 +2138,19 @@ mod tests {
     };
 
     use super::{
-        AppSettings, DAEMON_CAPTURE_INPUT_ARG, DAEMON_CRASH_DIR_NAME, DAEMON_CRASH_MARKER_ARG,
-        DAEMON_CRASH_MARKER_FILE_NAME, DAEMON_EDGE_BINDING_ARG, DAEMON_IDENTITY_DISPLAY_NAME,
-        DAEMON_IDENTITY_DISPLAY_NAME_ARG, DAEMON_IDENTITY_STORE_ARG, DAEMON_LIFECYCLE_SMOKE_FLAG,
-        DAEMON_PEER_LISTEN_ARG, DAEMON_SERVE_ARG, DAEMON_SETTINGS_START_SMOKE_FLAG,
-        DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption, DaemonLifecyclePhase,
-        DaemonLifecycleSmokeReport, DaemonLifecycleSnapshot, DaemonScreenEdgeOption,
-        DaemonStartOptions, DaemonStopMethod, DaemonStopOutcome, IDENTITY_STORE_DIR_NAME,
-        IDENTITY_STORE_FILE_NAME, LayoutSettings, ManualPeerAddressSetting,
-        PREVIOUS_DAEMON_CRASH_START_BLOCKED_DETAIL, acknowledge_previous_daemon_crash_from_path,
-        build_identity_show_result_from_path, classify_daemon_call_error,
-        daemon_capture_input_enabled_from, daemon_crash_marker_path_from_config_dir,
-        daemon_executable_name, daemon_spawn_args_from, default_pairing_capabilities,
-        forget_trusted_identity_from_path, format_edge_binding_arg,
+        AppDiagnosticsSupportBundle, AppSettings, DAEMON_CAPTURE_INPUT_ARG, DAEMON_CRASH_DIR_NAME,
+        DAEMON_CRASH_MARKER_ARG, DAEMON_CRASH_MARKER_FILE_NAME, DAEMON_EDGE_BINDING_ARG,
+        DAEMON_IDENTITY_DISPLAY_NAME, DAEMON_IDENTITY_DISPLAY_NAME_ARG, DAEMON_IDENTITY_STORE_ARG,
+        DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_PEER_LISTEN_ARG, DAEMON_SERVE_ARG,
+        DAEMON_SETTINGS_START_SMOKE_FLAG, DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption,
+        DaemonLifecyclePhase, DaemonLifecycleSmokeReport, DaemonLifecycleSnapshot,
+        DaemonScreenEdgeOption, DaemonStartOptions, DaemonStopMethod, DaemonStopOutcome,
+        IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME, LayoutSettings,
+        ManualPeerAddressSetting, PREVIOUS_DAEMON_CRASH_START_BLOCKED_DETAIL,
+        acknowledge_previous_daemon_crash_from_path, build_identity_show_result_from_path,
+        classify_daemon_call_error, daemon_capture_input_enabled_from,
+        daemon_crash_marker_path_from_config_dir, daemon_executable_name, daemon_spawn_args_from,
+        default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
         graceful_stop_outcome_if_settled, has_exact_arg, identity_store_path_from_config_dir,
         list_trusted_identities_from_path, load_layout_from_path, load_settings_from_path,
         normalize_session_connect_options, parse_daemon_status_response, parse_json_rpc_response,
@@ -2522,6 +2612,46 @@ mod tests {
             Some(PREVIOUS_DAEMON_CRASH_START_BLOCKED_DETAIL)
         );
         assert_eq!(snapshot.previous_crash.as_deref(), Some(&marker));
+    }
+
+    #[test]
+    fn lifecycle_only_support_bundle_keeps_previous_crash_evidence() {
+        let marker = DaemonCrashMarker {
+            schema_version: "akraz.daemonCrashMarker/v1".to_string(),
+            process_role: "akraz-daemon".to_string(),
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            reason: "panic".to_string(),
+            panic_message_class: "stringPayload".to_string(),
+            panic_location: None,
+            recorded_at_unix_millis: 123_456,
+            privacy: DaemonCrashMarkerPrivacy::default(),
+        };
+        let lifecycle = previous_daemon_crash_start_blocked_snapshot(marker.clone());
+
+        let bundle = AppDiagnosticsSupportBundle::from_lifecycle_only(lifecycle);
+        let encoded = serde_json::to_string(&bundle).expect("support bundle JSON");
+
+        assert_eq!(bundle.schema_version, "akraz.diagnostics.supportBundle/v1");
+        assert!(bundle.snapshot.is_none());
+        assert_eq!(bundle.previous_daemon_crash.as_deref(), Some(&marker));
+        assert!(bundle.daemon_lifecycle.is_some());
+        assert_eq!(
+            bundle.included_sections,
+            vec![
+                "daemonLifecycle".to_string(),
+                "previousDaemonCrash".to_string()
+            ]
+        );
+        assert!(bundle.unavailable_sections.contains(&"daemon".to_string()));
+        assert!(
+            bundle
+                .unavailable_sections
+                .contains(&"recentLogs".to_string())
+        );
+        assert!(encoded.contains("\"daemonLifecycle\""));
+        assert!(encoded.contains("\"previousDaemonCrash\""));
+        assert!(!encoded.contains("privateKey"));
+        assert!(!encoded.contains("identitySecretKey"));
     }
 
     #[test]

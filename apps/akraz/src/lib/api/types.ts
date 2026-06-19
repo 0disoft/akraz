@@ -126,7 +126,8 @@ export interface DiagnosticsSupportBundle {
   schemaVersion: string;
   generatedBy: string;
   toolVersion: string;
-  snapshot: DiagnosticsSnapshot;
+  snapshot?: DiagnosticsSnapshot;
+  daemonLifecycle?: DaemonLifecycleSnapshot;
   recentLogs: DaemonLogEntry[];
   previousDaemonCrash?: DaemonCrashMarker;
   includedSections: string[];

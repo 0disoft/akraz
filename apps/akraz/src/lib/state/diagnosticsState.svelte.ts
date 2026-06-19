@@ -33,7 +33,7 @@ export class DiagnosticsState {
 
     try {
       this.bundle = await daemonClient.diagnosticsSupportBundle();
-      this.snapshot = this.bundle.snapshot;
+      this.snapshot = this.bundle.snapshot ?? null;
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
     } finally {

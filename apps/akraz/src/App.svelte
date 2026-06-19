@@ -301,7 +301,7 @@
     if (diagnosticsState.lastError) {
       return diagnosticsState.lastError;
     }
-    return diagnosticsState.snapshot ? '준비됨' : '대기 중';
+    return diagnosticsState.snapshot || diagnosticsState.bundle ? '준비됨' : '대기 중';
   }
 
   function diagnosticsPayloadLabel() {
@@ -740,32 +740,49 @@
         {/each}
       </div>
 
-      {#if diagnosticsState.snapshot}
-        <dl class="diagnostics-facts">
-          <div>
-            <dt>생성</dt>
-            <dd>{diagnosticsState.snapshot.generatedBy} · v{diagnosticsState.snapshot.toolVersion}</dd>
-          </div>
-          <div>
-            <dt>데몬</dt>
-            <dd>
-              {modeLabels[diagnosticsState.snapshot.daemon.mode]} ·
-              {diagnosticsState.snapshot.daemon.connectedPeerCount}/{diagnosticsState.snapshot.daemon.peerCount}
-            </dd>
-          </div>
-          <div>
-            <dt>화면</dt>
-            <dd>{screenTopologySummary(diagnosticsState.snapshot)}</dd>
-          </div>
-          <div>
-            <dt>지연</dt>
-            <dd>{latencySummary(diagnosticsState.snapshot)}</dd>
-          </div>
-          <div>
-            <dt>미포함</dt>
-            <dd>{unavailableSectionsSummary(diagnosticsState.snapshot)}</dd>
-          </div>
-          {#if diagnosticsState.bundle}
+      {#if diagnosticsState.snapshot || diagnosticsState.bundle}
+        {#if diagnosticsState.snapshot}
+          <dl class="diagnostics-facts">
+            <div>
+              <dt>생성</dt>
+              <dd>{diagnosticsState.snapshot.generatedBy} · v{diagnosticsState.snapshot.toolVersion}</dd>
+            </div>
+            <div>
+              <dt>데몬</dt>
+              <dd>
+                {modeLabels[diagnosticsState.snapshot.daemon.mode]} ·
+                {diagnosticsState.snapshot.daemon.connectedPeerCount}/{diagnosticsState.snapshot.daemon.peerCount}
+              </dd>
+            </div>
+            <div>
+              <dt>화면</dt>
+              <dd>{screenTopologySummary(diagnosticsState.snapshot)}</dd>
+            </div>
+            <div>
+              <dt>지연</dt>
+              <dd>{latencySummary(diagnosticsState.snapshot)}</dd>
+            </div>
+            <div>
+              <dt>미포함</dt>
+              <dd>{unavailableSectionsSummary(diagnosticsState.snapshot)}</dd>
+            </div>
+            {#if diagnosticsState.bundle}
+              <div>
+                <dt>포함</dt>
+                <dd>{includedSectionsSummary(diagnosticsState.bundle)}</dd>
+              </div>
+              <div>
+                <dt>이전 종료</dt>
+                <dd>{previousDaemonCrashSummary(diagnosticsState.bundle)}</dd>
+              </div>
+            {/if}
+          </dl>
+        {:else if diagnosticsState.bundle}
+          <dl class="diagnostics-facts">
+            <div>
+              <dt>생성</dt>
+              <dd>{diagnosticsState.bundle.generatedBy} · v{diagnosticsState.bundle.toolVersion}</dd>
+            </div>
             <div>
               <dt>포함</dt>
               <dd>{includedSectionsSummary(diagnosticsState.bundle)}</dd>
@@ -774,8 +791,8 @@
               <dt>이전 종료</dt>
               <dd>{previousDaemonCrashSummary(diagnosticsState.bundle)}</dd>
             </div>
-          {/if}
-        </dl>
+          </dl>
+        {/if}
 
         {#if diagnosticsState.bundle}
           <section class="diagnostics-log-panel" aria-labelledby="diagnostics-logs-title">
@@ -833,7 +850,7 @@
         <button
           type="button"
           class="control-button"
-          disabled={diagnosticsState.isBusy || diagnosticsState.snapshot === null}
+          disabled={diagnosticsState.isBusy || diagnosticsJson().length === 0}
           onclick={copyDiagnostics}
         >
           복사
