@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   evaluateUpdaterConfigPreflight,
   exitCodeForUpdaterConfigPreflight,
   parseUpdaterConfigPreflightArgs,
+  writeUpdaterConfigPreflightOutputFile,
 } from "../scripts/smoke-updater-config-preflight.mjs";
 
 const completeUpdaterConfig = {
@@ -155,5 +159,38 @@ describe("updater config preflight", () => {
     expect(exitCodeForUpdaterConfigPreflight(invalidReport, { expectMissing: true })).toBe(1);
     expect(exitCodeForUpdaterConfigPreflight(readyReport, { expectMissing: true })).toBe(1);
     expect(exitCodeForUpdaterConfigPreflight(readyReport)).toBe(0);
+  });
+
+  test("parses output file arguments and writes atomic JSON evidence", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-updater-preflight-out-"));
+    const outputFile = join(tempDir, "nested", "updater.json");
+
+    try {
+      expect(
+        parseUpdaterConfigPreflightArgs(["--expect-missing", "--out-file", outputFile]),
+      ).toEqual({
+        expectMissing: true,
+        outFile: outputFile,
+      });
+
+      const report = evaluateUpdaterConfigPreflight({
+        bundle: {
+          active: true,
+        },
+      });
+      const written = writeUpdaterConfigPreflightOutputFile(outputFile, report);
+
+      expect(written).toBe(outputFile);
+      expect(readFileSync(outputFile, "utf8").endsWith("\n")).toBe(true);
+      expect(JSON.parse(readFileSync(outputFile, "utf8"))).toEqual(report);
+      expect(() => parseUpdaterConfigPreflightArgs(["--out-file"])).toThrow(
+        "--out-file requires a non-empty value",
+      );
+      expect(() => parseUpdaterConfigPreflightArgs(["--unknown"])).toThrow(
+        "unknown updater config preflight argument: --unknown",
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

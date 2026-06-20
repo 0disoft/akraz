@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.4.89",
+  "version": "0.4.90",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -28,6 +28,7 @@
     "smoke:peer-session-executor": "bun run --cwd apps/akraz smoke:peer-session-executor",
     "smoke:signing-preflight": "bun run --cwd apps/akraz smoke:signing-preflight",
     "smoke:updater-config-preflight": "bun run --cwd apps/akraz smoke:updater-config-preflight",
+    "smoke:windows-mvp-release-gate": "bun run --cwd apps/akraz smoke:windows-mvp-release-gate",
     "smoke:session-connect-lifecycle": "bun run --cwd apps/akraz smoke:session-connect-lifecycle",
     "smoke:settings-start": "bun run --cwd apps/akraz smoke:settings-start",
     "smoke:tcp-transport": "bun run --cwd apps/akraz smoke:tcp-transport",

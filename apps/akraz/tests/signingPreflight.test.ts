@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -8,6 +8,7 @@ import {
   evaluateSigningPreflight,
   exitCodeForSigningPreflight,
   parseSigningPreflightArgs,
+  writeSigningPreflightOutputFile,
 } from "../scripts/smoke-signing-preflight.mjs";
 
 describe("signing preflight", () => {
@@ -89,5 +90,32 @@ describe("signing preflight", () => {
     expect(exitCodeForSigningPreflight(invalidReport, { expectMissing: true })).toBe(1);
     expect(exitCodeForSigningPreflight(readyReport, { expectMissing: true })).toBe(1);
     expect(exitCodeForSigningPreflight(readyReport)).toBe(0);
+  });
+
+  test("parses output file arguments and writes atomic JSON evidence", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-signing-preflight-out-"));
+    const outputFile = join(tempDir, "nested", "signing.json");
+
+    try {
+      expect(parseSigningPreflightArgs(["--expect-missing", "--out-file", outputFile])).toEqual({
+        expectMissing: true,
+        outFile: outputFile,
+      });
+
+      const report = evaluateSigningPreflight({});
+      const written = writeSigningPreflightOutputFile(outputFile, report);
+
+      expect(written).toBe(outputFile);
+      expect(readFileSync(outputFile, "utf8").endsWith("\n")).toBe(true);
+      expect(JSON.parse(readFileSync(outputFile, "utf8"))).toEqual(report);
+      expect(() => parseSigningPreflightArgs(["--out-file"])).toThrow(
+        "--out-file requires a non-empty value",
+      );
+      expect(() => parseSigningPreflightArgs(["--unknown"])).toThrow(
+        "unknown signing preflight argument: --unknown",
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

@@ -1,5 +1,15 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const UPDATER_CONFIG_PREFLIGHT_SCHEMA_VERSION = "akraz.updaterConfig.preflight/v1";
@@ -35,9 +45,26 @@ export function readTauriConfig(workspaceRoot) {
 }
 
 export function parseUpdaterConfigPreflightArgs(args) {
-  return {
-    expectMissing: args.includes("--expect-missing"),
+  const options = {
+    expectMissing: false,
+    outFile: undefined,
   };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    switch (arg) {
+      case "--expect-missing":
+        options.expectMissing = true;
+        break;
+      case "--out-file":
+        options.outFile = readValue(args, ++index, arg);
+        break;
+      default:
+        throw new Error(`unknown updater config preflight argument: ${arg}`);
+    }
+  }
+
+  return options;
 }
 
 export function exitCodeForUpdaterConfigPreflight(report, options = {}) {
@@ -46,6 +73,42 @@ export function exitCodeForUpdaterConfigPreflight(report, options = {}) {
   }
 
   return options.expectMissing && hasOnlyMissingChecks(report) ? 0 : 1;
+}
+
+export function writeUpdaterConfigPreflightOutputFile(outFile, payload) {
+  if (!outFile) {
+    return undefined;
+  }
+
+  const resolvedOutFile = resolve(outFile);
+  const outDirectory = dirname(resolvedOutFile);
+  const tempFile = resolve(
+    outDirectory,
+    `.${basename(resolvedOutFile)}.${process.pid}.${Date.now()}.tmp`,
+  );
+  const serializedPayload = `${JSON.stringify(payload, null, 2)}\n`;
+
+  mkdirSync(outDirectory, { recursive: true });
+
+  let fileDescriptor;
+  try {
+    fileDescriptor = openSync(tempFile, "w", 0o600);
+    writeFileSync(fileDescriptor, serializedPayload, "utf8");
+    fsyncSync(fileDescriptor);
+    closeSync(fileDescriptor);
+    fileDescriptor = undefined;
+    renameSync(tempFile, resolvedOutFile);
+  } catch (error) {
+    if (fileDescriptor !== undefined) {
+      closeSync(fileDescriptor);
+    }
+    if (existsSync(tempFile)) {
+      rmSync(tempFile, { force: true });
+    }
+    throw error;
+  }
+
+  return resolvedOutFile;
 }
 
 function hasOnlyMissingChecks(report) {
@@ -199,12 +262,21 @@ function isValidProductionEndpoint(value) {
   }
 }
 
+function readValue(args, index, flag) {
+  const value = args[index];
+  if (!value || value.trim().length === 0 || value.startsWith("--")) {
+    throw new Error(`${flag} requires a non-empty value`);
+  }
+  return value;
+}
+
 if (import.meta.main) {
   const options = parseUpdaterConfigPreflightArgs(process.argv.slice(2));
   const scriptDir = dirname(fileURLToPath(import.meta.url));
   const appRoot = dirname(scriptDir);
   const workspaceRoot = join(appRoot, "..", "..");
   const report = evaluateUpdaterConfigPreflight(readTauriConfig(workspaceRoot));
+  writeUpdaterConfigPreflightOutputFile(options.outFile, report);
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   process.exit(exitCodeForUpdaterConfigPreflight(report, options));
 }

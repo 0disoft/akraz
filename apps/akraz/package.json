@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.4.89",
+  "version": "0.4.90",
   "private": true,
   "type": "module",
   "scripts": {
@@ -23,6 +23,7 @@
     "smoke:peer-session-executor": "bun scripts/smoke-peer-session-executor.mjs",
     "smoke:signing-preflight": "bun scripts/smoke-signing-preflight.mjs --expect-missing",
     "smoke:updater-config-preflight": "bun scripts/smoke-updater-config-preflight.mjs --expect-missing",
+    "smoke:windows-mvp-release-gate": "bun scripts/smoke-windows-mvp-release-gate.mjs",
     "smoke:session-connect-lifecycle": "bun scripts/smoke-session-connect-lifecycle.mjs",
     "smoke:settings-start": "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
     "smoke:tcp-transport": "bun scripts/smoke-tcp-transport.mjs",

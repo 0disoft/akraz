@@ -27,6 +27,11 @@ import {
   parseWindowsMvpReleaseGateArgs,
   writeWindowsMvpReleaseGateOutputFile,
 } from "../scripts/windows-mvp-release-gate.mjs";
+import {
+  WINDOWS_MVP_RELEASE_GATE_SMOKE_SCHEMA_VERSION,
+  buildWindowsMvpReleaseGateSmokeReport,
+  exitCodeForWindowsMvpReleaseGateSmoke,
+} from "../scripts/smoke-windows-mvp-release-gate.mjs";
 
 function passingQaReport() {
   return {
@@ -275,5 +280,25 @@ describe("Windows MVP release gate", () => {
     } finally {
       rmSync(tempDir, { force: true, recursive: true });
     }
+  });
+
+  test("smoke gate verifies fail-closed behavior without release evidence", () => {
+    const releaseGateReport = buildWindowsMvpReleaseGateReport();
+    const smokeReport = buildWindowsMvpReleaseGateSmokeReport(releaseGateReport);
+
+    expect(smokeReport.schemaVersion).toBe(WINDOWS_MVP_RELEASE_GATE_SMOKE_SCHEMA_VERSION);
+    expect(smokeReport.ready).toBe(true);
+    expect(smokeReport.releaseGateReady).toBe(false);
+    expect(smokeReport.releaseGateExitCode).toBe(1);
+    expect(smokeReport.checkedGateIds).toContain("qaReport");
+    expect(smokeReport.checkedGateIds).toContain("soakReport");
+    expect(smokeReport.checks.every((check) => check.status === "pass")).toBe(true);
+    expect(smokeReport.privacy).toEqual({
+      includesQaReportPayload: false,
+      includesSecretValues: false,
+      includesFullFilePaths: false,
+      includesEndpointValues: false,
+    });
+    expect(exitCodeForWindowsMvpReleaseGateSmoke(smokeReport)).toBe(0);
   });
 });
