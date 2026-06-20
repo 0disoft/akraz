@@ -2505,16 +2505,16 @@ where
     let thread = thread::Builder::new()
         .name("akraz-daemon-input-capture".to_string())
         .spawn(move || {
-            run_daemon_input_capture_worker(
+            run_daemon_input_capture_worker(DaemonInputCaptureWorkerRuntime {
                 state,
                 capture,
-                worker_running,
+                running: worker_running,
                 config,
                 routing,
                 dispatcher,
                 logs,
                 environment_inspector,
-            )
+            })
         })
         .map_err(|error| {
             PlatformError::new(format!(
@@ -2525,7 +2525,7 @@ where
     Ok(DaemonInputCaptureWorker::new(running, thread))
 }
 
-fn run_daemon_input_capture_worker<D, E>(
+struct DaemonInputCaptureWorkerRuntime<D, E> {
     state: SharedRuntimeInputState,
     capture: InputCaptureSession,
     running: Arc<AtomicBool>,
@@ -2533,12 +2533,26 @@ fn run_daemon_input_capture_worker<D, E>(
     routing: DaemonInputRoutingConfig,
     dispatcher: D,
     logs: Option<SharedDaemonLogBuffer>,
-    mut environment_inspector: E,
+    environment_inspector: E,
+}
+
+fn run_daemon_input_capture_worker<D, E>(
+    runtime: DaemonInputCaptureWorkerRuntime<D, E>,
 ) -> Result<(), PlatformError>
 where
     D: CoreActionDispatcher,
     E: RuntimeEnvironmentInspector,
 {
+    let DaemonInputCaptureWorkerRuntime {
+        state,
+        capture,
+        running,
+        config,
+        routing,
+        dispatcher,
+        logs,
+        mut environment_inspector,
+    } = runtime;
     let idle_poll_interval = config.bounded_idle_poll_interval();
     let mut idle_watchdog =
         InputCaptureIdleWatchdog::new(config.bounded_idle_watchdog_timeout(), Instant::now());
@@ -3220,19 +3234,19 @@ fn handle_ipc_request(
         }
         IpcRequest::PermissionsProbe(request) => match build_permissions_probe(platform) {
             Ok(probe) => {
-                if !probe.issues.is_empty() {
-                    if let Err(error) = recover_runtime_state_after_interrupt_and_dispatch(
+                if !probe.issues.is_empty()
+                    && let Err(error) = recover_runtime_state_after_interrupt_and_dispatch(
                         state,
                         dispatcher,
                         logs,
                         RuntimeRecoveryInterrupt::PermissionLost,
-                    ) {
-                        return encode_platform_error(
-                            request.id,
-                            "permission recovery unavailable",
-                            error,
-                        );
-                    }
+                    )
+                {
+                    return encode_platform_error(
+                        request.id,
+                        "permission recovery unavailable",
+                        error,
+                    );
                 }
                 record_daemon_event(
                     logs,
