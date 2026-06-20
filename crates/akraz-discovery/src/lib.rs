@@ -6,7 +6,7 @@ use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use akraz_identity::{PairingIdentityDocument, TrustedPeerIdentity};
+use akraz_identity::{DeviceIdentity, PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_protocol::CapabilityFlags;
 
 /// DNS-SD service type used by Akraz mDNS discovery.
@@ -38,6 +38,27 @@ pub struct DiscoveryTxtRecord {
     pub fingerprint: Option<String>,
     pub capabilities: CapabilityFlags,
     pub build_version: String,
+}
+
+impl DiscoveryTxtRecord {
+    /// Build the public TXT payload advertised by a local peer identity.
+    pub fn from_device_identity(
+        identity: &DeviceIdentity,
+        capabilities: CapabilityFlags,
+        build_version: impl Into<String>,
+    ) -> Self {
+        let document = PairingIdentityDocument::from_device_identity(identity, capabilities);
+
+        Self {
+            version: AKRAZ_DISCOVERY_TXT_VERSION,
+            device_id: document.device_id().to_string(),
+            display_name: Some(document.display_name().to_string()),
+            identity_public_key: Some(document.identity_public_key().to_string()),
+            fingerprint: Some(document.fingerprint().to_string()),
+            capabilities: document.capabilities(),
+            build_version: build_version.into(),
+        }
+    }
 }
 
 /// One peer candidate after DNS-SD endpoint data and TXT records have been decoded.
@@ -778,6 +799,54 @@ mod tests {
                 "device_id=linux-laptop".to_string(),
                 "caps=pointer,keyboard".to_string(),
                 "build=0.5.7".to_string(),
+                "display_name=Linux Laptop".to_string(),
+                format!("identity_public_key={}", document.identity_public_key()),
+                format!("fingerprint={}", document.fingerprint()),
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_advertised_txt_record_from_local_identity() {
+        let secret_key = Ed25519IdentityKey::generate();
+        let public_key = secret_key.public_key_bytes();
+        let identity = DeviceIdentity::new(
+            "linux-laptop",
+            "Linux Laptop",
+            public_key,
+            fingerprint_for_public_key(&public_key),
+        );
+        let document = PairingIdentityDocument::from_device_identity(
+            &identity,
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+
+        let record = DiscoveryTxtRecord::from_device_identity(
+            &identity,
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            "0.8.0",
+        );
+
+        assert_eq!(record.version, AKRAZ_DISCOVERY_TXT_VERSION);
+        assert_eq!(record.device_id, "linux-laptop");
+        assert_eq!(record.display_name.as_deref(), Some("Linux Laptop"));
+        assert_eq!(
+            record.identity_public_key.as_deref(),
+            Some(document.identity_public_key())
+        );
+        assert_eq!(record.fingerprint.as_deref(), Some(document.fingerprint()));
+        assert_eq!(
+            record.capabilities,
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+        );
+        assert_eq!(record.build_version, "0.8.0");
+        assert_eq!(
+            build_discovery_txt_record(&record),
+            vec![
+                "v=1".to_string(),
+                "device_id=linux-laptop".to_string(),
+                "caps=pointer,keyboard".to_string(),
+                "build=0.8.0".to_string(),
                 "display_name=Linux Laptop".to_string(),
                 format!("identity_public_key={}", document.identity_public_key()),
                 format!("fingerprint={}", document.fingerprint()),

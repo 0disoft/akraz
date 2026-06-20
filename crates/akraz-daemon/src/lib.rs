@@ -18,8 +18,8 @@ use akraz_core::{
     RuntimeInputState, ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
 };
 use akraz_discovery::{
-    DiscoveredPeer, DiscoveryPeerFilter, DiscoverySessionCandidate, SharedDiscoveredPeers,
-    build_discovery_session_candidates,
+    DiscoveredPeer, DiscoveryPeerFilter, DiscoverySessionCandidate, DiscoveryTxtRecord,
+    SharedDiscoveredPeers, build_discovery_session_candidates,
 };
 use akraz_identity::{
     Ed25519PublicKey, FileIdentityStore, IdentityPublicKey, IdentitySecretKey, LocalIdentity,
@@ -799,6 +799,31 @@ impl ManagedPeerSessionTransport {
             local_device_id: DeviceId::new(local.identity().device_id()),
             trusted_peers,
         }))
+    }
+
+    /// Build the TXT record this daemon should advertise through discovery.
+    pub fn discovery_txt_record(
+        &self,
+        build_version: impl Into<String>,
+    ) -> Result<Option<DiscoveryTxtRecord>, PlatformError> {
+        let Some(auth_config) = &self.auth_config else {
+            return Ok(None);
+        };
+        let store = FileIdentityStore::new(&auth_config.identity_store);
+        let local = store
+            .load_or_create(&auth_config.identity_display_name)
+            .map_err(|error| {
+                PlatformError::new(format!(
+                    "failed to load identity store {}: {error}",
+                    auth_config.identity_store.display()
+                ))
+            })?;
+
+        Ok(Some(DiscoveryTxtRecord::from_device_identity(
+            local.identity(),
+            peer_session_capabilities(),
+            build_version,
+        )))
     }
 
     /// Attach an already connected TCP peer session.
@@ -3864,11 +3889,12 @@ mod tests {
         ScreenEdgeBinding, ScreenLayout, SessionId,
     };
     use akraz_discovery::{
-        DiscoveredPeer, DiscoverySessionCandidate, DiscoveryTxtRecord, SharedDiscoveredPeers,
+        AKRAZ_DISCOVERY_TXT_VERSION, DiscoveredPeer, DiscoverySessionCandidate, DiscoveryTxtRecord,
+        SharedDiscoveredPeers,
     };
     use akraz_identity::{
         DeviceIdentity, Ed25519IdentityKey, Ed25519PublicKey, FileIdentityStore, LocalIdentity,
-        TrustedPeer, TrustedPeerIdentity, fingerprint_for_public_key,
+        PairingIdentityDocument, TrustedPeer, TrustedPeerIdentity, fingerprint_for_public_key,
     };
     use akraz_ipc::{
         ControlModeSnapshot, DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams,
@@ -4465,6 +4491,57 @@ mod tests {
         .expect("discovery candidates without identity context");
 
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn peer_session_discovery_txt_record_requires_identity_context() {
+        let record = ManagedPeerSessionTransport::new()
+            .discovery_txt_record("0.8.0")
+            .expect("discovery TXT record without identity context");
+
+        assert_eq!(record, None);
+    }
+
+    #[test]
+    fn peer_session_discovery_txt_record_uses_local_identity_public_fields() {
+        let identity_store_path = unique_identity_store_path("discovery-advertisement");
+        let _ = std::fs::remove_file(&identity_store_path);
+        let identity_store = FileIdentityStore::new(&identity_store_path);
+        let local = identity_store
+            .load_or_create("Windows Desktop")
+            .expect("create local identity store");
+        let expected_document = PairingIdentityDocument::from_device_identity(
+            local.identity(),
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+        let peer_sessions = ManagedPeerSessionTransport::with_identity_store(
+            &identity_store_path,
+            "Windows Desktop",
+        );
+
+        let record = peer_sessions
+            .discovery_txt_record("0.8.0")
+            .expect("discovery TXT record with identity context")
+            .expect("advertised discovery TXT record");
+
+        assert_eq!(record.version, AKRAZ_DISCOVERY_TXT_VERSION);
+        assert_eq!(record.device_id, local.identity().device_id());
+        assert_eq!(record.display_name.as_deref(), Some("Windows Desktop"));
+        assert_eq!(
+            record.identity_public_key.as_deref(),
+            Some(expected_document.identity_public_key())
+        );
+        assert_eq!(
+            record.fingerprint.as_deref(),
+            Some(expected_document.fingerprint())
+        );
+        assert_eq!(
+            record.capabilities,
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+        );
+        assert_eq!(record.build_version, "0.8.0");
+
+        let _ = std::fs::remove_file(&identity_store_path);
     }
 
     #[test]
