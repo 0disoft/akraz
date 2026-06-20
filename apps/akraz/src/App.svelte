@@ -683,6 +683,12 @@
                   <span class="peer-main">
                     <span class="peer-name">{peerDisplayName(peer)}</span>
                     <code class="peer-id">{peer.peerId}</code>
+                    {#if peer.address}
+                      <code class="peer-id">{peer.address}</code>
+                    {/if}
+                    {#if peer.localDeviceId}
+                      <code class="peer-id">내 기기 {peer.localDeviceId}</code>
+                    {/if}
                   </span>
                   <strong>{peerConnectionLabel(peer)}</strong>
                 </li>

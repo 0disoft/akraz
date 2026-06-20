@@ -9,6 +9,8 @@ export interface PeerStatus {
   peerId: string;
   displayName: string;
   connected: boolean;
+  localDeviceId?: string;
+  address?: string;
 }
 
 export interface PlatformCapabilities {

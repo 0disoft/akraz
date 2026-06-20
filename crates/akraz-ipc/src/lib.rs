@@ -1060,13 +1060,17 @@ impl From<DesktopMonitor> for DiagnosticsMonitorSnapshot {
     }
 }
 
-/// Minimal peer status placeholder for the first status contract.
+/// Peer status shown by `daemon.status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerStatus {
     pub peer_id: String,
     pub display_name: String,
     pub connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 /// `daemon.status` result.
@@ -1902,7 +1906,22 @@ mod tests {
             daemon_version: "0.1.0".to_string(),
             mode: ControlModeSnapshot::Local,
             protocol: ProtocolVersionSnapshot { major: 1, minor: 0 },
-            peers: Vec::new(),
+            peers: vec![
+                PeerStatus {
+                    peer_id: "linux-laptop".to_string(),
+                    display_name: "Linux Laptop".to_string(),
+                    connected: true,
+                    local_device_id: Some("windows-desktop".to_string()),
+                    address: Some("127.0.0.1:24888".to_string()),
+                },
+                PeerStatus {
+                    peer_id: "offline-macbook".to_string(),
+                    display_name: "Offline MacBook".to_string(),
+                    connected: false,
+                    local_device_id: None,
+                    address: None,
+                },
+            ],
             capabilities: IpcPlatformCapabilities {
                 can_capture_pointer: true,
                 can_capture_keyboard: true,
@@ -1928,7 +1947,20 @@ mod tests {
                         "major": 1,
                         "minor": 0
                     },
-                    "peers": [],
+                    "peers": [
+                        {
+                            "peerId": "linux-laptop",
+                            "displayName": "Linux Laptop",
+                            "connected": true,
+                            "localDeviceId": "windows-desktop",
+                            "address": "127.0.0.1:24888"
+                        },
+                        {
+                            "peerId": "offline-macbook",
+                            "displayName": "Offline MacBook",
+                            "connected": false
+                        }
+                    ],
                     "capabilities": {
                         "canCapturePointer": true,
                         "canCaptureKeyboard": true,
@@ -2043,11 +2075,15 @@ mod tests {
                     peer_id: "linux-laptop-secret-id".to_string(),
                     display_name: "Alice Linux Laptop".to_string(),
                     connected: true,
+                    local_device_id: Some("windows-desktop-secret-id".to_string()),
+                    address: Some("127.0.0.1:24888".to_string()),
                 },
                 PeerStatus {
                     peer_id: "windows-desktop-secret-id".to_string(),
                     display_name: "Windows Desktop".to_string(),
                     connected: false,
+                    local_device_id: None,
+                    address: None,
                 },
             ],
             capabilities: capabilities.clone(),
@@ -2137,6 +2173,8 @@ mod tests {
                 peer_id: "secret-peer-id".to_string(),
                 display_name: "Secret Peer".to_string(),
                 connected: true,
+                local_device_id: Some("secret-local-device".to_string()),
+                address: Some("127.0.0.1:24888".to_string()),
             }],
             capabilities: capabilities.clone(),
         };

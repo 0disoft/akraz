@@ -3552,6 +3552,8 @@ fn active_peer_statuses(
             display_name,
             peer_id: session.peer_id.as_str().to_string(),
             connected: true,
+            local_device_id: Some(session.local_device_id.as_str().to_string()),
+            address: Some(session.address.to_string()),
         });
     }
 
@@ -4095,7 +4097,7 @@ mod tests {
                 version: 1,
                 device_id: device_id.to_string(),
                 capabilities,
-                build_version: "0.5.3".to_string(),
+                build_version: "0.5.4".to_string(),
             },
         }
     }
@@ -4168,6 +4170,8 @@ mod tests {
                 display_name: "Right Peer".to_string(),
                 peer_id: "right-peer".to_string(),
                 connected: true,
+                local_device_id: Some("windows-desktop".to_string()),
+                address: Some(address.to_string()),
             }]
         );
 
@@ -4214,7 +4218,7 @@ mod tests {
                 fingerprint: Some("AKRZ-TRUSTED".to_string()),
                 trusted: true,
                 address: "127.0.0.1:4455".parse().expect("candidate address"),
-                build_version: "0.5.3".to_string(),
+                build_version: "0.5.4".to_string(),
                 capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
             }]
         );

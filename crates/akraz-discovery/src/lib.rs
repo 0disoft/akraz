@@ -475,7 +475,7 @@ mod tests {
             capabilities: CapabilityFlags::POINTER
                 | CapabilityFlags::KEYBOARD
                 | CapabilityFlags::SCREEN_LAYOUT,
-            build_version: "0.5.3".to_string(),
+            build_version: "0.5.4".to_string(),
         }
     }
 
@@ -499,7 +499,7 @@ mod tests {
             "v=1",
             "device_id=linux-laptop",
             "caps=pointer,keyboard,screen-layout",
-            "build=0.5.3",
+            "build=0.5.4",
         ])
         .expect("parse TXT record");
 
@@ -514,7 +514,7 @@ mod tests {
                 "v=1",
                 "device_id=linux-laptop",
                 "caps=pointer,keyboard,screen-layout",
-                "build=0.5.3",
+                "build=0.5.4",
             ]
         );
     }
@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn rejects_missing_duplicate_unsupported_and_unknown_txt_fields() {
         assert_eq!(
-            parse_discovery_txt_record(["v=1", "device_id=linux-laptop", "build=0.5.3"]),
+            parse_discovery_txt_record(["v=1", "device_id=linux-laptop", "build=0.5.4"]),
             Err(DiscoveryTxtError::MissingField { key: "caps" })
         );
         assert_eq!(
@@ -531,7 +531,7 @@ mod tests {
                 "V=1",
                 "device_id=linux-laptop",
                 "caps=pointer",
-                "build=0.5.3",
+                "build=0.5.4",
             ]),
             Err(DiscoveryTxtError::DuplicateField {
                 key: "v".to_string(),
@@ -542,7 +542,7 @@ mod tests {
                 "v=2",
                 "device_id=linux-laptop",
                 "caps=pointer",
-                "build=0.5.3",
+                "build=0.5.4",
             ]),
             Err(DiscoveryTxtError::UnsupportedVersion { version: 2 })
         );
@@ -551,7 +551,7 @@ mod tests {
                 "v=1",
                 "device_id=linux-laptop",
                 "caps=pointer,text",
-                "build=0.5.3",
+                "build=0.5.4",
             ]),
             Err(DiscoveryTxtError::InvalidCapability {
                 value: "text".to_string(),
@@ -566,7 +566,7 @@ mod tests {
                 "v=1",
                 "device_id=linux laptop",
                 "caps=pointer",
-                "build=0.5.3",
+                "build=0.5.4",
             ]),
             Err(DiscoveryTxtError::InvalidDeviceId {
                 value: "linux laptop".to_string(),
@@ -578,7 +578,7 @@ mod tests {
                 "v=1",
                 "device_id=linux:laptop",
                 "caps=pointer",
-                "build=0.5.3",
+                "build=0.5.4",
             ]),
             Err(DiscoveryTxtError::InvalidDeviceId {
                 value: "linux:laptop".to_string(),
@@ -683,7 +683,7 @@ mod tests {
                 fingerprint: Some("AKRZ-TRUSTED".to_string()),
                 trusted: true,
                 address: "127.0.0.1:4455".parse().expect("candidate address"),
-                build_version: "0.5.3".to_string(),
+                build_version: "0.5.4".to_string(),
                 capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
             }]
         );
@@ -710,7 +710,7 @@ mod tests {
                 fingerprint: None,
                 trusted: false,
                 address: "127.0.0.1:4455".parse().expect("candidate address"),
-                build_version: "0.5.3".to_string(),
+                build_version: "0.5.4".to_string(),
                 capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
             }]
         );
