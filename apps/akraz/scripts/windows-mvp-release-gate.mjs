@@ -39,6 +39,13 @@ import {
 } from "./windows-mvp-soak-report.mjs";
 
 export const WINDOWS_MVP_RELEASE_GATE_SCHEMA_VERSION = "akraz.windowsMvpReleaseGate/v1";
+export const WINDOWS_MVP_RELEASE_GATE_CHECK_IDS = {
+  releaseMetadata: "releaseMetadata",
+  qaReport: "qaReport",
+  soakReport: "soakReport",
+  signingPreflight: "signingPreflight",
+  updaterConfigPreflight: "updaterConfigPreflight",
+};
 
 export function buildWindowsMvpReleaseGateReport(
   options = {},
@@ -156,7 +163,7 @@ export function writeWindowsMvpReleaseGateOutputFile(outFile, payload) {
 
 function evaluateReleaseMetadataEvidence(report) {
   return {
-    id: "releaseMetadata",
+    id: WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.releaseMetadata,
     source: "workspace",
     status: report.ready ? "pass" : "invalid",
     schemaVersion: report.schemaVersion,
@@ -177,7 +184,7 @@ function evaluateQaReportEvidence(fileRead, filePath) {
   const report = fileRead.payload;
   if (report?.schemaVersion !== WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION) {
     return schemaMismatchCheck(
-      "qaReport",
+      WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.qaReport,
       "qaReportFile",
       WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION,
       report,
@@ -186,7 +193,7 @@ function evaluateQaReportEvidence(fileRead, filePath) {
 
   const evaluation = evaluateWindowsMvpQaReport(report);
   return {
-    id: "qaReport",
+    id: WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.qaReport,
     source: "qaReportFile",
     status: evaluation.ready ? "pass" : "invalid",
     fileProvided: Boolean(filePath),
@@ -209,7 +216,7 @@ function evaluateSoakReportEvidence(fileRead, filePath) {
   const report = fileRead.payload;
   if (report?.schemaVersion !== WINDOWS_MVP_SOAK_SCHEMA_VERSION) {
     return schemaMismatchCheck(
-      "soakReport",
+      WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.soakReport,
       "soakReportFile",
       WINDOWS_MVP_SOAK_SCHEMA_VERSION,
       report,
@@ -220,6 +227,7 @@ function evaluateSoakReportEvidence(fileRead, filePath) {
   if (durationStatus.status !== "pass") {
     return {
       ...durationStatus,
+      id: WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.soakReport,
       fileProvided: Boolean(filePath),
       schemaVersion: report.schemaVersion,
       expectedSchemaVersion: WINDOWS_MVP_SOAK_SCHEMA_VERSION,
@@ -230,7 +238,7 @@ function evaluateSoakReportEvidence(fileRead, filePath) {
     assertSoakSummaryHealthy(report);
   } catch (error) {
     return {
-      id: "soakReport",
+      id: WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.soakReport,
       source: "soakReportFile",
       status: "invalid",
       detail: "soakSummaryUnhealthy",
@@ -246,7 +254,7 @@ function evaluateSoakReportEvidence(fileRead, filePath) {
   const qaEvidenceStatus = evaluateSoakQaEvidence(report);
   if (qaEvidenceStatus.status !== "pass") {
     return {
-      id: "soakReport",
+      id: WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.soakReport,
       source: "soakReportFile",
       status: "invalid",
       detail: qaEvidenceStatus.detail,
@@ -264,7 +272,7 @@ function evaluateSoakReportEvidence(fileRead, filePath) {
   }
 
   return {
-    id: "soakReport",
+    id: WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.soakReport,
     source: "soakReportFile",
     status: "pass",
     fileProvided: Boolean(filePath),
@@ -282,7 +290,7 @@ function evaluateSoakReportEvidence(fileRead, filePath) {
 function evaluateSigningPreflightEvidence(report, filePath) {
   if (report?.schemaVersion !== SIGNING_PREFLIGHT_SCHEMA_VERSION) {
     return schemaMismatchCheck(
-      "signingPreflight",
+      WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.signingPreflight,
       filePath ? "signingPreflightFile" : "environment",
       SIGNING_PREFLIGHT_SCHEMA_VERSION,
       report,
@@ -293,7 +301,7 @@ function evaluateSigningPreflightEvidence(report, filePath) {
   }
 
   return {
-    id: "signingPreflight",
+    id: WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.signingPreflight,
     source: filePath ? "signingPreflightFile" : "environment",
     status: report.ready ? "pass" : "invalid",
     fileProvided: Boolean(filePath),
@@ -309,7 +317,7 @@ function evaluateSigningPreflightEvidence(report, filePath) {
 function evaluateUpdaterConfigEvidence(report, filePath) {
   if (report?.schemaVersion !== UPDATER_CONFIG_PREFLIGHT_SCHEMA_VERSION) {
     return schemaMismatchCheck(
-      "updaterConfigPreflight",
+      WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.updaterConfigPreflight,
       filePath ? "updaterConfigPreflightFile" : "workspaceConfig",
       UPDATER_CONFIG_PREFLIGHT_SCHEMA_VERSION,
       report,
@@ -320,7 +328,7 @@ function evaluateUpdaterConfigEvidence(report, filePath) {
   }
 
   return {
-    id: "updaterConfigPreflight",
+    id: WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.updaterConfigPreflight,
     source: filePath ? "updaterConfigPreflightFile" : "workspaceConfig",
     status: report.ready ? "pass" : "invalid",
     fileProvided: Boolean(filePath),
@@ -390,7 +398,7 @@ function evaluateSoakDuration(report) {
     !Number.isSafeInteger(report.elapsedMs)
   ) {
     return {
-      id: "soakReport",
+      id: WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.soakReport,
       source: "soakReportFile",
       status: "invalid",
       detail: "durationFieldsInvalid",

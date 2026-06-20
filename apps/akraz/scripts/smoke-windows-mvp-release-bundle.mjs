@@ -5,7 +5,10 @@ import {
   exitCodeForWindowsMvpReleaseBundle,
 } from "./windows-mvp-release-bundle.mjs";
 import { WINDOWS_MVP_RELEASE_GATE_SCHEMA_VERSION } from "./windows-mvp-release-gate.mjs";
-import { WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION } from "./windows-mvp-release-evidence-sources.mjs";
+import {
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS,
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
+} from "./windows-mvp-release-evidence-sources.mjs";
 import { WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION } from "./windows-mvp-qa-report.mjs";
 import { WINDOWS_MVP_SOAK_SCHEMA_VERSION } from "./windows-mvp-soak-report.mjs";
 import { SIGNING_PREFLIGHT_SCHEMA_VERSION } from "./smoke-signing-preflight.mjs";
@@ -39,6 +42,41 @@ const EXPECTED_MANIFEST_ARTIFACT_FILES = {
   updaterConfigPreflight: WINDOWS_MVP_RELEASE_BUNDLE_FILES.updaterConfigPreflight,
   evidenceSources: WINDOWS_MVP_RELEASE_BUNDLE_FILES.evidenceSources,
 };
+const EXPECTED_EVIDENCE_SOURCE_BUNDLE_MAPPINGS = Object.entries(
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS,
+).map(([id, bundle]) => Object.assign({ id }, bundle));
+const PRIVACY_FLAG_NAMES = [
+  "includesQaReportPayload",
+  "includesSecretValues",
+  "includesFullFilePaths",
+  "includesEndpointValues",
+  "includesSourceEvidencePaths",
+  "includesArtifactPayloads",
+];
+const SECRET_STRING_PATTERNS = [
+  {
+    id: "secretSentinel",
+    pattern: /super-secret/i,
+  },
+  {
+    id: "privateKeyPem",
+    pattern: /-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----/i,
+  },
+  {
+    id: "githubToken",
+    pattern: /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/,
+  },
+  {
+    id: "awsAccessKeyId",
+    pattern: /\bAKIA[0-9A-Z]{16}\b/,
+  },
+  {
+    id: "genericSecretToken",
+    pattern: /\bsk-[A-Za-z0-9_-]{20,}\b/,
+  },
+];
+const SENSITIVE_FIELD_NAME_PATTERN =
+  /secret|password|private[-_]?key|token|certificate[-_]?base64|cert[-_]?base64|pfx|p12/i;
 
 export function buildWindowsMvpReleaseBundleSmokeReport(
   bundleReport = buildWindowsMvpReleaseBundleReport(),
@@ -426,10 +464,26 @@ function evaluateReleaseGateArtifact(releaseGate) {
 }
 
 function evaluateEvidenceSourcesArtifact(evidenceSources) {
-  if (
-    evidenceSources?.schemaVersion === WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION &&
-    evidenceSources?.ready === true
-  ) {
+  if (evidenceSources?.schemaVersion !== WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION) {
+    return {
+      id: "evidenceSourcesArtifactReady",
+      status: "invalid",
+      detail: "evidenceSourcesArtifactNotReady",
+      ready: evidenceSources?.ready ?? null,
+    };
+  }
+
+  if (evidenceSources?.ready !== true) {
+    return {
+      id: "evidenceSourcesArtifactReady",
+      status: "invalid",
+      detail: "evidenceSourcesArtifactNotReady",
+      ready: evidenceSources?.ready ?? null,
+    };
+  }
+
+  const sourceBundleMapping = evaluateEvidenceSourcesBundleMapping(evidenceSources);
+  if (sourceBundleMapping.status === "pass") {
     return {
       id: "evidenceSourcesArtifactReady",
       status: "pass",
@@ -439,17 +493,30 @@ function evaluateEvidenceSourcesArtifact(evidenceSources) {
   return {
     id: "evidenceSourcesArtifactReady",
     status: "invalid",
-    detail: "evidenceSourcesArtifactNotReady",
-    ready: evidenceSources?.ready ?? null,
+    detail: sourceBundleMapping.detail,
+    invalidSourceIds: sourceBundleMapping.invalidSourceIds,
   };
 }
 
 function evaluateArtifactPrivacy(artifacts) {
-  const invalidFiles = Object.entries(artifacts)
-    .filter(
-      ([, artifact]) => artifact.ok && JSON.stringify(artifact.payload).includes("super-secret"),
-    )
-    .map(([fileName]) => fileName);
+  const findings = Object.entries(artifacts).flatMap(([fileName, artifact]) => {
+    if (!artifact.ok) {
+      return [];
+    }
+
+    const failures = artifactPrivacyFailures(artifact.payload);
+    if (failures.length === 0) {
+      return [];
+    }
+
+    return [
+      {
+        fileName,
+        ...mergePrivacyFailures(failures),
+      },
+    ];
+  });
+  const invalidFiles = findings.map((finding) => finding.fileName);
 
   if (invalidFiles.length === 0) {
     return {
@@ -461,8 +528,155 @@ function evaluateArtifactPrivacy(artifacts) {
   return {
     id: "bundleArtifactPrivacy",
     status: "invalid",
-    detail: "bundleArtifactContainsSecretSentinel",
+    detail: "bundleArtifactPrivacyNotReady",
     invalidFiles,
+    findings,
+  };
+}
+
+function evaluateEvidenceSourcesBundleMapping(evidenceSources) {
+  const sources = Array.isArray(evidenceSources?.sources) ? evidenceSources.sources : [];
+  const invalidSourceIds = EXPECTED_EVIDENCE_SOURCE_BUNDLE_MAPPINGS.filter((expected) => {
+    const source = sources.find((candidate) => candidate?.id === expected.id);
+    return (
+      !source ||
+      source.expectedFileName !== expected.fileName ||
+      source.bundle?.artifactId !== expected.artifactId ||
+      source.bundle?.releaseGateCheckId !== expected.releaseGateCheckId ||
+      source.bundle?.fileName !== expected.fileName
+    );
+  }).map((expected) => expected.id);
+
+  if (invalidSourceIds.length === 0) {
+    return {
+      status: "pass",
+    };
+  }
+
+  return {
+    status: "invalid",
+    detail: "evidenceSourceBundleMappingDrift",
+    invalidSourceIds,
+  };
+}
+
+function artifactPrivacyFailures(payload) {
+  return [
+    ...privacyFlagFailures(payload?.privacy),
+    ...secretPatternFailures(payload),
+    ...sensitiveFieldFailures(payload),
+  ];
+}
+
+function privacyFlagFailures(privacy) {
+  if (typeof privacy !== "object" || privacy === null || Array.isArray(privacy)) {
+    return [];
+  }
+
+  const invalidFlags = PRIVACY_FLAG_NAMES.filter(
+    (flagName) => Object.hasOwn(privacy, flagName) && privacy[flagName] !== false,
+  );
+  if (invalidFlags.length === 0) {
+    return [];
+  }
+
+  return [
+    {
+      reason: "privacyFlagsNotReady",
+      invalidFlags,
+    },
+  ];
+}
+
+function secretPatternFailures(payload) {
+  const patternIds = [...new Set(secretPatternIds(payload))].toSorted();
+  if (patternIds.length === 0) {
+    return [];
+  }
+
+  return [
+    {
+      reason: "secretPatternDetected",
+      secretPatterns: patternIds,
+    },
+  ];
+}
+
+function secretPatternIds(value) {
+  if (typeof value === "string") {
+    return SECRET_STRING_PATTERNS.filter((entry) => entry.pattern.test(value)).map(
+      (entry) => entry.id,
+    );
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => secretPatternIds(item));
+  }
+
+  if (typeof value === "object" && value !== null) {
+    return Object.values(value).flatMap((item) => secretPatternIds(item));
+  }
+
+  return [];
+}
+
+function sensitiveFieldFailures(payload) {
+  const sensitiveFields = sensitiveFieldPaths(payload).toSorted();
+  if (sensitiveFields.length === 0) {
+    return [];
+  }
+
+  return [
+    {
+      reason: "sensitiveFieldValue",
+      sensitiveFields,
+    },
+  ];
+}
+
+function sensitiveFieldPaths(value, path = []) {
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => sensitiveFieldPaths(item, [...path, String(index)]));
+  }
+
+  if (typeof value !== "object" || value === null) {
+    return [];
+  }
+
+  return Object.entries(value).flatMap(([key, child]) => {
+    const childPath = [...path, key];
+    if (
+      typeof child === "string" &&
+      SENSITIVE_FIELD_NAME_PATTERN.test(key) &&
+      looksLikeSensitiveFieldValue(child)
+    ) {
+      return [childPath.join(".")];
+    }
+
+    return sensitiveFieldPaths(child, childPath);
+  });
+}
+
+function looksLikeSensitiveFieldValue(value) {
+  const trimmed = value.trim();
+  return (
+    trimmed.length >= 8 &&
+    !/^(missing|present|redacted|available|unavailable|configured|notConfigured)$/i.test(trimmed)
+  );
+}
+
+function mergePrivacyFailures(failures) {
+  return {
+    reasons: [...new Set(failures.map((failure) => failure.reason))].toSorted(),
+    invalidFlags: [
+      ...new Set(failures.flatMap((failure) => failure.invalidFlags ?? [])),
+    ].toSorted(),
+    secretPatterns: [
+      ...new Set(failures.flatMap((failure) => failure.secretPatterns ?? [])),
+    ].toSorted(),
+    sensitiveFields: [
+      ...new Set(failures.flatMap((failure) => failure.sensitiveFields ?? [])),
+    ].toSorted(),
   };
 }
 

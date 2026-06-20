@@ -16,6 +16,7 @@ import {
   WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
   buildWindowsMvpReleaseWorkflowInputsReport,
 } from "./windows-mvp-release-workflow-inputs.mjs";
+import { WINDOWS_MVP_RELEASE_GATE_CHECK_IDS } from "./windows-mvp-release-gate.mjs";
 
 export const WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION =
   "akraz.windowsMvpReleaseEvidenceSources/v1";
@@ -28,12 +29,12 @@ export const WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES = {
 export const WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS = {
   qaReport: {
     artifactId: "qaReport",
-    releaseGateCheckId: "qaReport",
+    releaseGateCheckId: WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.qaReport,
     fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
   },
   soakReport: {
     artifactId: "soakReport",
-    releaseGateCheckId: "soakReport",
+    releaseGateCheckId: WINDOWS_MVP_RELEASE_GATE_CHECK_IDS.soakReport,
     fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
   },
 };

@@ -57,6 +57,14 @@ const RELEASE_RESOLVED_EVIDENCE_SOURCE_SNIPPETS = [
     id: "bundleMappingDriftDetail",
     snippet: "bundleMappingDrift",
   },
+  {
+    id: "bundleMappingComparison",
+    snippet: "!evidenceSourceBundleMatches(bundle, canonicalBundle)",
+  },
+  {
+    id: "bundleReleaseGateCheckIdComparison",
+    snippet: "bundle.releaseGateCheckId === canonicalBundle.releaseGateCheckId",
+  },
 ];
 const RELEASE_BUNDLE_ARTIFACT_INTEGRITY_SMOKE_SNIPPETS = [
   {
@@ -74,6 +82,22 @@ const RELEASE_BUNDLE_ARTIFACT_INTEGRITY_SMOKE_SNIPPETS = [
   {
     id: "manifestFileNameActualValue",
     snippet: 'actualFileName: typeof artifact.fileName === "string" ? artifact.fileName : null',
+  },
+  {
+    id: "canonicalSourceBundleMappingImport",
+    snippet: "WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS",
+  },
+  {
+    id: "evidenceSourceBundleMappingDriftDetail",
+    snippet: "evidenceSourceBundleMappingDrift",
+  },
+  {
+    id: "evidenceSourceExpectedFileNameComparison",
+    snippet: "source.expectedFileName !== expected.fileName",
+  },
+  {
+    id: "evidenceSourceReleaseGateCheckIdComparison",
+    snippet: "source.bundle?.releaseGateCheckId !== expected.releaseGateCheckId",
   },
 ];
 const RELEASE_EVIDENCE_SOURCES_ARGUMENT_SNIPPETS = [
@@ -290,7 +314,8 @@ function evaluateBunPackageManager(packageManager, expectedBunVersion) {
 
 function evaluateCheckoutVersions(workflows) {
   return workflows.flatMap((workflow) => {
-    const matches = [...workflow.source.matchAll(/uses:\s+actions\/checkout@([^\s#]+)/g)];
+    const workflowSource = activeSource(workflow.source);
+    const matches = [...workflowSource.matchAll(/uses:\s+actions\/checkout@([^\s#]+)/g)];
     if (matches.length === 0) {
       return [
         {
@@ -305,7 +330,7 @@ function evaluateCheckoutVersions(workflows) {
     return matches.map((match) => {
       const actualVersion = match[1];
       return {
-        id: `checkoutVersion:${workflow.name}:${lineNumberForOffset(workflow.source, match.index)}`,
+        id: `checkoutVersion:${workflow.name}:${lineNumberForOffset(workflowSource, match.index)}`,
         status: actualVersion === REQUIRED_CHECKOUT_VERSION ? "pass" : "invalid",
         workflowFile: workflow.name,
         expectedVersion: REQUIRED_CHECKOUT_VERSION,
@@ -317,11 +342,12 @@ function evaluateCheckoutVersions(workflows) {
 
 function evaluateBunVersions(workflows, expectedBunVersion) {
   return workflows.flatMap((workflow) => {
-    if (!workflow.source.includes("oven-sh/setup-bun@")) {
+    const workflowSource = activeSource(workflow.source);
+    if (!workflowSource.includes("oven-sh/setup-bun@")) {
       return [];
     }
 
-    const matches = [...workflow.source.matchAll(/bun-version:\s*([^\s#]+)/g)];
+    const matches = [...workflowSource.matchAll(/bun-version:\s*([^\s#]+)/g)];
     if (matches.length === 0) {
       return [
         {
@@ -337,7 +363,7 @@ function evaluateBunVersions(workflows, expectedBunVersion) {
     return matches.map((match) => {
       const actualVersion = unquote(match[1]);
       return {
-        id: `bunVersion:${workflow.name}:${lineNumberForOffset(workflow.source, match.index)}`,
+        id: `bunVersion:${workflow.name}:${lineNumberForOffset(workflowSource, match.index)}`,
         status: actualVersion === expectedBunVersion ? "pass" : "invalid",
         workflowFile: workflow.name,
         expectedBunVersion,
@@ -466,7 +492,9 @@ function evaluateTauriSidecarContract(workflows, tauriConfig) {
     .filter((requirement) => !requirement.valid)
     .map((requirement) => requirement.id);
   const missingWorkflowSnippets = requiredWorkflowSnippets
-    .filter((requirement) => !checkWorkflow.source.includes(requirement.snippet))
+    .filter(
+      (requirement) => !sourceIncludesActiveSnippet(checkWorkflow.source, requirement.snippet),
+    )
     .map((requirement) => requirement.id);
 
   if (missingConfigEntries.length === 0 && missingWorkflowSnippets.length === 0) {
@@ -710,7 +738,9 @@ function evaluateReleaseEvidenceSourcesWiring(workflows) {
     },
   ];
   const missingSnippets = requiredSnippets
-    .filter((requirement) => !releaseWorkflow.source.includes(requirement.snippet))
+    .filter(
+      (requirement) => !sourceIncludesActiveSnippet(releaseWorkflow.source, requirement.snippet),
+    )
     .map((requirement) => requirement.id);
 
   if (missingSnippets.length === 0) {
@@ -772,7 +802,9 @@ function evaluateReleaseBundleOutputWiring(workflows) {
     },
   ];
   const missingSnippets = requiredSnippets
-    .filter((requirement) => !releaseWorkflow.source.includes(requirement.snippet))
+    .filter(
+      (requirement) => !sourceIncludesActiveSnippet(releaseWorkflow.source, requirement.snippet),
+    )
     .map((requirement) => requirement.id);
 
   if (missingSnippets.length === 0) {
@@ -813,7 +845,7 @@ function evaluateReleaseBundleArtifactIntegritySmokeContract(workspaceRoot) {
 
   const scriptSource = readFileSync(scriptPath, "utf8");
   const missingSnippets = RELEASE_BUNDLE_ARTIFACT_INTEGRITY_SMOKE_SNIPPETS.filter(
-    (requirement) => !scriptSource.includes(requirement.snippet),
+    (requirement) => !sourceIncludesActiveSnippet(scriptSource, requirement.snippet),
   ).map((requirement) => requirement.id);
 
   if (missingSnippets.length === 0) {
@@ -849,7 +881,7 @@ function evaluateReleaseResolvedEvidenceSourceContract(workspaceRoot) {
 
   const scriptSource = readFileSync(scriptPath, "utf8");
   const missingSnippets = RELEASE_RESOLVED_EVIDENCE_SOURCE_SNIPPETS.filter(
-    (requirement) => !scriptSource.includes(requirement.snippet),
+    (requirement) => !sourceIncludesActiveSnippet(scriptSource, requirement.snippet),
   ).map((requirement) => requirement.id);
 
   if (missingSnippets.length === 0) {
@@ -921,7 +953,9 @@ function evaluateSmokeWorkflowCoverage(workflows) {
     },
   ];
   const missingSnippets = requiredSnippets
-    .filter((requirement) => !checkWorkflow.source.includes(requirement.snippet))
+    .filter(
+      (requirement) => !sourceIncludesActiveSnippet(checkWorkflow.source, requirement.snippet),
+    )
     .map((requirement) => requirement.id);
 
   if (missingScripts.length === 0 && missingSnippets.length === 0) {
@@ -1077,7 +1111,8 @@ function buildNextActions(checks) {
         return [
           {
             id: "syncReleaseBundleArtifactIntegritySmoke",
-            action: "restore release bundle artifact integrity smoke manifest file-name checks",
+            action:
+              "restore release bundle artifact integrity smoke manifest and evidence-source mapping checks",
             scriptPath: check.scriptPath,
             missingSnippets: check.missingSnippets ?? [],
           },
@@ -1140,11 +1175,12 @@ function uniqueWorkflowScripts(workflows) {
 }
 
 function extractBunRunScripts(source) {
-  const directScripts = [...source.matchAll(/\bbun\s+run\s+([A-Za-z0-9:_-]+)/g)].map(
-    (match) => match[1],
-  );
+  const sourceWithoutInactiveLines = activeSource(source);
+  const directScripts = [
+    ...sourceWithoutInactiveLines.matchAll(/\bbun\s+run\s+([A-Za-z0-9:_-]+)/g),
+  ].map((match) => match[1]);
   const arrayScripts = [];
-  const lines = source.split(/\r?\n/);
+  const lines = sourceWithoutInactiveLines.split(/\r?\n/);
   for (let index = 0; index < lines.length - 1; index += 1) {
     if (unquoteListItem(lines[index]) !== "run") {
       continue;
@@ -1160,25 +1196,48 @@ function extractBunRunScripts(source) {
 }
 
 function inputDefault(source, inputName) {
-  const pattern = new RegExp(`${inputName}:[\\s\\S]*?\\n\\s+default:\\s*([^\\n#]+)`);
-  const match = source.match(pattern);
-  return match ? unquote(match[1].trim()) : null;
+  const lines = activeSource(source).split(/\r?\n/);
+  const inputPattern = new RegExp(`^(\\s*)${escapeRegExp(inputName)}:\\s*$`);
+  const inputLineIndex = lines.findIndex((line) => inputPattern.test(line));
+  if (inputLineIndex === -1) {
+    return null;
+  }
+
+  const inputIndent = leadingWhitespaceLength(lines[inputLineIndex]);
+  for (let index = inputLineIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.trim().length === 0) {
+      continue;
+    }
+
+    const lineIndent = leadingWhitespaceLength(line);
+    if (lineIndent <= inputIndent) {
+      return null;
+    }
+
+    const defaultMatch = line.match(/^\s+default:\s*([^\n#]+)/);
+    if (defaultMatch) {
+      return unquote(defaultMatch[1].trim());
+    }
+  }
+
+  return null;
 }
 
 function uploadArtifactName(source) {
-  const match = source.match(
+  const match = activeSource(source).match(
     /uses:\s+actions\/upload-artifact@[^\n]+[\s\S]*?\n\s+name:\s*([^\n#]+)/,
   );
   return match ? unquote(match[1].trim()) : null;
 }
 
 function workflowInputDefinitionExists(source, inputName) {
-  return new RegExp(`\\n\\s{6}${escapeRegExp(inputName)}:\\s*\\n`).test(source);
+  return new RegExp(`\\n\\s{6}${escapeRegExp(inputName)}:\\s*\\n`).test(activeSource(source));
 }
 
 function countWorkflowInputEnvMappings(source, inputName, envName) {
   const expectedMapping = `${envName}: \${{ inputs.${inputName} }}`;
-  return source.split(expectedMapping).length - 1;
+  return activeSource(source).split(expectedMapping).length - 1;
 }
 
 function readWorkflowFiles(workspaceRoot) {
@@ -1220,6 +1279,24 @@ function unquote(value) {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function sourceIncludesActiveSnippet(source, snippet) {
+  return activeSource(source).includes(snippet);
+}
+
+function activeSource(source) {
+  return source
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trim();
+      return !trimmed.startsWith("#") && !trimmed.startsWith("//");
+    })
+    .join("\n");
+}
+
+function leadingWhitespaceLength(value) {
+  return value.match(/^\s*/)?.[0].length ?? 0;
 }
 
 function lineNumberForOffset(source, offset) {

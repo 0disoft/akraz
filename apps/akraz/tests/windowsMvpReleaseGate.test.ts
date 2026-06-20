@@ -1002,6 +1002,122 @@ describe("Windows MVP release gate", () => {
     }
   });
 
+  test("rejects a release bundle with stale evidence source bundle mapping", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-bundle-source-map-"));
+    const outDir = join(tempDir, "bundle");
+    const qaReportFile = join(tempDir, "qa-report.json");
+    const soakReportFile = join(tempDir, "soak-report.json");
+    const signingFile = join(tempDir, "signing.json");
+    const updaterFile = join(tempDir, "updater.json");
+    const evidenceSourcesFile = join(tempDir, "evidence-sources.json");
+    const options = {
+      evidenceSourcesFile: writeJson(
+        evidenceSourcesFile,
+        buildWindowsMvpReleaseEvidenceSourcesReport({
+          sourceRunId: "27856073522",
+          manifestWritten: true,
+          dispatchInputsWritten: true,
+        }),
+      ),
+      qaReportFile: writeJson(qaReportFile, passingQaReport()),
+      signingPreflightFile: writeJson(signingFile, passingSigningPreflight()),
+      soakReportFile: writeJson(soakReportFile, passingSoakReport()),
+      updaterConfigPreflightFile: writeJson(updaterFile, passingUpdaterConfigPreflight()),
+    };
+
+    try {
+      const gateReport = buildWindowsMvpReleaseGateReport(options);
+      const bundleReport = buildWindowsMvpReleaseBundleReport(options);
+      writeWindowsMvpReleaseBundleOutput(outDir, options, bundleReport, gateReport);
+
+      const bundledEvidenceSourcesPath = join(
+        outDir,
+        WINDOWS_MVP_RELEASE_BUNDLE_FILES.evidenceSources,
+      );
+      const bundledEvidenceSources = JSON.parse(readFileSync(bundledEvidenceSourcesPath, "utf8"));
+      const qaSource = bundledEvidenceSources.sources.find((source) => source.id === "qaReport");
+      qaSource.bundle.releaseGateCheckId = "qaEvidence";
+      writeJson(bundledEvidenceSourcesPath, bundledEvidenceSources);
+
+      const report = buildWindowsMvpReleaseBundleArtifactIntegrityReport(outDir);
+
+      expect(report.ready).toBe(false);
+      expect(
+        report.checks.find((check) => check.id === "evidenceSourcesArtifactReady"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "evidenceSourceBundleMappingDrift",
+        invalidSourceIds: ["qaReport"],
+      });
+      expect(report.checks.find((check) => check.id === "bundleManifestReady")).toMatchObject({
+        status: "pass",
+      });
+      expect(exitCodeForWindowsMvpReleaseBundleArtifactIntegrity(report)).toBe(1);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects a release bundle artifact with unsafe privacy flags or secret patterns", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-bundle-privacy-"));
+    const outDir = join(tempDir, "bundle");
+    const qaReportFile = join(tempDir, "qa-report.json");
+    const soakReportFile = join(tempDir, "soak-report.json");
+    const signingFile = join(tempDir, "signing.json");
+    const updaterFile = join(tempDir, "updater.json");
+    const evidenceSourcesFile = join(tempDir, "evidence-sources.json");
+    const options = {
+      evidenceSourcesFile: writeJson(
+        evidenceSourcesFile,
+        buildWindowsMvpReleaseEvidenceSourcesReport({
+          sourceRunId: "27856073522",
+          manifestWritten: true,
+          dispatchInputsWritten: true,
+        }),
+      ),
+      qaReportFile: writeJson(qaReportFile, passingQaReport()),
+      signingPreflightFile: writeJson(signingFile, passingSigningPreflight()),
+      soakReportFile: writeJson(soakReportFile, passingSoakReport()),
+      updaterConfigPreflightFile: writeJson(updaterFile, passingUpdaterConfigPreflight()),
+    };
+
+    try {
+      const gateReport = buildWindowsMvpReleaseGateReport(options);
+      const bundleReport = buildWindowsMvpReleaseBundleReport(options);
+      writeWindowsMvpReleaseBundleOutput(outDir, options, bundleReport, gateReport);
+
+      const signingArtifactPath = join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.signingPreflight);
+      const signingArtifact = JSON.parse(readFileSync(signingArtifactPath, "utf8"));
+      signingArtifact.privacy.includesSecretValues = true;
+      signingArtifact.debug = {
+        privateKeyPem: "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----",
+      };
+      writeJson(signingArtifactPath, signingArtifact);
+
+      const report = buildWindowsMvpReleaseBundleArtifactIntegrityReport(outDir);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "bundleArtifactPrivacy")).toMatchObject({
+        status: "invalid",
+        detail: "bundleArtifactPrivacyNotReady",
+        invalidFiles: [WINDOWS_MVP_RELEASE_BUNDLE_FILES.signingPreflight],
+        findings: [
+          {
+            fileName: WINDOWS_MVP_RELEASE_BUNDLE_FILES.signingPreflight,
+            reasons: ["privacyFlagsNotReady", "secretPatternDetected", "sensitiveFieldValue"],
+            invalidFlags: ["includesSecretValues"],
+            secretPatterns: ["privateKeyPem"],
+            sensitiveFields: ["debug.privateKeyPem"],
+          },
+        ],
+      });
+      expect(JSON.stringify(report)).not.toContain("not-a-real-key");
+      expect(exitCodeForWindowsMvpReleaseBundleArtifactIntegrity(report)).toBe(1);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
   test("rejects incomplete release bundle inputs without copying missing evidence", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-bundle-missing-"));
     const outDir = join(tempDir, "bundle");

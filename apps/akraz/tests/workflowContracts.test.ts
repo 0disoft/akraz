@@ -125,6 +125,10 @@ describe("GitHub Actions workflow contracts", () => {
         "manifestFileNameMismatchList",
         "manifestFileNameExpectedValue",
         "manifestFileNameActualValue",
+        "canonicalSourceBundleMappingImport",
+        "evidenceSourceBundleMappingDriftDetail",
+        "evidenceSourceExpectedFileNameComparison",
+        "evidenceSourceReleaseGateCheckIdComparison",
       ],
     });
     expect(
@@ -137,6 +141,8 @@ describe("GitHub Actions workflow contracts", () => {
         "sourceBundleRead",
         "canonicalBundleOutput",
         "bundleMappingDriftDetail",
+        "bundleMappingComparison",
+        "bundleReleaseGateCheckIdComparison",
       ],
     });
     expect(report.checks.every((check) => check.status === "pass")).toBe(true);
@@ -498,6 +504,62 @@ describe("GitHub Actions workflow contracts", () => {
     }
   });
 
+  test("rejects release artifact drift when an input default is missing", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-artifact-contracts-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory);
+      copyCurrentWorkflows(tempDirectory);
+
+      const releaseWorkflowWithoutQaDefault = readFileSync(
+        join(".github", "workflows", "windows-mvp-release.yml"),
+        "utf8",
+      ).replace(
+        [
+          "      qa_report_artifact:",
+          '        description: "Artifact name containing one sanitized Windows MVP QA report JSON."',
+          "        required: true",
+          "        type: string",
+          "        default: windows-mvp-qa-report",
+        ].join("\n"),
+        [
+          "      qa_report_artifact:",
+          '        description: "Artifact name containing one sanitized Windows MVP QA report JSON."',
+          "        required: true",
+          "        type: string",
+        ].join("\n"),
+      );
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "windows-mvp-release.yml"),
+        releaseWorkflowWithoutQaDefault,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "releaseArtifactNames")).toMatchObject({
+        status: "invalid",
+        detail: "releaseArtifactNamesDrifted",
+        mismatches: ["qaReportArtifact"],
+        actual: {
+          releaseQaDefault: null,
+          releaseSoakDefault: "windows-mvp-soak-report",
+          qaUploadName: "windows-mvp-qa-report",
+          soakUploadName: "windows-mvp-soak-report",
+        },
+      });
+      expect(report.nextActions).toContainEqual({
+        id: "syncReleaseArtifactNames",
+        action: "sync release workflow artifact defaults with QA and soak upload artifact names",
+        mismatches: ["qaReportArtifact"],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
   test("rejects release workflow drift when bundle artifact integrity is not smoked", () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-bundle-smoke-contracts-"));
 
@@ -589,13 +651,61 @@ describe("GitHub Actions workflow contracts", () => {
       });
       expect(report.nextActions).toContainEqual({
         id: "syncReleaseBundleArtifactIntegritySmoke",
-        action: "restore release bundle artifact integrity smoke manifest file-name checks",
+        action:
+          "restore release bundle artifact integrity smoke manifest and evidence-source mapping checks",
         scriptPath: "apps/akraz/scripts/smoke-windows-mvp-release-bundle.mjs",
         missingSnippets: [
           "manifestArtifactFileMap",
           "manifestFileNameMismatchList",
           "manifestFileNameExpectedValue",
         ],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects release bundle smoke drift when evidence source bundle mapping is not checked", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-bundle-source-map-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory);
+      copyCurrentWorkflows(tempDirectory);
+
+      const smokeScriptPath = join(
+        tempDirectory,
+        "apps",
+        "akraz",
+        "scripts",
+        "smoke-windows-mvp-release-bundle.mjs",
+      );
+      writeFileSync(
+        smokeScriptPath,
+        readFileSync(smokeScriptPath, "utf8").replaceAll(
+          "evidenceSourceBundleMappingDrift",
+          "evidenceSourceBundleMappingMismatch",
+        ),
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(
+        report.checks.find((check) => check.id === "releaseBundleArtifactIntegritySmokeContract"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "releaseBundleArtifactIntegritySmokeDrifted",
+        scriptPath: "apps/akraz/scripts/smoke-windows-mvp-release-bundle.mjs",
+        missingSnippets: ["evidenceSourceBundleMappingDriftDetail"],
+      });
+      expect(report.nextActions).toContainEqual({
+        id: "syncReleaseBundleArtifactIntegritySmoke",
+        action:
+          "restore release bundle artifact integrity smoke manifest and evidence-source mapping checks",
+        scriptPath: "apps/akraz/scripts/smoke-windows-mvp-release-bundle.mjs",
+        missingSnippets: ["evidenceSourceBundleMappingDriftDetail"],
       });
       expect(exitCodeForWorkflowContracts(report)).toBe(1);
     } finally {
@@ -651,6 +761,42 @@ describe("GitHub Actions workflow contracts", () => {
         workflowFile: "windows-mvp-release.yml",
         missingSnippets: ["releaseBundleOutDirArgument", "releaseBundleUploadPath"],
       });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects release workflow drift when canonical upload path only exists in a comment", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-bundle-comment-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory);
+      copyCurrentWorkflows(tempDirectory);
+
+      const releaseWorkflowWithCommentOnlyUploadPath = readFileSync(
+        join(".github", "workflows", "windows-mvp-release.yml"),
+        "utf8",
+      ).replace(
+        "          path: release-bundle/*.json",
+        "          path: release-output/*.json\n          # path: release-bundle/*.json",
+      );
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "windows-mvp-release.yml"),
+        releaseWorkflowWithCommentOnlyUploadPath,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "releaseBundleOutputWiring")).toMatchObject(
+        {
+          status: "invalid",
+          detail: "releaseBundleOutputWiringDrifted",
+          missingSnippets: ["releaseBundleUploadPath"],
+        },
+      );
       expect(exitCodeForWorkflowContracts(report)).toBe(1);
     } finally {
       rmSync(tempDirectory, { force: true, recursive: true });
