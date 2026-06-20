@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "akraz-app"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "akraz-identity",
  "akraz-ipc",
@@ -33,11 +33,11 @@ dependencies = [
 
 [[package]]
 name = "akraz-core"
-version = "0.8.0"
+version = "0.9.0"
 
 [[package]]
 name = "akraz-daemon"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "akraz-core",
  "akraz-discovery",
@@ -52,16 +52,17 @@ dependencies = [
 
 [[package]]
 name = "akraz-discovery"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "akraz-identity",
  "akraz-protocol",
+ "mdns-sd",
  "serde_json",
 ]
 
 [[package]]
 name = "akraz-identity"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "akraz-protocol",
  "blake3",
@@ -75,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "akraz-ipc"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "akraz-core",
  "akraz-platform",
@@ -87,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "akraz-platform"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "akraz-core",
  "windows-sys 0.60.2",
@@ -95,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "akraz-protocol"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -103,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "akrazctl"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "akraz-identity",
  "akraz-ipc",
@@ -1002,6 +1003,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "flume"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
+dependencies = [
+ "spin",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1700,6 +1710,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1970,6 +1990,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdns-sd"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "892f96f6d2ebe1ea641279f986ac52a2a6bac71e8f743bb258315cfe2bd7e88e"
+dependencies = [
+ "fastrand",
+ "flume",
+ "if-addrs",
+ "mio",
+ "socket-pktinfo",
+ "socket2",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2007,6 +2041,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -3110,6 +3145,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
+name = "socket-pktinfo"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "927136cc2ae6a1b0e66ac6b1210902b75c3f726db004a73bc18686dcd0dcd22f"
+dependencies = [
+ "libc",
+ "socket2",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3165,6 +3211,15 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "spin"
+version = "0.9.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+dependencies = [
+ "lock_api",
 ]
 
 [[package]]

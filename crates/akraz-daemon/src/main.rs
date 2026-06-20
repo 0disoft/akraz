@@ -27,6 +27,7 @@ use akraz_daemon::{
     serve_tcp_peer_transport_session_and_execute, shared_runtime_state,
     start_monitored_daemon_input_capture_with_edge_bindings_dispatcher_and_logs,
 };
+use akraz_discovery::{MdnsDiscoveryConfig, MdnsDiscoveryRuntime, SharedDiscoveredPeers};
 use akraz_identity::FileIdentityStore;
 use akraz_ipc::{
     DAEMON_CRASH_MARKER_PROCESS_ROLE, DAEMON_CRASH_MARKER_SCHEMA_VERSION, DaemonCrashMarker,
@@ -39,6 +40,7 @@ use akraz_platform::{
 use serde::Serialize;
 
 const PEER_LISTENER_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 fn main() -> ExitCode {
     match parse_daemon_command(env::args().skip(1)) {
@@ -103,11 +105,13 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let server = DaemonIpcServer::from_shared_state_dispatcher_and_peer_sessions(
+    let discovered_peers = SharedDiscoveredPeers::new();
+    let server = DaemonIpcServer::from_shared_state_dispatcher_peer_sessions_and_discovery(
         shared_runtime_state(RuntimeInputState::new()),
         platform.clone(),
         dispatcher.clone(),
-        peer_sessions,
+        peer_sessions.clone(),
+        discovered_peers.clone(),
     );
     let peer_listener_worker = match options.peer_listen {
         Some(address) => {
@@ -138,11 +142,25 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
         }
         None => None,
     };
+    let discovery_worker = peer_listener_worker.as_ref().and_then(|worker| {
+        match start_configured_peer_discovery(
+            &peer_sessions,
+            worker.address,
+            discovered_peers.clone(),
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                eprintln!("failed to start peer discovery: {error}");
+                None
+            }
+        }
+    });
     let capture_worker =
         match start_configured_input_capture(&server, &platform, &options, dispatcher) {
             Ok(worker) => worker,
             Err(error) => {
                 eprintln!("failed to start daemon input capture: {error}");
+                stop_discovery_worker(discovery_worker);
                 if stop_peer_session_listener(peer_listener_worker).is_err() {
                     eprintln!("failed to stop peer session listener after startup error");
                 }
@@ -160,6 +178,7 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
     };
 
     let capture_result = stop_capture_worker(capture_worker);
+    stop_discovery_worker(discovery_worker);
     let peer_listener_result = stop_peer_session_listener(peer_listener_worker);
 
     if matches!(
@@ -387,7 +406,90 @@ where
 }
 
 #[derive(Debug)]
+struct PeerDiscoveryWorker {
+    running: Arc<AtomicBool>,
+    handle: JoinHandle<Result<(), PlatformError>>,
+}
+
+fn start_configured_peer_discovery(
+    peer_sessions: &ManagedPeerSessionTransport,
+    listener_address: SocketAddr,
+    discovered_peers: SharedDiscoveredPeers,
+) -> Result<Option<PeerDiscoveryWorker>, PlatformError> {
+    let Some(txt) = peer_sessions.discovery_txt_record(env!("CARGO_PKG_VERSION"))? else {
+        return Ok(None);
+    };
+    let config = MdnsDiscoveryConfig::from_txt_record(
+        txt,
+        listener_address.port(),
+        peer_listener_discovery_addresses(listener_address),
+    );
+    let runtime = MdnsDiscoveryRuntime::start(config)
+        .map_err(|error| PlatformError::new(format!("failed to start mDNS discovery: {error}")))?;
+    let running = Arc::new(AtomicBool::new(true));
+    let worker_running = Arc::clone(&running);
+    let handle =
+        thread::spawn(move || run_peer_discovery(runtime, worker_running, discovered_peers));
+
+    eprintln!("akraz-daemon peer discovery advertising at {listener_address}");
+    Ok(Some(PeerDiscoveryWorker { running, handle }))
+}
+
+fn run_peer_discovery(
+    mut runtime: MdnsDiscoveryRuntime,
+    running: Arc<AtomicBool>,
+    discovered_peers: SharedDiscoveredPeers,
+) -> Result<(), PlatformError> {
+    while running.load(Ordering::Acquire) {
+        let peers = runtime
+            .poll_snapshot(DISCOVERY_POLL_INTERVAL)
+            .map_err(|error| {
+                PlatformError::new(format!("failed to poll mDNS discovery: {error}"))
+            })?;
+        discovered_peers.replace(peers).map_err(|error| {
+            PlatformError::new(format!(
+                "failed to update discovered peer snapshot: {error}"
+            ))
+        })?;
+    }
+
+    let shutdown_result = runtime.shutdown().map_err(|error| {
+        PlatformError::new(format!("failed to shut down mDNS discovery: {error}"))
+    });
+    discovered_peers.replace(Vec::new()).map_err(|error| {
+        PlatformError::new(format!("failed to clear discovered peer snapshot: {error}"))
+    })?;
+    shutdown_result
+}
+
+fn peer_listener_discovery_addresses(address: SocketAddr) -> Vec<std::net::IpAddr> {
+    if address.ip().is_unspecified() {
+        Vec::new()
+    } else {
+        vec![address.ip()]
+    }
+}
+
+fn stop_discovery_worker(worker: Option<PeerDiscoveryWorker>) {
+    let Some(worker) = worker else {
+        return;
+    };
+
+    worker.running.store(false, Ordering::Release);
+    match worker.handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("failed to stop peer discovery: {error}");
+        }
+        Err(_) => {
+            eprintln!("peer discovery thread panicked");
+        }
+    }
+}
+
+#[derive(Debug)]
 struct PeerSessionListenerWorker {
+    address: SocketAddr,
     running: Arc<AtomicBool>,
     handle: JoinHandle<Result<(), PlatformError>>,
 }
@@ -429,7 +531,11 @@ where
     });
 
     eprintln!("akraz-daemon peer session listener at {address}");
-    Ok(PeerSessionListenerWorker { running, handle })
+    Ok(PeerSessionListenerWorker {
+        address,
+        running,
+        handle,
+    })
 }
 
 fn run_peer_session_listener<P>(
@@ -1428,7 +1534,11 @@ impl Display for DaemonUsageError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, net::SocketAddr, path::PathBuf};
+    use std::{
+        fs,
+        net::{IpAddr, SocketAddr},
+        path::PathBuf,
+    };
 
     use akraz_core::{PeerId, ScreenEdge, ScreenEdgeBinding};
     use akraz_ipc::{IpcEndpoint, IpcEndpointKind, IpcTransportError};
@@ -1439,7 +1549,8 @@ mod tests {
         build_daemon_crash_marker, build_loopback_transport_smoke_report,
         build_peer_session_executor_smoke_report, build_peer_session_smoke_report,
         build_tcp_transport_smoke_report, current_unix_millis, format_daemon_ipc_error,
-        panic_payload_class, parse_daemon_command, write_daemon_crash_marker_file,
+        panic_payload_class, parse_daemon_command, peer_listener_discovery_addresses,
+        write_daemon_crash_marker_file,
     };
 
     fn unique_crash_marker_path(label: &str) -> PathBuf {
@@ -1717,6 +1828,34 @@ mod tests {
                 identity_store: Some(PathBuf::from("akraz-identity.json")),
                 identity_display_name: Some("Windows Desktop".to_string()),
             }))
+        );
+    }
+
+    #[test]
+    fn peer_discovery_addresses_follow_listener_binding_policy() {
+        assert_eq!(
+            peer_listener_discovery_addresses(
+                "0.0.0.0:4455"
+                    .parse::<SocketAddr>()
+                    .expect("unspecified IPv4 listener")
+            ),
+            Vec::<IpAddr>::new()
+        );
+        assert_eq!(
+            peer_listener_discovery_addresses(
+                "[::]:4455"
+                    .parse::<SocketAddr>()
+                    .expect("unspecified IPv6 listener")
+            ),
+            Vec::<IpAddr>::new()
+        );
+        assert_eq!(
+            peer_listener_discovery_addresses(
+                "127.0.0.1:4455"
+                    .parse::<SocketAddr>()
+                    .expect("loopback listener")
+            ),
+            vec!["127.0.0.1".parse::<IpAddr>().expect("loopback address")]
         );
     }
 

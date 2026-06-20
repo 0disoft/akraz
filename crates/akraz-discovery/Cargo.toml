@@ -13,4 +13,5 @@ workspace = true
 [dependencies]
 akraz-identity = { path = "../akraz-identity" }
 akraz-protocol = { path = "../akraz-protocol" }
+mdns-sd = { version = "0.20.0", default-features = false }
 serde_json = { workspace = true }

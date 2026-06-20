@@ -5,9 +5,11 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use akraz_identity::{DeviceIdentity, PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_protocol::CapabilityFlags;
+use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 /// DNS-SD service type used by Akraz mDNS discovery.
 pub const AKRAZ_DISCOVERY_SERVICE_TYPE: &str = "_akraz._tcp.local.";
@@ -27,6 +29,7 @@ const CAPABILITY_POINTER: &str = "pointer";
 const CAPABILITY_KEYBOARD: &str = "keyboard";
 const CAPABILITY_CLIPBOARD: &str = "clipboard";
 const CAPABILITY_SCREEN_LAYOUT: &str = "screen-layout";
+const MDNS_SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 
 /// Parsed TXT record advertised by one Akraz peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +83,164 @@ impl DiscoveredPeer {
             .map(|address| SocketAddr::new(address, self.port))
     }
 }
+
+/// Configuration for the Akraz mDNS/DNS-SD discovery backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdnsDiscoveryConfig {
+    pub instance_name: String,
+    pub host_name: String,
+    pub addresses: Vec<IpAddr>,
+    pub port: u16,
+    pub txt: DiscoveryTxtRecord,
+}
+
+impl MdnsDiscoveryConfig {
+    /// Build a publishable mDNS config from a local discovery TXT record.
+    pub fn from_txt_record(
+        txt: DiscoveryTxtRecord,
+        port: u16,
+        addresses: impl IntoIterator<Item = IpAddr>,
+    ) -> Self {
+        Self {
+            instance_name: mdns_instance_name(&txt),
+            host_name: mdns_host_name(&txt),
+            addresses: addresses.into_iter().collect(),
+            port,
+            txt,
+        }
+    }
+}
+
+/// Running mDNS/DNS-SD publisher and browser for Akraz peers.
+pub struct MdnsDiscoveryRuntime {
+    daemon: ServiceDaemon,
+    events: Receiver<ServiceEvent>,
+    service_fullname: String,
+    peers: BTreeMap<String, DiscoveredPeer>,
+}
+
+impl MdnsDiscoveryRuntime {
+    /// Register the local peer and start browsing for Akraz peers.
+    pub fn start(config: MdnsDiscoveryConfig) -> Result<Self, MdnsDiscoveryError> {
+        let service_info = build_mdns_service_info(&config)?;
+        let service_fullname = service_info.get_fullname().to_string();
+        let daemon = ServiceDaemon::new().map_err(|error| backend_error("start", error))?;
+        let events = match daemon.browse(AKRAZ_DISCOVERY_SERVICE_TYPE) {
+            Ok(events) => events,
+            Err(error) => {
+                wait_for_receiver_result(daemon.shutdown());
+                return Err(backend_error("browse", error));
+            }
+        };
+
+        if let Err(error) = daemon.register(service_info) {
+            let _ = daemon.stop_browse(AKRAZ_DISCOVERY_SERVICE_TYPE);
+            wait_for_receiver_result(daemon.shutdown());
+            return Err(backend_error("register", error));
+        }
+
+        Ok(Self {
+            daemon,
+            events,
+            service_fullname,
+            peers: BTreeMap::new(),
+        })
+    }
+
+    /// Poll the discovery backend and return the latest peer snapshot.
+    pub fn poll_snapshot(
+        &mut self,
+        max_wait: Duration,
+    ) -> Result<Vec<DiscoveredPeer>, MdnsDiscoveryError> {
+        if max_wait.is_zero() {
+            self.drain_available_events();
+            return Ok(self.peer_snapshot());
+        }
+
+        if let Ok(event) = self.events.recv_timeout(max_wait) {
+            self.apply_event(event);
+            self.drain_available_events();
+        }
+
+        Ok(self.peer_snapshot())
+    }
+
+    /// Stop browsing, unregister the local peer, and ask the mDNS daemon thread to exit.
+    pub fn shutdown(self) -> Result<(), MdnsDiscoveryError> {
+        let mut first_error = None;
+
+        if let Err(error) = self.daemon.stop_browse(AKRAZ_DISCOVERY_SERVICE_TYPE) {
+            first_error.get_or_insert_with(|| backend_error("stop browse", error));
+        }
+        match self.daemon.unregister(&self.service_fullname) {
+            Ok(receiver) => wait_for_receiver(receiver),
+            Err(error) => {
+                first_error.get_or_insert_with(|| backend_error("unregister", error));
+            }
+        }
+        match self.daemon.shutdown() {
+            Ok(receiver) => wait_for_receiver(receiver),
+            Err(error) => {
+                first_error.get_or_insert_with(|| backend_error("shutdown", error));
+            }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn drain_available_events(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            self.apply_event(event);
+        }
+    }
+
+    fn apply_event(&mut self, event: ServiceEvent) {
+        match event {
+            ServiceEvent::ServiceResolved(service) => {
+                if let Some(peer) = discovered_peer_from_resolved_service(&service) {
+                    self.peers.insert(service.get_fullname().to_string(), peer);
+                }
+            }
+            ServiceEvent::ServiceRemoved(_, fullname) => {
+                self.peers.remove(&fullname);
+                self.peers.remove(&fullname.to_ascii_lowercase());
+            }
+            _ => {}
+        }
+    }
+
+    fn peer_snapshot(&self) -> Vec<DiscoveredPeer> {
+        self.peers.values().cloned().collect()
+    }
+}
+
+/// Failure returned by the mDNS/DNS-SD discovery backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MdnsDiscoveryError {
+    InvalidConfig {
+        reason: &'static str,
+    },
+    Backend {
+        action: &'static str,
+        message: String,
+    },
+}
+
+impl Display for MdnsDiscoveryError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfig { reason } => write!(formatter, "invalid mDNS config: {reason}"),
+            Self::Backend { action, message } => {
+                write!(formatter, "mDNS discovery {action} failed: {message}")
+            }
+        }
+    }
+}
+
+impl Error for MdnsDiscoveryError {}
 
 /// Thread-safe snapshot of the latest peers resolved by a discovery backend.
 #[derive(Debug, Clone, Default)]
@@ -365,6 +526,176 @@ pub fn build_discovery_txt_record(record: &DiscoveryTxtRecord) -> Vec<String> {
     entries
 }
 
+fn build_mdns_service_info(
+    config: &MdnsDiscoveryConfig,
+) -> Result<ServiceInfo, MdnsDiscoveryError> {
+    if config.instance_name.trim().is_empty() {
+        return Err(MdnsDiscoveryError::InvalidConfig {
+            reason: "instance name is required",
+        });
+    }
+    if !config.host_name.ends_with(".local.") {
+        return Err(MdnsDiscoveryError::InvalidConfig {
+            reason: "host name must end with .local.",
+        });
+    }
+    if config.port == 0 {
+        return Err(MdnsDiscoveryError::InvalidConfig {
+            reason: "port must be non-zero",
+        });
+    }
+
+    let properties = mdns_txt_properties(&config.txt);
+    let addresses = config
+        .addresses
+        .iter()
+        .copied()
+        .filter(|address| !address.is_unspecified())
+        .map(|address| address.to_string())
+        .collect::<Vec<_>>();
+    let service_info = ServiceInfo::new(
+        AKRAZ_DISCOVERY_SERVICE_TYPE,
+        &config.instance_name,
+        &config.host_name,
+        &addresses[..],
+        config.port,
+        &properties[..],
+    )
+    .map_err(|error| backend_error("build service info", error))?;
+
+    if addresses.is_empty() {
+        Ok(service_info.enable_addr_auto())
+    } else {
+        Ok(service_info)
+    }
+}
+
+fn mdns_txt_properties(record: &DiscoveryTxtRecord) -> Vec<(String, String)> {
+    build_discovery_txt_record(record)
+        .into_iter()
+        .filter_map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn discovered_peer_from_resolved_service(service: &ResolvedService) -> Option<DiscoveredPeer> {
+    let txt = parse_discovery_txt_record(
+        service
+            .get_properties()
+            .iter()
+            .map(|property| format!("{}={}", property.key(), property.val_str())),
+    )
+    .ok()?;
+    let mut addresses = service
+        .get_addresses()
+        .iter()
+        .map(|address| address.to_ip_addr())
+        .collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+
+    if service.get_hostname().trim().is_empty() || service.get_port() == 0 || addresses.is_empty() {
+        return None;
+    }
+
+    Some(DiscoveredPeer {
+        instance_name: service.get_fullname().to_string(),
+        host_name: service.get_hostname().to_string(),
+        addresses,
+        port: service.get_port(),
+        txt,
+    })
+}
+
+fn mdns_instance_name(record: &DiscoveryTxtRecord) -> String {
+    sanitize_mdns_instance_name(&record.device_id)
+}
+
+fn sanitize_mdns_instance_name(value: &str) -> String {
+    let normalized = value
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let label = truncate_utf8_bytes(normalized.trim_matches('.'), 63);
+
+    if label.is_empty() {
+        "Akraz Peer".to_string()
+    } else {
+        label
+    }
+}
+
+fn mdns_host_name(record: &DiscoveryTxtRecord) -> String {
+    format!("{}.local.", sanitize_dns_label(&record.device_id))
+}
+
+fn sanitize_dns_label(value: &str) -> String {
+    let mut label = String::new();
+    let mut previous_was_dash = false;
+
+    for character in value.chars().flat_map(char::to_lowercase) {
+        let character = if character.is_ascii_alphanumeric() {
+            character
+        } else {
+            '-'
+        };
+        if character == '-' && previous_was_dash {
+            continue;
+        }
+        label.push(character);
+        previous_was_dash = character == '-';
+    }
+
+    let label = truncate_utf8_bytes(label.trim_matches('-'), 63);
+    let label = label.trim_matches('-');
+    if label.is_empty() {
+        "akraz-peer".to_string()
+    } else {
+        label.to_string()
+    }
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    let mut truncated = String::new();
+    for character in value.chars() {
+        if truncated.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        truncated.push(character);
+    }
+    truncated
+}
+
+fn backend_error(action: &'static str, error: mdns_sd::Error) -> MdnsDiscoveryError {
+    MdnsDiscoveryError::Backend {
+        action,
+        message: error.to_string(),
+    }
+}
+
+fn wait_for_receiver_result<T>(result: mdns_sd::Result<Receiver<T>>) {
+    if let Ok(receiver) = result {
+        wait_for_receiver(receiver);
+    }
+}
+
+fn wait_for_receiver<T>(receiver: Receiver<T>) {
+    let _ = receiver.recv_timeout(MDNS_SHUTDOWN_WAIT);
+}
+
 fn collect_txt_fields<I, S>(entries: I) -> Result<BTreeMap<String, String>, DiscoveryTxtError>
 where
     I: IntoIterator<Item = S>,
@@ -644,7 +975,7 @@ impl Error for DiscoveryPeerRejectReason {}
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, net::IpAddr};
 
     use akraz_identity::{
         DeviceIdentity, Ed25519IdentityKey, PairingIdentityDocument, fingerprint_for_public_key,
@@ -654,8 +985,9 @@ mod tests {
     use super::{
         AKRAZ_DISCOVERY_SERVICE_TYPE, AKRAZ_DISCOVERY_TXT_VERSION, DiscoveredPeer,
         DiscoveryPeerFilter, DiscoveryPeerRejectReason, DiscoverySessionCandidate,
-        DiscoveryTxtError, DiscoveryTxtRecord, SharedDiscoveredPeers,
-        build_discovery_session_candidates, build_discovery_txt_record, filter_discovered_peers,
+        DiscoveryTxtError, DiscoveryTxtRecord, MdnsDiscoveryConfig, MdnsDiscoveryError,
+        SharedDiscoveredPeers, build_discovery_session_candidates, build_discovery_txt_record,
+        build_mdns_service_info, discovered_peer_from_resolved_service, filter_discovered_peers,
         parse_discovery_txt_record,
     };
 
@@ -851,6 +1183,97 @@ mod tests {
                 format!("identity_public_key={}", document.identity_public_key()),
                 format!("fingerprint={}", document.fingerprint()),
             ]
+        );
+    }
+
+    #[test]
+    fn builds_mdns_service_info_from_discovery_txt_record() {
+        let config = MdnsDiscoveryConfig::from_txt_record(
+            DiscoveryTxtRecord {
+                display_name: Some("Linux Laptop".to_string()),
+                capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+                ..txt_record()
+            },
+            4455,
+            ["192.168.1.23".parse().expect("LAN address")],
+        );
+
+        let service_info = build_mdns_service_info(&config).expect("mDNS service info");
+
+        assert_eq!(config.instance_name, "linux-laptop");
+        assert_eq!(config.host_name, "linux-laptop.local.");
+        assert_eq!(
+            service_info.get_fullname(),
+            "linux-laptop._akraz._tcp.local."
+        );
+        assert_eq!(service_info.get_hostname(), "linux-laptop.local.");
+        assert_eq!(service_info.get_port(), 4455);
+        assert_eq!(
+            service_info
+                .get_addresses()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec!["192.168.1.23".parse::<IpAddr>().expect("LAN address")]
+        );
+
+        let resolved = service_info.as_resolved_service();
+        let discovered = discovered_peer_from_resolved_service(&resolved).expect("discovered peer");
+
+        assert_eq!(discovered.instance_name, "linux-laptop._akraz._tcp.local.");
+        assert_eq!(discovered.host_name, "linux-laptop.local.");
+        assert_eq!(discovered.port, 4455);
+        assert_eq!(
+            discovered.addresses,
+            vec!["192.168.1.23".parse::<IpAddr>().expect("LAN address")]
+        );
+        assert_eq!(
+            discovered.txt.capabilities,
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+        );
+        assert_eq!(discovered.txt.display_name.as_deref(), Some("Linux Laptop"));
+    }
+
+    #[test]
+    fn mdns_service_info_uses_auto_addresses_for_unspecified_listener() {
+        let config = MdnsDiscoveryConfig::from_txt_record(
+            txt_record(),
+            4455,
+            ["0.0.0.0".parse().expect("unspecified address")],
+        );
+
+        let service_info = build_mdns_service_info(&config).expect("mDNS service info");
+
+        assert!(service_info.get_addresses().is_empty());
+        assert!(service_info.is_addr_auto());
+    }
+
+    #[test]
+    fn mdns_service_info_rejects_zero_port() {
+        let config = MdnsDiscoveryConfig::from_txt_record(txt_record(), 0, Vec::<IpAddr>::new());
+
+        assert_eq!(
+            build_mdns_service_info(&config).map(|_| ()),
+            Err(MdnsDiscoveryError::InvalidConfig {
+                reason: "port must be non-zero",
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_mdns_resolved_service_is_ignored() {
+        let service_info = mdns_sd::ServiceInfo::new(
+            AKRAZ_DISCOVERY_SERVICE_TYPE,
+            "Broken Peer",
+            "broken-peer.local.",
+            "192.168.1.44",
+            4455,
+            &[("v", "1"), ("device_id", "broken-peer"), ("build", "0.8.0")][..],
+        )
+        .expect("broken mDNS service info");
+
+        assert!(
+            discovered_peer_from_resolved_service(&service_info.as_resolved_service()).is_none()
         );
     }
 

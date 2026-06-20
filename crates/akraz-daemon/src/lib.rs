@@ -2218,6 +2218,24 @@ impl<P> DaemonIpcServer<P> {
         )
     }
 
+    /// Create an in-process daemon IPC server with explicit sessions and discovery.
+    pub fn from_shared_state_dispatcher_peer_sessions_and_discovery(
+        state: SharedRuntimeInputState,
+        platform: P,
+        dispatcher: SharedCoreActionDispatcher,
+        peer_sessions: ManagedPeerSessionTransport,
+        discovered_peers: SharedDiscoveredPeers,
+    ) -> Self {
+        Self::from_shared_state_dispatcher_peer_sessions_discovery_and_logs(
+            state,
+            platform,
+            dispatcher,
+            peer_sessions,
+            discovered_peers,
+            shared_daemon_log_buffer(DEFAULT_DAEMON_LOG_CAPACITY),
+        )
+    }
+
     /// Create an in-process daemon IPC server with an explicit diagnostics log buffer.
     pub fn from_shared_state_dispatcher_peer_sessions_and_logs(
         state: SharedRuntimeInputState,
