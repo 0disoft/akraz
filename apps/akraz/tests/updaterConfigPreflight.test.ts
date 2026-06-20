@@ -186,6 +186,25 @@ describe("updater config preflight", () => {
     expect(report.privacy.includesEndpointValues).toBe(false);
   });
 
+  test("fails closed through the release package script without updater publication config", () => {
+    const result = runAppPackageScript("release:updater-config-preflight", []);
+    const report = JSON.parse(result.stdout);
+
+    expect(result.status).toBe(1);
+    expect(report.ready).toBe(false);
+    expect(report.schemaVersion).toBe("akraz.updaterConfig.preflight/v1");
+    expect(report.checks.map((check) => check.status)).toEqual([
+      "missing",
+      "missing",
+      "missing",
+      "pass",
+      "pass",
+    ]);
+    expect(report.privacy.includesSecretValues).toBe(false);
+    expect(report.privacy.includesFullFilePaths).toBe(false);
+    expect(report.privacy.includesEndpointValues).toBe(false);
+  });
+
   test("parses output file arguments and writes atomic JSON evidence", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "akraz-updater-preflight-out-"));
     const outputFile = join(tempDir, "nested", "updater.json");

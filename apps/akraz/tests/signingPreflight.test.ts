@@ -126,6 +126,30 @@ describe("signing preflight", () => {
     expect(result.stdout).not.toContain("super-secret");
   });
 
+  test("fails closed through the release package script without signing inputs", () => {
+    const result = runAppPackageScript("release:signing-preflight", [], {
+      AKRAZ_WINDOWS_SIGNING_CERT_BASE64: "",
+      AKRAZ_WINDOWS_SIGNING_CERT_PASSWORD: "",
+      AKRAZ_WINDOWS_SIGNING_CERT_PATH: "",
+      TAURI_SIGNING_PRIVATE_KEY: "",
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "",
+    });
+    const report = JSON.parse(result.stdout);
+
+    expect(result.status).toBe(1);
+    expect(report.ready).toBe(false);
+    expect(report.schemaVersion).toBe("akraz.signing.preflight/v1");
+    expect(report.checks.map((check) => check.status)).toEqual([
+      "missing",
+      "missing",
+      "missing",
+      "missing",
+    ]);
+    expect(report.privacy.includesSecretValues).toBe(false);
+    expect(report.privacy.includesFullFilePaths).toBe(false);
+    expect(result.stdout).not.toContain("super-secret");
+  });
+
   test("parses output file arguments and writes atomic JSON evidence", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "akraz-signing-preflight-out-"));
     const outputFile = join(tempDir, "nested", "signing.json");
