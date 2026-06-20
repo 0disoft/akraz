@@ -1,0 +1,279 @@
+import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  evaluateSigningPreflight,
+  SIGNING_PREFLIGHT_SCHEMA_VERSION,
+} from "../scripts/smoke-signing-preflight.mjs";
+import { evaluateUpdaterConfigPreflight } from "../scripts/smoke-updater-config-preflight.mjs";
+import {
+  WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
+  listWindowsMvpQaCaseIds,
+} from "../scripts/windows-mvp-qa-plan.mjs";
+import {
+  WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION,
+  buildWindowsMvpQaReportTemplate,
+} from "../scripts/windows-mvp-qa-report.mjs";
+import {
+  DEFAULT_DURATION_MS,
+  WINDOWS_MVP_SOAK_SCHEMA_VERSION,
+} from "../scripts/windows-mvp-soak-report.mjs";
+import {
+  WINDOWS_MVP_RELEASE_GATE_SCHEMA_VERSION,
+  buildWindowsMvpReleaseGateReport,
+  exitCodeForWindowsMvpReleaseGate,
+  parseWindowsMvpReleaseGateArgs,
+  writeWindowsMvpReleaseGateOutputFile,
+} from "../scripts/windows-mvp-release-gate.mjs";
+
+function passingQaReport() {
+  return {
+    schemaVersion: WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION,
+    planSchemaVersion: WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
+    executedAt: "2026-06-20T00:00:00.000Z",
+    environment: {
+      sourceOs: "Windows 11",
+      targetOs: "Windows 11",
+      hardware: "two physical Windows endpoints",
+    },
+    results: listWindowsMvpQaCaseIds().map((caseId) => ({
+      caseId,
+      result: "pass",
+      evidence: [`${caseId} sanitized artifact id`],
+    })),
+    privacy: {
+      includesTypedContent: false,
+      includesSecretValues: false,
+      includesFullFilePaths: false,
+    },
+  };
+}
+
+function passingSoakReport(overrides = {}) {
+  return {
+    schemaVersion: WINDOWS_MVP_SOAK_SCHEMA_VERSION,
+    startedAt: "2026-06-20T00:00:00.000Z",
+    finishedAt: "2026-06-20T02:00:00.000Z",
+    requestedDurationMs: DEFAULT_DURATION_MS,
+    elapsedMs: DEFAULT_DURATION_MS,
+    maxCycles: null,
+    cycleDelayMs: 1000,
+    scenarioTimeoutMs: 600000,
+    scenarios: ["peer-session-executor"],
+    completedCycles: 1,
+    completedRuns: 1,
+    metrics: {
+      scenarioPasses: 1,
+      scenarioFailures: 0,
+      scenarioTimeouts: 0,
+      remoteSessionStarts: 1,
+      remoteSessionStops: 1,
+      forwardedInputCommands: 0,
+      forwardedInputOutcomes: 1,
+      injectedInputEvents: 1,
+      releaseAllCommands: 0,
+      releaseAllOutcomes: 1,
+      platformReleaseAllCalls: 1,
+      sessionConnects: 1,
+      sessionDisconnects: 1,
+      finalPeerLeaks: 0,
+      stuckInputSuspicions: 0,
+    },
+    failures: [],
+    ...overrides,
+  };
+}
+
+function passingSigningPreflight() {
+  return evaluateSigningPreflight({
+    TAURI_SIGNING_PRIVATE_KEY: "super-secret-updater-key",
+    TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "super-secret-updater-password",
+    AKRAZ_WINDOWS_SIGNING_CERT_BASE64: "super-secret-cert-data",
+    AKRAZ_WINDOWS_SIGNING_CERT_PASSWORD: "super-secret-cert-password",
+  });
+}
+
+function passingUpdaterConfigPreflight() {
+  return evaluateUpdaterConfigPreflight({
+    bundle: {
+      createUpdaterArtifacts: true,
+    },
+    plugins: {
+      updater: {
+        pubkey: "akraz-public-updater-key-content",
+        endpoints: ["https://updates.example.com/{{target}}/{{arch}}/{{current_version}}"],
+        windows: {
+          installMode: "passive",
+        },
+      },
+    },
+  });
+}
+
+function writeJson(path, payload) {
+  writeFileSync(path, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  return path;
+}
+
+describe("Windows MVP release gate", () => {
+  test("accepts complete sanitized release evidence", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-gate-"));
+    const qaReportFile = join(tempDir, "qa-report.json");
+    const soakReportFile = join(tempDir, "soak-report.json");
+    const signingFile = join(tempDir, "signing.json");
+    const updaterFile = join(tempDir, "updater.json");
+
+    try {
+      const report = buildWindowsMvpReleaseGateReport({
+        qaReportFile: writeJson(qaReportFile, passingQaReport()),
+        signingPreflightFile: writeJson(signingFile, passingSigningPreflight()),
+        soakReportFile: writeJson(soakReportFile, passingSoakReport()),
+        updaterConfigPreflightFile: writeJson(updaterFile, passingUpdaterConfigPreflight()),
+      });
+      const formatted = JSON.stringify(report);
+
+      expect(report.schemaVersion).toBe(WINDOWS_MVP_RELEASE_GATE_SCHEMA_VERSION);
+      expect(report.ready).toBe(true);
+      expect(report.requiredSoakDurationMs).toBe(DEFAULT_DURATION_MS);
+      expect(report.checks.every((check) => check.status === "pass")).toBe(true);
+      expect(report.nextActions).toEqual([]);
+      expect(report.privacy).toEqual({
+        includesQaReportPayload: false,
+        includesSecretValues: false,
+        includesFullFilePaths: false,
+        includesEndpointValues: false,
+      });
+      expect(formatted).not.toContain(qaReportFile);
+      expect(formatted).not.toContain("super-secret");
+      expect(formatted).not.toContain("updates.example.com");
+      expect(exitCodeForWindowsMvpReleaseGate(report)).toBe(0);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects missing evidence file arguments with actionable next steps", () => {
+    const report = buildWindowsMvpReleaseGateReport();
+
+    expect(report.ready).toBe(false);
+    expect(report.checks.find((check) => check.id === "qaReport")).toMatchObject({
+      status: "missing",
+      detail: "fileArgumentMissing",
+    });
+    expect(report.nextActions).toContainEqual({
+      gate: "qaReport",
+      action: "provide --qa-report-file with a release evidence JSON file",
+    });
+    expect(exitCodeForWindowsMvpReleaseGate(report)).toBe(1);
+  });
+
+  test("rejects smoke-length soak evidence for release gating", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-gate-short-soak-"));
+    const qaReportFile = join(tempDir, "qa-report.json");
+    const soakReportFile = join(tempDir, "soak-report.json");
+    const signingFile = join(tempDir, "signing.json");
+    const updaterFile = join(tempDir, "updater.json");
+
+    try {
+      const report = buildWindowsMvpReleaseGateReport({
+        qaReportFile: writeJson(qaReportFile, passingQaReport()),
+        signingPreflightFile: writeJson(signingFile, passingSigningPreflight()),
+        soakReportFile: writeJson(
+          soakReportFile,
+          passingSoakReport({
+            finishedAt: "2026-06-20T00:00:01.000Z",
+            requestedDurationMs: 1,
+            elapsedMs: 1,
+          }),
+        ),
+        updaterConfigPreflightFile: writeJson(updaterFile, passingUpdaterConfigPreflight()),
+      });
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "soakReport")).toMatchObject({
+        status: "invalid",
+        detail: "durationBelowReleaseMinimum",
+        requiredSoakDurationMs: DEFAULT_DURATION_MS,
+        requestedDurationMs: 1,
+        elapsedMs: 1,
+      });
+      expect(report.nextActions).toContainEqual({
+        gate: "soakReport",
+        action: "run the Windows MVP soak for the full release minimum duration",
+      });
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("parses arguments and writes a gate report atomically", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-gate-write-"));
+    const outputFile = join(tempDir, "nested", "gate.json");
+
+    try {
+      expect(
+        parseWindowsMvpReleaseGateArgs([
+          "--qa-report-file",
+          "qa.json",
+          "--soak-report-file",
+          "soak.json",
+          "--signing-preflight-file",
+          "signing.json",
+          "--updater-config-preflight-file",
+          "updater.json",
+          "--out-file",
+          outputFile,
+        ]),
+      ).toEqual({
+        outFile: outputFile,
+        qaReportFile: "qa.json",
+        signingPreflightFile: "signing.json",
+        soakReportFile: "soak.json",
+        updaterConfigPreflightFile: "updater.json",
+      });
+
+      const written = writeWindowsMvpReleaseGateOutputFile(outputFile, {
+        schemaVersion: WINDOWS_MVP_RELEASE_GATE_SCHEMA_VERSION,
+      });
+
+      expect(written).toBe(outputFile);
+      expect(readFileSync(outputFile, "utf8").endsWith("\n")).toBe(true);
+      expect(JSON.parse(readFileSync(outputFile, "utf8"))).toEqual({
+        schemaVersion: WINDOWS_MVP_RELEASE_GATE_SCHEMA_VERSION,
+      });
+      expect(() => parseWindowsMvpReleaseGateArgs(["--qa-report-file"])).toThrow(
+        "--qa-report-file requires a non-empty value",
+      );
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects stale evidence schemas without leaking the input file path", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-gate-schema-"));
+    const qaReportFile = join(tempDir, "qa-report.json");
+
+    try {
+      const report = buildWindowsMvpReleaseGateReport({
+        qaReportFile: writeJson(qaReportFile, {
+          ...buildWindowsMvpQaReportTemplate(),
+          schemaVersion: "akraz.windowsMvpQaReport/v0",
+        }),
+      });
+      const formatted = JSON.stringify(report);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "qaReport")).toMatchObject({
+        source: "qaReportFile",
+        status: "invalid",
+        detail: "schemaVersionMismatch",
+      });
+      expect(formatted).not.toContain(qaReportFile);
+      expect(formatted).toContain(SIGNING_PREFLIGHT_SCHEMA_VERSION);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+});
