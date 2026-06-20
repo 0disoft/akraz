@@ -9,6 +9,12 @@ import {
   buildWorkflowContractsReport,
   exitCodeForWorkflowContracts,
 } from "../scripts/verify-workflow-contracts.mjs";
+import {
+  TAURI_SIDECAR_EXTERNAL_BIN,
+  WINDOWS_CI_SIDECAR_FILE_NAME,
+  buildCargoArgs,
+  sidecarFileName,
+} from "../scripts/prepare-sidecar.mjs";
 
 function runAppPackageScript(scriptName, args = []) {
   return spawnSync(process.execPath, ["run", scriptName, "--", ...args], {
@@ -19,6 +25,16 @@ function runAppPackageScript(scriptName, args = []) {
 }
 
 describe("GitHub Actions workflow contracts", () => {
+  test("keeps prepare-sidecar helpers import-safe for contract checks", () => {
+    expect(TAURI_SIDECAR_EXTERNAL_BIN).toBe("binaries/akraz-daemon");
+    expect(WINDOWS_CI_SIDECAR_FILE_NAME).toBe("akraz-daemon-x86_64-pc-windows-msvc.exe");
+    expect(sidecarFileName("x86_64-unknown-linux-gnu", "linux")).toBe(
+      "akraz-daemon-x86_64-unknown-linux-gnu",
+    );
+    expect(buildCargoArgs()).toEqual(["build", "-p", "akraz-daemon"]);
+    expect(buildCargoArgs({ release: true })).toEqual(["build", "-p", "akraz-daemon", "--release"]);
+  });
+
   test("accepts the repository workflows and package scripts", () => {
     const report = buildWorkflowContractsReport();
 
@@ -35,16 +51,25 @@ describe("GitHub Actions workflow contracts", () => {
     expect(report.workflowScripts).toContain("release:windows-mvp-evidence-sources");
     expect(report.workflowScripts).toContain("release:windows-mvp-resolved-evidence");
     expect(report.workflowScripts).toContain("smoke:windows-mvp-soak");
-    expect(report.checks.find((check) => check.id === "workspaceAppScript:smoke:tcp-transport"))
-      .toMatchObject({
-        status: "pass",
-        expectedCommand: "bun run --cwd apps/akraz smoke:tcp-transport",
-      });
-    expect(report.checks.find((check) => check.id === "appPackageScript:smoke:settings-start"))
-      .toMatchObject({
-        status: "pass",
-        expectedCommand: "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
-      });
+    expect(
+      report.checks.find((check) => check.id === "workspaceAppScript:smoke:tcp-transport"),
+    ).toMatchObject({
+      status: "pass",
+      expectedCommand: "bun run --cwd apps/akraz smoke:tcp-transport",
+    });
+    expect(
+      report.checks.find((check) => check.id === "appPackageScript:smoke:settings-start"),
+    ).toMatchObject({
+      status: "pass",
+      expectedCommand: "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
+    });
+    expect(report.checks.find((check) => check.id === "tauriSidecarContract")).toMatchObject({
+      status: "pass",
+      workflowFile: "check.yml",
+      externalBin: "binaries/akraz-daemon",
+      windowsCiSidecarDestination:
+        "apps/akraz/src-tauri/binaries/akraz-daemon-x86_64-pc-windows-msvc.exe",
+    });
     expect(report.checks.find((check) => check.id === "smokeWorkflowCoverage")).toMatchObject({
       status: "pass",
       workflowFile: "check.yml",
@@ -64,34 +89,32 @@ describe("GitHub Actions workflow contracts", () => {
       workflowFile: "windows-mvp-qa.yml",
       inputNames: ["qa_report_json", "qa_report_base64"],
     });
-    expect(report.checks.find((check) => check.id === "releaseWorkflowInputWiring"))
-      .toMatchObject({
-        status: "pass",
-        workflowFile: "windows-mvp-release.yml",
-        inputNames: [
-          "source_run_id",
-          "qa_source_run_id",
-          "soak_source_run_id",
-          "qa_report_artifact",
-          "soak_report_artifact",
-        ],
-      });
-    expect(report.checks.find((check) => check.id === "releaseBundleOutputWiring"))
-      .toMatchObject({
-        status: "pass",
-        workflowFile: "windows-mvp-release.yml",
-        artifactName: "windows-mvp-release-bundle",
-        uploadPath: "release-bundle/*.json",
-        expectedBundleFiles: [
-          "windows-mvp-qa-report.json",
-          "windows-mvp-release-bundle.json",
-          "windows-mvp-release-evidence-sources.json",
-          "windows-mvp-release-gate.json",
-          "windows-mvp-signing-preflight.json",
-          "windows-mvp-soak-report.json",
-          "windows-mvp-updater-config-preflight.json",
-        ],
-      });
+    expect(report.checks.find((check) => check.id === "releaseWorkflowInputWiring")).toMatchObject({
+      status: "pass",
+      workflowFile: "windows-mvp-release.yml",
+      inputNames: [
+        "source_run_id",
+        "qa_source_run_id",
+        "soak_source_run_id",
+        "qa_report_artifact",
+        "soak_report_artifact",
+      ],
+    });
+    expect(report.checks.find((check) => check.id === "releaseBundleOutputWiring")).toMatchObject({
+      status: "pass",
+      workflowFile: "windows-mvp-release.yml",
+      artifactName: "windows-mvp-release-bundle",
+      uploadPath: "release-bundle/*.json",
+      expectedBundleFiles: [
+        "windows-mvp-qa-report.json",
+        "windows-mvp-release-bundle.json",
+        "windows-mvp-release-evidence-sources.json",
+        "windows-mvp-release-gate.json",
+        "windows-mvp-signing-preflight.json",
+        "windows-mvp-soak-report.json",
+        "windows-mvp-updater-config-preflight.json",
+      ],
+    });
     expect(report.checks.every((check) => check.status === "pass")).toBe(true);
     expect(report.privacy).toEqual({
       includesSecretValues: false,
@@ -252,6 +275,59 @@ describe("GitHub Actions workflow contracts", () => {
     }
   });
 
+  test("rejects Tauri sidecar drift before Windows smoke jobs run", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-sidecar-contracts-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory);
+      copyCurrentWorkflows(tempDirectory);
+
+      const tauriConfig = JSON.parse(
+        readFileSync(join(tempDirectory, "apps", "akraz", "src-tauri", "tauri.conf.json"), "utf8"),
+      );
+      tauriConfig.bundle.externalBin = ["binaries/other-daemon"];
+      writeJson(join(tempDirectory, "apps", "akraz", "src-tauri", "tauri.conf.json"), tauriConfig);
+
+      const checkWorkflowWithoutSidecarCopy = readFileSync(
+        join(".github", "workflows", "check.yml"),
+        "utf8",
+      ).replace(
+        "          Copy-Item target/debug/akraz-daemon.exe apps/akraz/src-tauri/binaries/akraz-daemon-x86_64-pc-windows-msvc.exe",
+        "          Copy-Item target/debug/akraz-daemon.exe apps/akraz/src-tauri/binaries/akraz-daemon.exe",
+      );
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "check.yml"),
+        checkWorkflowWithoutSidecarCopy,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "tauriSidecarContract")).toMatchObject({
+        status: "invalid",
+        detail: "tauriSidecarContractDrifted",
+        missingConfigEntries: ["externalBin"],
+        missingWorkflowSnippets: ["windowsCopiesSidecarBinary"],
+        expected: {
+          externalBin: "binaries/akraz-daemon",
+          windowsCiSidecarDestination:
+            "apps/akraz/src-tauri/binaries/akraz-daemon-x86_64-pc-windows-msvc.exe",
+        },
+      });
+      expect(report.nextActions).toContainEqual({
+        id: "syncTauriSidecarContract",
+        action: "sync Tauri externalBin, prepare-sidecar hooks, and Windows CI sidecar copy",
+        workflowFile: "check.yml",
+        missingConfigEntries: ["externalBin"],
+        missingWorkflowSnippets: ["windowsCopiesSidecarBinary"],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
   test("rejects QA workflow drift when generated payload input is not wired", () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-qa-workflow-input-contracts-"));
 
@@ -326,19 +402,20 @@ describe("GitHub Actions workflow contracts", () => {
       const report = buildWorkflowContractsReport(tempDirectory);
 
       expect(report.ready).toBe(false);
-      expect(report.checks.find((check) => check.id === "releaseWorkflowInputWiring"))
-        .toMatchObject({
-          status: "invalid",
-          detail: "releaseWorkflowInputWiringDrifted",
-          missingInputDefinitions: [],
-          missingEnvMappings: [
-            {
-              inputName: "qa_source_run_id",
-              envName: "QA_SOURCE_RUN_ID",
-              minReferences: 2,
-            },
-          ],
-        });
+      expect(
+        report.checks.find((check) => check.id === "releaseWorkflowInputWiring"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "releaseWorkflowInputWiringDrifted",
+        missingInputDefinitions: [],
+        missingEnvMappings: [
+          {
+            inputName: "qa_source_run_id",
+            envName: "QA_SOURCE_RUN_ID",
+            minReferences: 2,
+          },
+        ],
+      });
       expect(report.nextActions).toContainEqual({
         id: "syncReleaseWorkflowInputs",
         action: "sync the Windows MVP release workflow dispatch inputs and environment mappings",
@@ -435,8 +512,8 @@ describe("GitHub Actions workflow contracts", () => {
       const report = buildWorkflowContractsReport(tempDirectory);
 
       expect(report.ready).toBe(false);
-      expect(report.checks.find((check) => check.id === "releaseBundleOutputWiring"))
-        .toMatchObject({
+      expect(report.checks.find((check) => check.id === "releaseBundleOutputWiring")).toMatchObject(
+        {
           status: "invalid",
           detail: "releaseBundleOutputWiringDrifted",
           missingSnippets: ["releaseBundleOutDirArgument", "releaseBundleUploadPath"],
@@ -453,7 +530,8 @@ describe("GitHub Actions workflow contracts", () => {
               "windows-mvp-updater-config-preflight.json",
             ],
           },
-        });
+        },
+      );
       expect(report.nextActions).toContainEqual({
         id: "syncReleaseBundleOutputWiring",
         action: "restore release bundle out-dir, integrity smoke, and artifact upload wiring",
@@ -624,13 +702,14 @@ describe("GitHub Actions workflow contracts", () => {
       const report = buildWorkflowContractsReport(tempDirectory);
 
       expect(report.ready).toBe(false);
-      expect(report.checks.find((check) => check.id === "workspaceAppScript:smoke:tcp-transport"))
-        .toMatchObject({
-          status: "invalid",
-          detail: "workspaceScriptDelegationDrifted",
-          expectedCommand: "bun run --cwd apps/akraz smoke:tcp-transport",
-          actualCommand: "bun run --cwd apps/akraz smoke:peer-session",
-        });
+      expect(
+        report.checks.find((check) => check.id === "workspaceAppScript:smoke:tcp-transport"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "workspaceScriptDelegationDrifted",
+        expectedCommand: "bun run --cwd apps/akraz smoke:tcp-transport",
+        actualCommand: "bun run --cwd apps/akraz smoke:peer-session",
+      });
       expect(report.nextActions).toContainEqual({
         id: "syncWorkspaceAppScript",
         action: "sync the root package script with the app package script",
@@ -657,13 +736,14 @@ describe("GitHub Actions workflow contracts", () => {
       const report = buildWorkflowContractsReport(tempDirectory);
 
       expect(report.ready).toBe(false);
-      expect(report.checks.find((check) => check.id === "appPackageScript:smoke:settings-start"))
-        .toMatchObject({
-          status: "invalid",
-          detail: "appPackageScriptDrifted",
-          expectedCommand: "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
-          actualCommand: "bun scripts/smoke-daemon-lifecycle.mjs",
-        });
+      expect(
+        report.checks.find((check) => check.id === "appPackageScript:smoke:settings-start"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "appPackageScriptDrifted",
+        expectedCommand: "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
+        actualCommand: "bun scripts/smoke-daemon-lifecycle.mjs",
+      });
       expect(report.nextActions).toContainEqual({
         id: "syncAppPackageScript",
         action: "restore the expected app package script command",
@@ -720,6 +800,12 @@ function writeCurrentAppPackageFixture(
   };
   mkdirSync(join(tempDirectory, "apps", "akraz"), { recursive: true });
   writeJson(join(tempDirectory, "apps", "akraz", "package.json"), appPackage);
+  mkdirSync(join(tempDirectory, "apps", "akraz", "src-tauri"), { recursive: true });
+  writeFileSync(
+    join(tempDirectory, "apps", "akraz", "src-tauri", "tauri.conf.json"),
+    readFileSync(join("apps", "akraz", "src-tauri", "tauri.conf.json"), "utf8"),
+    "utf8",
+  );
 }
 
 function writeJson(path: string, payload: unknown) {

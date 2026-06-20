@@ -2,6 +2,12 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  AKRAZ_DAEMON_BINARY_NAME,
+  AKRAZ_DAEMON_PACKAGE_NAME,
+  TAURI_SIDECAR_EXTERNAL_BIN,
+  WINDOWS_CI_SIDECAR_FILE_NAME,
+} from "./prepare-sidecar.mjs";
 import { WINDOWS_MVP_RELEASE_BUNDLE_FILES } from "./windows-mvp-release-bundle.mjs";
 import {
   DEFAULT_QA_REPORT_ARTIFACT,
@@ -16,6 +22,10 @@ export const WORKFLOW_CONTRACTS_SCHEMA_VERSION = "akraz.workflowContracts/v1";
 const WORKFLOW_DIRECTORY = ".github/workflows";
 const REQUIRED_CHECKOUT_VERSION = "v6";
 const WINDOWS_MVP_QA_WORKFLOW_FILE = "windows-mvp-qa.yml";
+const CHECK_WORKFLOW_FILE = "check.yml";
+const WINDOWS_CI_SIDECAR_DIRECTORY = "apps/akraz/src-tauri/binaries";
+const WINDOWS_CI_SIDECAR_SOURCE = `target/debug/${AKRAZ_DAEMON_BINARY_NAME}.exe`;
+const WINDOWS_CI_SIDECAR_DESTINATION = `${WINDOWS_CI_SIDECAR_DIRECTORY}/${WINDOWS_CI_SIDECAR_FILE_NAME}`;
 const RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH =
   "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json";
 const RELEASE_WORKFLOW_INPUTS_MANIFEST_PATH =
@@ -141,7 +151,8 @@ const EXPECTED_APP_PACKAGE_SCRIPTS = {
   "smoke:settings-start": "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
   "smoke:signing-preflight": "bun scripts/smoke-signing-preflight.mjs --expect-missing",
   "smoke:tcp-transport": "bun scripts/smoke-tcp-transport.mjs",
-  "smoke:updater-config-preflight": "bun scripts/smoke-updater-config-preflight.mjs --expect-missing",
+  "smoke:updater-config-preflight":
+    "bun scripts/smoke-updater-config-preflight.mjs --expect-missing",
   "smoke:windows-mvp-release-bundle": "bun scripts/smoke-windows-mvp-release-bundle.mjs",
   "smoke:windows-mvp-release-gate": "bun scripts/smoke-windows-mvp-release-gate.mjs",
   "smoke:windows-mvp-soak": "bun scripts/smoke-windows-mvp-soak.mjs",
@@ -153,6 +164,9 @@ const EXPECTED_APP_PACKAGE_SCRIPTS = {
 export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoot()) {
   const rootPackage = readJsonFile(join(workspaceRoot, "package.json"));
   const appPackage = readJsonFile(join(workspaceRoot, "apps", "akraz", "package.json"));
+  const tauriConfig = readJsonFile(
+    join(workspaceRoot, "apps", "akraz", "src-tauri", "tauri.conf.json"),
+  );
   const workflows = readWorkflowFiles(workspaceRoot);
   const expectedBunVersion = packageManagerBunVersion(rootPackage.packageManager);
   const workflowScripts = uniqueWorkflowScripts(workflows);
@@ -163,6 +177,7 @@ export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoo
     ...evaluateCheckoutVersions(workflows),
     ...evaluateBunVersions(workflows, expectedBunVersion),
     ...evaluateWorkflowScripts(workflowScripts, rootPackage.scripts ?? {}),
+    evaluateTauriSidecarContract(workflows, tauriConfig),
     evaluateQaWorkflowInputWiring(workflows),
     evaluateReleaseWorkflowFile(workflows),
     evaluateReleaseWorkflowInputWiring(workflows),
@@ -338,6 +353,81 @@ function evaluateAppPackageScripts(appScripts) {
       actualCommand: typeof actualCommand === "string" ? actualCommand : null,
     };
   });
+}
+
+function evaluateTauriSidecarContract(workflows, tauriConfig) {
+  const checkWorkflow = workflows.find((workflow) => workflow.name === CHECK_WORKFLOW_FILE);
+  if (!checkWorkflow) {
+    return {
+      id: "tauriSidecarContract",
+      status: "missing",
+      detail: "checkWorkflowMissing",
+      workflowFile: CHECK_WORKFLOW_FILE,
+    };
+  }
+
+  const externalBins = Array.isArray(tauriConfig?.bundle?.externalBin)
+    ? tauriConfig.bundle.externalBin
+    : [];
+  const requiredConfigEntries = [
+    {
+      id: "externalBin",
+      valid: externalBins.includes(TAURI_SIDECAR_EXTERNAL_BIN),
+    },
+    {
+      id: "beforeDevPrepareSidecar",
+      valid: tauriConfig?.build?.beforeDevCommand === "bun run prepare:sidecar && bun run dev",
+    },
+    {
+      id: "beforeBuildPrepareSidecarRelease",
+      valid:
+        tauriConfig?.build?.beforeBuildCommand ===
+        "bun run prepare:sidecar:release && bun run build",
+    },
+  ];
+  const requiredWorkflowSnippets = [
+    {
+      id: "windowsRustBuildsDaemonPackage",
+      snippet: `cargo build -p ${AKRAZ_DAEMON_PACKAGE_NAME}`,
+    },
+    {
+      id: "windowsCreatesSidecarDirectory",
+      snippet: `New-Item -ItemType Directory -Force ${WINDOWS_CI_SIDECAR_DIRECTORY}`,
+    },
+    {
+      id: "windowsCopiesSidecarBinary",
+      snippet: `Copy-Item ${WINDOWS_CI_SIDECAR_SOURCE} ${WINDOWS_CI_SIDECAR_DESTINATION}`,
+    },
+  ];
+  const missingConfigEntries = requiredConfigEntries
+    .filter((requirement) => !requirement.valid)
+    .map((requirement) => requirement.id);
+  const missingWorkflowSnippets = requiredWorkflowSnippets
+    .filter((requirement) => !checkWorkflow.source.includes(requirement.snippet))
+    .map((requirement) => requirement.id);
+
+  if (missingConfigEntries.length === 0 && missingWorkflowSnippets.length === 0) {
+    return {
+      id: "tauriSidecarContract",
+      status: "pass",
+      workflowFile: CHECK_WORKFLOW_FILE,
+      externalBin: TAURI_SIDECAR_EXTERNAL_BIN,
+      windowsCiSidecarDestination: WINDOWS_CI_SIDECAR_DESTINATION,
+    };
+  }
+
+  return {
+    id: "tauriSidecarContract",
+    status: "invalid",
+    detail: "tauriSidecarContractDrifted",
+    workflowFile: CHECK_WORKFLOW_FILE,
+    missingConfigEntries,
+    missingWorkflowSnippets,
+    expected: {
+      externalBin: TAURI_SIDECAR_EXTERNAL_BIN,
+      windowsCiSidecarDestination: WINDOWS_CI_SIDECAR_DESTINATION,
+    },
+  };
 }
 
 function evaluateReleaseWorkflowFile(workflows) {
@@ -773,6 +863,16 @@ function buildNextActions(checks) {
             expectedCommand: check.expectedCommand,
           },
         ];
+      case "tauriSidecarContractDrifted":
+        return [
+          {
+            id: "syncTauriSidecarContract",
+            action: "sync Tauri externalBin, prepare-sidecar hooks, and Windows CI sidecar copy",
+            workflowFile: check.workflowFile,
+            missingConfigEntries: check.missingConfigEntries,
+            missingWorkflowSnippets: check.missingWorkflowSnippets,
+          },
+        ];
       case "releaseWorkflowFileMissing":
         return [
           {
@@ -833,8 +933,7 @@ function buildNextActions(checks) {
         return [
           {
             id: "syncReleaseBundleOutputWiring",
-            action:
-              "restore release bundle out-dir, integrity smoke, and artifact upload wiring",
+            action: "restore release bundle out-dir, integrity smoke, and artifact upload wiring",
             workflowFile: check.workflowFile,
             missingSnippets: check.missingSnippets,
           },
