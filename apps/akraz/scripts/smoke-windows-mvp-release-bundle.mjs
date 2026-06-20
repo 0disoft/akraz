@@ -31,6 +31,14 @@ const EXPECTED_ARTIFACT_SCHEMAS = {
   [WINDOWS_MVP_RELEASE_BUNDLE_FILES.updaterConfigPreflight]:
     UPDATER_CONFIG_PREFLIGHT_SCHEMA_VERSION,
 };
+const EXPECTED_MANIFEST_ARTIFACT_FILES = {
+  releaseGate: WINDOWS_MVP_RELEASE_BUNDLE_FILES.releaseGate,
+  qaReport: WINDOWS_MVP_RELEASE_BUNDLE_FILES.qaReport,
+  soakReport: WINDOWS_MVP_RELEASE_BUNDLE_FILES.soakReport,
+  signingPreflight: WINDOWS_MVP_RELEASE_BUNDLE_FILES.signingPreflight,
+  updaterConfigPreflight: WINDOWS_MVP_RELEASE_BUNDLE_FILES.updaterConfigPreflight,
+  evidenceSources: WINDOWS_MVP_RELEASE_BUNDLE_FILES.evidenceSources,
+};
 
 export function buildWindowsMvpReleaseBundleSmokeReport(
   bundleReport = buildWindowsMvpReleaseBundleReport(),
@@ -350,25 +358,35 @@ function evaluateBundleManifest(manifest) {
     "updaterConfigPreflight",
     "evidenceSources",
   ];
-  const includedArtifactIds = Array.isArray(manifest?.artifacts)
-    ? manifest.artifacts
-        .filter((artifact) => artifact?.included === true)
-        .map((artifact) => artifact.id)
-        .toSorted()
+  const includedArtifacts = Array.isArray(manifest?.artifacts)
+    ? manifest.artifacts.filter((artifact) => artifact?.included === true)
     : [];
+  const includedArtifactIds = includedArtifacts.map((artifact) => artifact.id).toSorted();
   const missingArtifactIds = expectedIncludedIds.filter(
     (artifactId) => !includedArtifactIds.includes(artifactId),
   );
   const unexpectedArtifactIds = includedArtifactIds.filter(
     (artifactId) => !expectedIncludedIds.includes(artifactId),
   );
+  const mismatchedFileNames = includedArtifacts
+    .filter(
+      (artifact) =>
+        Object.hasOwn(EXPECTED_MANIFEST_ARTIFACT_FILES, artifact.id) &&
+        EXPECTED_MANIFEST_ARTIFACT_FILES[artifact.id] !== artifact.fileName,
+    )
+    .map((artifact) => ({
+      artifactId: artifact.id,
+      expectedFileName: EXPECTED_MANIFEST_ARTIFACT_FILES[artifact.id],
+      actualFileName: typeof artifact.fileName === "string" ? artifact.fileName : null,
+    }));
 
   if (
     manifest?.schemaVersion === WINDOWS_MVP_RELEASE_BUNDLE_SCHEMA_VERSION &&
     manifest?.ready === true &&
     manifest?.releaseGateReady === true &&
     missingArtifactIds.length === 0 &&
-    unexpectedArtifactIds.length === 0
+    unexpectedArtifactIds.length === 0 &&
+    mismatchedFileNames.length === 0
   ) {
     return {
       id: "bundleManifestReady",
@@ -384,6 +402,7 @@ function evaluateBundleManifest(manifest) {
     releaseGateReady: manifest?.releaseGateReady ?? null,
     missingArtifactIds,
     unexpectedArtifactIds,
+    mismatchedFileNames,
   };
 }
 
