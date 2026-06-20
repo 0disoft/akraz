@@ -4,9 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: "GitHub Actions run ID containing the QA and soak evidence artifacts."
-        required: true
+        description: "Optional shared run ID containing both QA and soak evidence artifacts."
+        required: false
         type: string
+        default: ""
+      qa_source_run_id:
+        description: "Optional run ID containing the QA evidence artifact. Falls back to source_run_id."
+        required: false
+        type: string
+        default: ""
+      soak_source_run_id:
+        description: "Optional run ID containing the soak evidence artifact. Falls back to source_run_id."
+        required: false
+        type: string
+        default: ""
       qa_report_artifact:
         description: "Artifact name containing one sanitized Windows MVP QA report JSON."
         required: true
@@ -18,7 +29,7 @@ on:
         type: string
         default: windows-mvp-soak-report
 
-run-name: windows-mvp-release from run ${{ inputs.source_run_id }}
+run-name: windows-mvp-release evidence bundle
 
 permissions:
   actions: read
@@ -44,6 +55,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          QA_SOURCE_RUN_ID: ${{ inputs.qa_source_run_id }}
+          SOAK_SOURCE_RUN_ID: ${{ inputs.soak_source_run_id }}
           QA_REPORT_ARTIFACT: ${{ inputs.qa_report_artifact }}
           SOAK_REPORT_ARTIFACT: ${{ inputs.soak_report_artifact }}
         run: |
@@ -51,12 +64,34 @@ jobs:
 
           mkdir -p release-evidence/qa release-evidence/soak
 
-          gh run download "$SOURCE_RUN_ID" \
+          resolve_source_run_id() {
+            local explicit_run_id="$1"
+            local fallback_run_id="$2"
+            local evidence_label="$3"
+
+            if [ -n "$explicit_run_id" ]; then
+              printf '%s\n' "$explicit_run_id"
+              return 0
+            fi
+
+            if [ -n "$fallback_run_id" ]; then
+              printf '%s\n' "$fallback_run_id"
+              return 0
+            fi
+
+            echo "::error::${evidence_label} evidence requires either a dedicated source run ID or source_run_id"
+            return 1
+          }
+
+          qa_source_run_id="$(resolve_source_run_id "$QA_SOURCE_RUN_ID" "$SOURCE_RUN_ID" "QA")"
+          soak_source_run_id="$(resolve_source_run_id "$SOAK_SOURCE_RUN_ID" "$SOURCE_RUN_ID" "soak")"
+
+          gh run download "$qa_source_run_id" \
             --repo "$GITHUB_REPOSITORY" \
             --name "$QA_REPORT_ARTIFACT" \
             --dir release-evidence/qa
 
-          gh run download "$SOURCE_RUN_ID" \
+          gh run download "$soak_source_run_id" \
             --repo "$GITHUB_REPOSITORY" \
             --name "$SOAK_REPORT_ARTIFACT" \
             --dir release-evidence/soak
