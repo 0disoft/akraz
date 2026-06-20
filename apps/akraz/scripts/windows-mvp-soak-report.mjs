@@ -16,6 +16,7 @@ export const SESSION_CONNECT_LIFECYCLE_SMOKE_SCHEMA_VERSION =
 export const DEFAULT_DURATION_MS = 120 * 60 * 1000;
 export const DEFAULT_CYCLE_DELAY_MS = 1000;
 export const DEFAULT_SCENARIO_TIMEOUT_MS = 10 * 60 * 1000;
+export const WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS = ["WIN-002", "WIN-003", "WIN-006", "WIN-008"];
 
 export const windowsMvpSoakScenarios = [
   {
@@ -247,7 +248,54 @@ export function buildSoakSummary({
     completedCycles,
     completedRuns,
     metrics: finalMetrics,
+    qaEvidence: buildSoakQaEvidence(finalMetrics, failures),
     failures,
+  };
+}
+
+export function buildSoakQaEvidence(metrics, failures = []) {
+  const blockers = [];
+  const forwardedInputs =
+    metrics.forwardedInputCommands + metrics.forwardedInputOutcomes + metrics.injectedInputEvents;
+  const releaseSignals =
+    metrics.releaseAllCommands + metrics.releaseAllOutcomes + metrics.platformReleaseAllCalls;
+
+  if (failures.length > 0 || metrics.scenarioFailures > 0) {
+    blockers.push("scenarioFailures");
+  }
+  if (metrics.scenarioTimeouts > 0) {
+    blockers.push("scenarioTimeouts");
+  }
+  if (metrics.stuckInputSuspicions > 0) {
+    blockers.push("stuckInputSuspicions");
+  }
+  if (metrics.finalPeerLeaks > 0) {
+    blockers.push("finalPeerLeaks");
+  }
+
+  const failed = blockers.length > 0;
+
+  if (metrics.scenarioPasses <= 0) {
+    blockers.push("scenarioPassesMissing");
+  }
+  if (metrics.remoteSessionStarts <= 0) {
+    blockers.push("remoteSessionStartMissing");
+  }
+  if (metrics.remoteSessionStops <= 0) {
+    blockers.push("remoteSessionStopMissing");
+  }
+  if (forwardedInputs <= 0) {
+    blockers.push("remoteInputMissing");
+  }
+  if (releaseSignals <= 0) {
+    blockers.push("releaseSignalMissing");
+  }
+
+  return {
+    supportedCaseIds: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS,
+    supportedCaseCount: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS.length,
+    status: failed ? "failed" : blockers.length === 0 ? "pass" : "insufficient",
+    blockers,
   };
 }
 

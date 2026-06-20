@@ -7,8 +7,10 @@ import {
   DEFAULT_DURATION_MS,
   SESSION_CONNECT_LIFECYCLE_SMOKE_SCHEMA_VERSION,
   WINDOWS_MVP_SOAK_SCHEMA_VERSION,
+  WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS,
   assertSoakSummaryHealthy,
   buildScenarioFailure,
+  buildSoakQaEvidence,
   buildSoakSummary,
   collectScenarioMetrics,
   createEmptySoakMetrics,
@@ -155,6 +157,12 @@ describe("Windows MVP soak reporting", () => {
     expect(summary.schemaVersion).toBe(WINDOWS_MVP_SOAK_SCHEMA_VERSION);
     expect(summary.elapsedMs).toBe(1000);
     expect(summary.metrics.scenarioPasses).toBe(1);
+    expect(summary.qaEvidence).toMatchObject({
+      supportedCaseIds: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS,
+      supportedCaseCount: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS.length,
+      status: "insufficient",
+    });
+    expect(summary.qaEvidence.blockers).toContain("remoteSessionStartMissing");
     expect(() => assertSoakSummaryHealthy(summary)).not.toThrow();
 
     const failed = {
@@ -171,6 +179,61 @@ describe("Windows MVP soak reporting", () => {
       ],
     };
     expect(() => assertSoakSummaryHealthy(failed)).toThrow("peer-session");
+  });
+
+  test("maps soak metrics to Windows MVP QA evidence status", () => {
+    const passingMetrics = {
+      ...createEmptySoakMetrics(),
+      scenarioPasses: 5,
+      remoteSessionStarts: 2,
+      remoteSessionStops: 2,
+      forwardedInputOutcomes: 3,
+      injectedInputEvents: 2,
+      releaseAllOutcomes: 2,
+      platformReleaseAllCalls: 1,
+      sessionConnects: 1,
+      sessionDisconnects: 1,
+    };
+
+    expect(buildSoakQaEvidence(passingMetrics)).toEqual({
+      supportedCaseIds: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS,
+      supportedCaseCount: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS.length,
+      status: "pass",
+      blockers: [],
+    });
+
+    expect(buildSoakQaEvidence(createEmptySoakMetrics())).toMatchObject({
+      status: "insufficient",
+      blockers: [
+        "scenarioPassesMissing",
+        "remoteSessionStartMissing",
+        "remoteSessionStopMissing",
+        "remoteInputMissing",
+        "releaseSignalMissing",
+      ],
+    });
+
+    expect(
+      buildSoakQaEvidence(
+        {
+          ...passingMetrics,
+          stuckInputSuspicions: 1,
+        },
+        [
+          buildScenarioFailure({
+            cycle: 1,
+            elapsedMs: 250,
+            exitCode: 1,
+            scenario: "peer-session",
+            signal: null,
+            timedOut: false,
+          }),
+        ],
+      ),
+    ).toMatchObject({
+      status: "failed",
+      blockers: ["scenarioFailures", "stuckInputSuspicions"],
+    });
   });
 
   test("writes soak summaries atomically with a trailing newline", () => {
