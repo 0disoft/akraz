@@ -1,0 +1,121 @@
+name: windows-mvp-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "GitHub Actions run ID containing the QA and soak evidence artifacts."
+        required: true
+        type: string
+      qa_report_artifact:
+        description: "Artifact name containing one sanitized Windows MVP QA report JSON."
+        required: true
+        type: string
+        default: windows-mvp-qa-report
+      soak_report_artifact:
+        description: "Artifact name containing one full-duration Windows MVP soak report JSON."
+        required: true
+        type: string
+        default: windows-mvp-soak-report
+
+run-name: windows-mvp-release from run ${{ inputs.source_run_id }}
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: windows-mvp-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - run: bun install --frozen-lockfile
+
+      - name: Download QA and soak evidence artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          QA_REPORT_ARTIFACT: ${{ inputs.qa_report_artifact }}
+          SOAK_REPORT_ARTIFACT: ${{ inputs.soak_report_artifact }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-evidence/qa release-evidence/soak
+
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$QA_REPORT_ARTIFACT" \
+            --dir release-evidence/qa
+
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$SOAK_REPORT_ARTIFACT" \
+            --dir release-evidence/soak
+
+      - name: Resolve downloaded evidence files
+        run: |
+          set -euo pipefail
+
+          resolve_json() {
+            local evidence_dir="$1"
+            mapfile -t files < <(find "$evidence_dir" -type f -name '*.json' | sort)
+            if [ "${#files[@]}" -ne 1 ]; then
+              echo "::error::expected exactly one JSON file under $evidence_dir, found ${#files[@]}"
+              return 1
+            fi
+            printf '%s\n' "${files[0]}"
+          }
+
+          qa_report_file="$(resolve_json release-evidence/qa)"
+          soak_report_file="$(resolve_json release-evidence/soak)"
+
+          {
+            echo "QA_REPORT_FILE=$qa_report_file"
+            echo "SOAK_REPORT_FILE=$soak_report_file"
+          } >> "$GITHUB_ENV"
+
+      - name: Generate release environment preflight evidence
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          AKRAZ_WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.AKRAZ_WINDOWS_SIGNING_CERT_BASE64 }}
+          AKRAZ_WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.AKRAZ_WINDOWS_SIGNING_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-evidence/signing release-evidence/updater
+
+          bun run release:signing-preflight -- \
+            --out-file release-evidence/signing/windows-mvp-signing-preflight.json
+
+          bun run release:updater-config-preflight -- \
+            --out-file release-evidence/updater/windows-mvp-updater-config-preflight.json
+
+      - name: Build Windows MVP release bundle
+        run: |
+          set -euo pipefail
+
+          bun run release:windows-mvp-bundle -- \
+            --qa-report-file "$QA_REPORT_FILE" \
+            --soak-report-file "$SOAK_REPORT_FILE" \
+            --signing-preflight-file release-evidence/signing/windows-mvp-signing-preflight.json \
+            --updater-config-preflight-file release-evidence/updater/windows-mvp-updater-config-preflight.json \
+            --out-dir release-bundle
+
+      - name: Upload Windows MVP release bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-mvp-release-bundle
+          path: release-bundle/*.json
+          if-no-files-found: warn
+          retention-days: 14
