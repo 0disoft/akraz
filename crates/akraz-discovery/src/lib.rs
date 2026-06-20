@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 
 use akraz_identity::TrustedPeerIdentity;
 use akraz_protocol::CapabilityFlags;
@@ -52,6 +53,60 @@ impl DiscoveredPeer {
             .map(|address| SocketAddr::new(address, self.port))
     }
 }
+
+/// Thread-safe snapshot of the latest peers resolved by a discovery backend.
+#[derive(Debug, Clone, Default)]
+pub struct SharedDiscoveredPeers {
+    peers: Arc<Mutex<Vec<DiscoveredPeer>>>,
+}
+
+impl SharedDiscoveredPeers {
+    /// Create an empty discovered-peer snapshot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a discovered-peer snapshot from an initial peer list.
+    pub fn from_peers(peers: Vec<DiscoveredPeer>) -> Self {
+        Self {
+            peers: Arc::new(Mutex::new(peers)),
+        }
+    }
+
+    /// Replace the current discovered-peer snapshot.
+    pub fn replace(&self, peers: Vec<DiscoveredPeer>) -> Result<(), DiscoveredPeerSnapshotError> {
+        *self
+            .peers
+            .lock()
+            .map_err(|_| DiscoveredPeerSnapshotError::Unavailable)? = peers;
+
+        Ok(())
+    }
+
+    /// Return an owned snapshot of the current discovered peers.
+    pub fn snapshot(&self) -> Result<Vec<DiscoveredPeer>, DiscoveredPeerSnapshotError> {
+        self.peers
+            .lock()
+            .map_err(|_| DiscoveredPeerSnapshotError::Unavailable)
+            .map(|peers| peers.clone())
+    }
+}
+
+/// Errors returned when the shared discovered-peer snapshot cannot be read or updated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveredPeerSnapshotError {
+    Unavailable,
+}
+
+impl Display for DiscoveredPeerSnapshotError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("discovered peer snapshot is unavailable"),
+        }
+    }
+}
+
+impl Error for DiscoveredPeerSnapshotError {}
 
 /// Filtering policy applied before a discovered peer is shown as pairable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,8 +519,9 @@ mod tests {
     use super::{
         AKRAZ_DISCOVERY_SERVICE_TYPE, AKRAZ_DISCOVERY_TXT_VERSION, DiscoveredPeer,
         DiscoveryPeerFilter, DiscoveryPeerRejectReason, DiscoverySessionCandidate,
-        DiscoveryTxtError, DiscoveryTxtRecord, build_discovery_session_candidates,
-        build_discovery_txt_record, filter_discovered_peers, parse_discovery_txt_record,
+        DiscoveryTxtError, DiscoveryTxtRecord, SharedDiscoveredPeers,
+        build_discovery_session_candidates, build_discovery_txt_record, filter_discovered_peers,
+        parse_discovery_txt_record,
     };
 
     fn txt_record() -> DiscoveryTxtRecord {
@@ -475,7 +531,7 @@ mod tests {
             capabilities: CapabilityFlags::POINTER
                 | CapabilityFlags::KEYBOARD
                 | CapabilityFlags::SCREEN_LAYOUT,
-            build_version: "0.5.6".to_string(),
+            build_version: "0.5.7".to_string(),
         }
     }
 
@@ -494,12 +550,58 @@ mod tests {
     }
 
     #[test]
+    fn shared_discovered_peers_returns_owned_snapshots() {
+        let source = SharedDiscoveredPeers::from_peers(vec![peer(
+            "linux-laptop",
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        )]);
+
+        let mut snapshot = source.snapshot().expect("discovery snapshot");
+        snapshot[0].txt.device_id = "mutated-copy".to_string();
+
+        assert_eq!(
+            source
+                .snapshot()
+                .expect("second discovery snapshot")
+                .into_iter()
+                .map(|peer| peer.txt.device_id)
+                .collect::<Vec<_>>(),
+            vec!["linux-laptop"]
+        );
+    }
+
+    #[test]
+    fn shared_discovered_peers_replaces_current_snapshot() {
+        let source = SharedDiscoveredPeers::new();
+
+        source
+            .replace(vec![peer(
+                "linux-laptop",
+                CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            )])
+            .expect("replace discovery snapshot");
+        source
+            .replace(vec![peer("keyboard-only", CapabilityFlags::KEYBOARD)])
+            .expect("replace discovery snapshot again");
+
+        assert_eq!(
+            source
+                .snapshot()
+                .expect("current discovery snapshot")
+                .into_iter()
+                .map(|peer| peer.txt.device_id)
+                .collect::<Vec<_>>(),
+            vec!["keyboard-only"]
+        );
+    }
+
+    #[test]
     fn parses_dns_sd_txt_record_contract() {
         let record = parse_discovery_txt_record([
             "v=1",
             "device_id=linux-laptop",
             "caps=pointer,keyboard,screen-layout",
-            "build=0.5.6",
+            "build=0.5.7",
         ])
         .expect("parse TXT record");
 
@@ -514,7 +616,7 @@ mod tests {
                 "v=1",
                 "device_id=linux-laptop",
                 "caps=pointer,keyboard,screen-layout",
-                "build=0.5.6",
+                "build=0.5.7",
             ]
         );
     }
@@ -522,7 +624,7 @@ mod tests {
     #[test]
     fn rejects_missing_duplicate_unsupported_and_unknown_txt_fields() {
         assert_eq!(
-            parse_discovery_txt_record(["v=1", "device_id=linux-laptop", "build=0.5.6"]),
+            parse_discovery_txt_record(["v=1", "device_id=linux-laptop", "build=0.5.7"]),
             Err(DiscoveryTxtError::MissingField { key: "caps" })
         );
         assert_eq!(
@@ -531,7 +633,7 @@ mod tests {
                 "V=1",
                 "device_id=linux-laptop",
                 "caps=pointer",
-                "build=0.5.6",
+                "build=0.5.7",
             ]),
             Err(DiscoveryTxtError::DuplicateField {
                 key: "v".to_string(),
@@ -542,7 +644,7 @@ mod tests {
                 "v=2",
                 "device_id=linux-laptop",
                 "caps=pointer",
-                "build=0.5.6",
+                "build=0.5.7",
             ]),
             Err(DiscoveryTxtError::UnsupportedVersion { version: 2 })
         );
@@ -551,7 +653,7 @@ mod tests {
                 "v=1",
                 "device_id=linux-laptop",
                 "caps=pointer,text",
-                "build=0.5.6",
+                "build=0.5.7",
             ]),
             Err(DiscoveryTxtError::InvalidCapability {
                 value: "text".to_string(),
@@ -566,7 +668,7 @@ mod tests {
                 "v=1",
                 "device_id=linux laptop",
                 "caps=pointer",
-                "build=0.5.6",
+                "build=0.5.7",
             ]),
             Err(DiscoveryTxtError::InvalidDeviceId {
                 value: "linux laptop".to_string(),
@@ -578,7 +680,7 @@ mod tests {
                 "v=1",
                 "device_id=linux:laptop",
                 "caps=pointer",
-                "build=0.5.6",
+                "build=0.5.7",
             ]),
             Err(DiscoveryTxtError::InvalidDeviceId {
                 value: "linux:laptop".to_string(),
@@ -683,7 +785,7 @@ mod tests {
                 fingerprint: Some("AKRZ-TRUSTED".to_string()),
                 trusted: true,
                 address: "127.0.0.1:4455".parse().expect("candidate address"),
-                build_version: "0.5.6".to_string(),
+                build_version: "0.5.7".to_string(),
                 capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
             }]
         );
@@ -710,7 +812,7 @@ mod tests {
                 fingerprint: None,
                 trusted: false,
                 address: "127.0.0.1:4455".parse().expect("candidate address"),
-                build_version: "0.5.6".to_string(),
+                build_version: "0.5.7".to_string(),
                 capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
             }]
         );

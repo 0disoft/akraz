@@ -18,7 +18,7 @@ use akraz_core::{
     RuntimeInputState, ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
 };
 use akraz_discovery::{
-    DiscoveredPeer, DiscoveryPeerFilter, DiscoverySessionCandidate,
+    DiscoveredPeer, DiscoveryPeerFilter, DiscoverySessionCandidate, SharedDiscoveredPeers,
     build_discovery_session_candidates,
 };
 use akraz_identity::{
@@ -713,6 +713,12 @@ pub struct ManagedPeerSessionAuthConfig {
     identity_display_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerSessionDiscoveryIdentityContext {
+    local_device_id: DeviceId,
+    trusted_peers: Vec<TrustedPeerIdentity>,
+}
+
 impl ManagedPeerSessionTransport {
     /// Create an empty managed peer session transport.
     pub fn new() -> Self {
@@ -765,6 +771,34 @@ impl ManagedPeerSessionTransport {
         })?;
 
         Ok(Some(trusted_peer.identity().display_name().to_string()))
+    }
+
+    fn discovery_identity_context(
+        &self,
+    ) -> Result<Option<PeerSessionDiscoveryIdentityContext>, PlatformError> {
+        let Some(auth_config) = &self.auth_config else {
+            return Ok(None);
+        };
+        let store = FileIdentityStore::new(&auth_config.identity_store);
+        let local = store
+            .load_or_create(&auth_config.identity_display_name)
+            .map_err(|error| {
+                PlatformError::new(format!(
+                    "failed to load identity store {}: {error}",
+                    auth_config.identity_store.display()
+                ))
+            })?;
+        let trusted_peers = store.list_trusted_peers().map_err(|error| {
+            PlatformError::new(format!(
+                "failed to list trusted peers from {}: {error}",
+                auth_config.identity_store.display()
+            ))
+        })?;
+
+        Ok(Some(PeerSessionDiscoveryIdentityContext {
+            local_device_id: DeviceId::new(local.identity().device_id()),
+            trusted_peers,
+        }))
     }
 
     /// Attach an already connected TCP peer session.
@@ -2103,6 +2137,7 @@ pub struct DaemonIpcServer<P> {
     platform: P,
     dispatcher: SharedCoreActionDispatcher,
     peer_sessions: ManagedPeerSessionTransport,
+    discovered_peers: SharedDiscoveredPeers,
     logs: SharedDaemonLogBuffer,
     shutdown_requested: Arc<AtomicBool>,
 }
@@ -2166,11 +2201,31 @@ impl<P> DaemonIpcServer<P> {
         peer_sessions: ManagedPeerSessionTransport,
         logs: SharedDaemonLogBuffer,
     ) -> Self {
+        Self::from_shared_state_dispatcher_peer_sessions_discovery_and_logs(
+            state,
+            platform,
+            dispatcher,
+            peer_sessions,
+            SharedDiscoveredPeers::new(),
+            logs,
+        )
+    }
+
+    /// Create an in-process daemon IPC server with explicit sessions, discovery, and logs.
+    pub fn from_shared_state_dispatcher_peer_sessions_discovery_and_logs(
+        state: SharedRuntimeInputState,
+        platform: P,
+        dispatcher: SharedCoreActionDispatcher,
+        peer_sessions: ManagedPeerSessionTransport,
+        discovered_peers: SharedDiscoveredPeers,
+        logs: SharedDaemonLogBuffer,
+    ) -> Self {
         Self {
             state,
             platform,
             dispatcher,
             peer_sessions,
+            discovered_peers,
             logs,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
         }
@@ -2201,14 +2256,17 @@ where
             IpcTransportError::request_failed("daemon runtime state is unavailable")
         })?;
 
-        handle_ipc_request_line_with_peer_sessions(
+        handle_ipc_request_line_with_context(
             &mut state,
             &self.platform,
             &self.dispatcher,
-            &self.peer_sessions,
+            IpcRuntimeContext {
+                peer_sessions: &self.peer_sessions,
+                discovered_peers: &self.discovered_peers,
+                logs: Some(&self.logs),
+                shutdown_requested: Some(&self.shutdown_requested),
+            },
             request_line,
-            Some(&self.logs),
-            Some(&self.shutdown_requested),
         )
         .map_err(|error| IpcTransportError::request_failed(error.to_string()))
     }
@@ -3188,6 +3246,25 @@ pub fn build_peer_session_discovery_candidates(
     build_discovery_session_candidates(discovered_peers, &filter, trusted_peers)
 }
 
+/// Build daemon discovery candidates from the current shared discovery and identity state.
+pub fn build_peer_session_discovery_candidates_from_shared_peers(
+    peer_sessions: &ManagedPeerSessionTransport,
+    discovered_peers: &SharedDiscoveredPeers,
+) -> Result<Vec<DiscoverySessionCandidate>, PlatformError> {
+    let Some(identity_context) = peer_sessions.discovery_identity_context()? else {
+        return Ok(Vec::new());
+    };
+    let discovered_peers = discovered_peers.snapshot().map_err(|error| {
+        PlatformError::new(format!("failed to read discovered peer snapshot: {error}"))
+    })?;
+
+    Ok(build_peer_session_discovery_candidates(
+        &identity_context.local_device_id,
+        &discovered_peers,
+        &identity_context.trusted_peers,
+    ))
+}
+
 /// Convert discovery candidates into the local IPC result contract.
 pub fn build_session_discovery_candidates_result(
     candidates: &[DiscoverySessionCandidate],
@@ -3206,6 +3283,14 @@ pub fn build_session_discovery_candidates_result(
             })
             .collect(),
     }
+}
+
+#[derive(Clone, Copy)]
+struct IpcRuntimeContext<'a> {
+    peer_sessions: &'a ManagedPeerSessionTransport,
+    discovered_peers: &'a SharedDiscoveredPeers,
+    logs: Option<&'a SharedDaemonLogBuffer>,
+    shutdown_requested: Option<&'a AtomicBool>,
 }
 
 /// Handle one local IPC JSON-RPC request line.
@@ -3236,16 +3321,30 @@ pub fn handle_ipc_request_line_with_peer_sessions(
     logs: Option<&SharedDaemonLogBuffer>,
     shutdown_requested: Option<&AtomicBool>,
 ) -> Result<String, DaemonIpcError> {
-    match parse_request_line(line) {
-        Ok(request) => handle_ipc_request(
-            state,
-            platform,
-            dispatcher,
+    let discovered_peers = SharedDiscoveredPeers::new();
+    handle_ipc_request_line_with_context(
+        state,
+        platform,
+        dispatcher,
+        IpcRuntimeContext {
             peer_sessions,
+            discovered_peers: &discovered_peers,
             logs,
             shutdown_requested,
-            request,
-        ),
+        },
+        line,
+    )
+}
+
+fn handle_ipc_request_line_with_context(
+    state: &mut RuntimeInputState,
+    platform: &impl PlatformAdapter,
+    dispatcher: &impl CoreActionDispatcher,
+    runtime: IpcRuntimeContext<'_>,
+    line: &str,
+) -> Result<String, DaemonIpcError> {
+    match parse_request_line(line) {
+        Ok(request) => handle_ipc_request(state, platform, dispatcher, runtime, request),
         Err(failure) => encode_response(&failure),
     }
 }
@@ -3254,11 +3353,16 @@ fn handle_ipc_request(
     state: &mut RuntimeInputState,
     platform: &impl PlatformAdapter,
     dispatcher: &impl CoreActionDispatcher,
-    peer_sessions: &ManagedPeerSessionTransport,
-    logs: Option<&SharedDaemonLogBuffer>,
-    shutdown_requested: Option<&AtomicBool>,
+    runtime: IpcRuntimeContext<'_>,
     request: IpcRequest,
 ) -> Result<String, DaemonIpcError> {
+    let IpcRuntimeContext {
+        peer_sessions,
+        discovered_peers,
+        logs,
+        shutdown_requested,
+    } = runtime;
+
     match request {
         IpcRequest::DaemonStatus(request) => {
             record_daemon_event(
@@ -3447,10 +3551,28 @@ fn handle_ipc_request(
                 "session.discoveryCandidates",
                 "Peer session discovery candidates requested.",
             );
-            encode_response(&JsonRpcSuccess::new(
-                request.id,
-                build_session_discovery_candidates_result(&[]),
-            ))
+            match build_peer_session_discovery_candidates_from_shared_peers(
+                peer_sessions,
+                discovered_peers,
+            ) {
+                Ok(candidates) => encode_response(&JsonRpcSuccess::new(
+                    request.id,
+                    build_session_discovery_candidates_result(&candidates),
+                )),
+                Err(error) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Warn,
+                        "session.discoveryCandidates.failed",
+                        "Peer session discovery candidates failed.",
+                    );
+                    encode_platform_error(
+                        request.id,
+                        "session discovery candidates unavailable",
+                        error,
+                    )
+                }
+            }
         }
         IpcRequest::SessionDisconnect(request) => {
             match disconnect_peer_session(state, dispatcher, peer_sessions) {
@@ -3740,7 +3862,9 @@ mod tests {
         PeerId, PhysicalKey, PressState, RuntimeEvent, RuntimeInputState, ScreenEdge,
         ScreenEdgeBinding, ScreenLayout, SessionId,
     };
-    use akraz_discovery::{DiscoveredPeer, DiscoverySessionCandidate, DiscoveryTxtRecord};
+    use akraz_discovery::{
+        DiscoveredPeer, DiscoverySessionCandidate, DiscoveryTxtRecord, SharedDiscoveredPeers,
+    };
     use akraz_identity::{
         DeviceIdentity, Ed25519IdentityKey, Ed25519PublicKey, FileIdentityStore, LocalIdentity,
         TrustedPeer, TrustedPeerIdentity, fingerprint_for_public_key,
@@ -3783,8 +3907,9 @@ mod tests {
         TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
         build_daemon_status_with_peer_sessions, build_diagnostics_keyboard_layout,
         build_diagnostics_screen_topology, build_peer_session_discovery_candidates,
-        build_permissions_probe, build_session_discovery_candidates_result, connect_peer_session,
-        disconnect_peer_session, dispatch_input_capture_idle_watchdog_action, drain_capture_events,
+        build_peer_session_discovery_candidates_from_shared_peers, build_permissions_probe,
+        build_session_discovery_candidates_result, connect_peer_session, disconnect_peer_session,
+        dispatch_input_capture_idle_watchdog_action, drain_capture_events,
         execute_authenticated_peer_transport_session_stream_until_closed,
         execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
         execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
@@ -4132,7 +4257,7 @@ mod tests {
                 version: 1,
                 device_id: device_id.to_string(),
                 capabilities,
-                build_version: "0.5.6".to_string(),
+                build_version: "0.5.7".to_string(),
             },
         }
     }
@@ -4253,7 +4378,7 @@ mod tests {
                 fingerprint: Some("AKRZ-TRUSTED".to_string()),
                 trusted: true,
                 address: "127.0.0.1:4455".parse().expect("candidate address"),
-                build_version: "0.5.6".to_string(),
+                build_version: "0.5.7".to_string(),
                 capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
             }]
         );
@@ -4318,6 +4443,101 @@ mod tests {
                 candidates: Vec::new()
             }
         );
+    }
+
+    #[test]
+    fn peer_session_discovery_candidates_require_identity_context() {
+        let discovered_peers = SharedDiscoveredPeers::from_peers(vec![discovered_peer(
+            "right-peer",
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        )]);
+
+        let candidates = build_peer_session_discovery_candidates_from_shared_peers(
+            &ManagedPeerSessionTransport::new(),
+            &discovered_peers,
+        )
+        .expect("discovery candidates without identity context");
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn daemon_ipc_session_discovery_candidates_uses_shared_discovery_source() {
+        let identity_store_path = unique_identity_store_path("discovery-candidates");
+        let _ = std::fs::remove_file(&identity_store_path);
+        let identity_store = FileIdentityStore::new(&identity_store_path);
+        let local = identity_store
+            .load_or_create("Windows Desktop")
+            .expect("create local identity store");
+        let (_, trusted_target, _) = peer_session_pair_auth_fixture();
+        identity_store
+            .save_trusted_peer(trusted_target.identity())
+            .expect("save trusted target peer");
+        let discovered_peers = SharedDiscoveredPeers::from_peers(vec![
+            discovered_peer(
+                local.identity().device_id(),
+                CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            ),
+            discovered_peer(
+                trusted_target.identity().peer_id(),
+                CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            ),
+            discovered_peer("keyboard-only", CapabilityFlags::KEYBOARD),
+        ]);
+        let state = shared_runtime_state(RuntimeInputState::new());
+        let platform = FakePlatformAdapter::default();
+        let dispatcher = Arc::new(LocalPlatformCoreActionDispatcher::new(
+            platform.clone(),
+            NoopCoreActionDispatcher,
+        ));
+        let server = DaemonIpcServer::from_shared_state_dispatcher_peer_sessions_discovery_and_logs(
+            state,
+            platform,
+            dispatcher,
+            ManagedPeerSessionTransport::with_identity_store(
+                &identity_store_path,
+                "Windows Desktop",
+            ),
+            discovered_peers,
+            shared_daemon_log_buffer(8),
+        );
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_SESSION_DISCOVERY_CANDIDATES,
+            SessionDiscoveryCandidatesParams::default(),
+        );
+        let request_line = to_json_line(&request).expect("session discovery request line");
+
+        let response_line = match server.handle_request_line(&request_line) {
+            Ok(line) => line,
+            Err(error) => panic!("expected session discovery response: {error}"),
+        };
+        let response: JsonRpcSuccess<SessionDiscoveryCandidatesResult> =
+            match serde_json::from_str(&response_line) {
+                Ok(response) => response,
+                Err(error) => panic!("expected session discovery success JSON: {error}"),
+            };
+
+        assert_eq!(response.id, "req_1");
+        assert_eq!(response.result.candidates.len(), 1);
+        let candidate = &response.result.candidates[0];
+        assert_eq!(candidate.peer_id, trusted_target.identity().peer_id());
+        assert_eq!(
+            candidate.display_name,
+            trusted_target.identity().display_name()
+        );
+        assert_eq!(
+            candidate.fingerprint.as_deref(),
+            Some(trusted_target.identity().fingerprint())
+        );
+        assert!(candidate.trusted);
+        assert_eq!(candidate.address, "127.0.0.1:4455");
+        assert_eq!(
+            candidate.capabilities,
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+        );
+
+        let _ = std::fs::remove_file(&identity_store_path);
     }
 
     #[test]
