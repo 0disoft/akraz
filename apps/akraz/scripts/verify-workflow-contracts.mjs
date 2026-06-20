@@ -16,6 +16,16 @@ const RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH =
   "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json";
 const RELEASE_WORKFLOW_INPUTS_MANIFEST_PATH =
   "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-workflow-inputs.json";
+const RELEASE_BUNDLE_EVIDENCE_SOURCES_SNIPPET = [
+  "bun run release:windows-mvp-bundle -- \\",
+  `            --evidence-sources-file "${RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH}" \\`,
+].join("\n");
+const RESOLVED_EVIDENCE_COMMAND_SNIPPET = [
+  "bun run release:windows-mvp-resolved-evidence -- \\",
+  `            --evidence-sources-file "${RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH}" \\`,
+  '            --qa-report-file "$qa_report_file" \\',
+  '            --soak-report-file "$soak_report_file"',
+].join("\n");
 
 export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoot()) {
   const rootPackage = readJsonFile(join(workspaceRoot, "package.json"));
@@ -263,8 +273,12 @@ function evaluateReleaseEvidenceSourcesWiring(workflows) {
       snippet: "release:windows-mvp-bundle",
     },
     {
-      id: "releaseBundleEvidenceSourcesArgument",
-      snippet: "--evidence-sources-file",
+      id: "resolvedEvidenceCommand",
+      snippet: RESOLVED_EVIDENCE_COMMAND_SNIPPET,
+    },
+    {
+      id: "releaseBundleEvidenceSourcesCommand",
+      snippet: RELEASE_BUNDLE_EVIDENCE_SOURCES_SNIPPET,
     },
     {
       id: "releaseBundleIntegritySmokeScript",

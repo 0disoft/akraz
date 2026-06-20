@@ -24,6 +24,7 @@ describe("GitHub Actions workflow contracts", () => {
     ]);
     expect(report.workflowScripts).toContain("release:windows-mvp-bundle");
     expect(report.workflowScripts).toContain("release:windows-mvp-evidence-sources");
+    expect(report.workflowScripts).toContain("release:windows-mvp-resolved-evidence");
     expect(report.workflowScripts).toContain("smoke:windows-mvp-soak");
     expect(
       report.checks.find((check) => check.id === "releaseEvidenceSourcesWiring"),
@@ -147,8 +148,11 @@ describe("GitHub Actions workflow contracts", () => {
         join(".github", "workflows", "windows-mvp-release.yml"),
         "utf8",
       ).replace(
-        '            --evidence-sources-file "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json" \\\n',
-        "",
+        [
+          "          bun run release:windows-mvp-bundle -- \\",
+          '            --evidence-sources-file "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json" \\',
+        ].join("\n"),
+        "          bun run release:windows-mvp-bundle -- \\",
       );
       writeFileSync(
         join(tempDirectory, ".github", "workflows", "windows-mvp-release.yml"),
@@ -164,13 +168,13 @@ describe("GitHub Actions workflow contracts", () => {
       ).toMatchObject({
         status: "invalid",
         detail: "releaseEvidenceSourcesWiringDrifted",
-        missingSnippets: ["releaseBundleEvidenceSourcesArgument"],
+        missingSnippets: ["releaseBundleEvidenceSourcesCommand"],
       });
       expect(report.nextActions).toContainEqual({
         id: "syncReleaseEvidenceSourcesWiring",
         action: "wire the release evidence source manifest generation into the bundle command",
         workflowFile: "windows-mvp-release.yml",
-        missingSnippets: ["releaseBundleEvidenceSourcesArgument"],
+        missingSnippets: ["releaseBundleEvidenceSourcesCommand"],
       });
       expect(exitCodeForWorkflowContracts(report)).toBe(1);
     } finally {
@@ -230,6 +234,59 @@ describe("GitHub Actions workflow contracts", () => {
           "releaseBundleIntegritySmokeScript",
           "releaseBundleIntegrityBundleDirArgument",
         ],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects release workflow drift when resolved evidence filenames are not checked", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-resolved-evidence-contracts-"));
+
+    try {
+      writeFileSync(
+        join(tempDirectory, "package.json"),
+        readFileSync("package.json", "utf8"),
+        "utf8",
+      );
+      mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
+      for (const workflowFile of ["check.yml", "windows-mvp-qa.yml", "windows-mvp-soak.yml"]) {
+        writeFileSync(
+          join(tempDirectory, ".github", "workflows", workflowFile),
+          readFileSync(join(".github", "workflows", workflowFile), "utf8"),
+          "utf8",
+        );
+      }
+
+      const releaseWorkflowWithoutResolvedEvidenceCheck = readFileSync(
+        join(".github", "workflows", "windows-mvp-release.yml"),
+        "utf8",
+      ).replace(
+        [
+          "          bun run release:windows-mvp-resolved-evidence -- \\",
+          '            --evidence-sources-file "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json" \\',
+          '            --qa-report-file "$qa_report_file" \\',
+          '            --soak-report-file "$soak_report_file"',
+          "",
+        ].join("\n"),
+        "",
+      );
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "windows-mvp-release.yml"),
+        releaseWorkflowWithoutResolvedEvidenceCheck,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(
+        report.checks.find((check) => check.id === "releaseEvidenceSourcesWiring"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "releaseEvidenceSourcesWiringDrifted",
+        missingSnippets: ["resolvedEvidenceCommand"],
       });
       expect(exitCodeForWorkflowContracts(report)).toBe(1);
     } finally {

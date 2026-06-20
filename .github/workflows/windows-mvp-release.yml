@@ -157,6 +157,11 @@ jobs:
           qa_report_file="$(resolve_json "$RELEASE_EVIDENCE_DIR/qa")"
           soak_report_file="$(resolve_json "$RELEASE_EVIDENCE_DIR/soak")"
 
+          bun run release:windows-mvp-resolved-evidence -- \
+            --evidence-sources-file "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json" \
+            --qa-report-file "$qa_report_file" \
+            --soak-report-file "$soak_report_file"
+
           {
             echo "QA_REPORT_FILE=$qa_report_file"
             echo "SOAK_REPORT_FILE=$soak_report_file"

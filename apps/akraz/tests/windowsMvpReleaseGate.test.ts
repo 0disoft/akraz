@@ -69,6 +69,12 @@ import {
   writeWindowsMvpReleaseEvidenceSourcesDispatchInputsFile,
   writeWindowsMvpReleaseEvidenceSourcesFile,
 } from "../scripts/windows-mvp-release-evidence-sources.mjs";
+import {
+  WINDOWS_MVP_RELEASE_RESOLVED_EVIDENCE_SCHEMA_VERSION,
+  buildWindowsMvpReleaseResolvedEvidenceReport,
+  exitCodeForWindowsMvpReleaseResolvedEvidence,
+  parseWindowsMvpReleaseResolvedEvidenceArgs,
+} from "../scripts/windows-mvp-release-resolved-evidence.mjs";
 
 function passingQaReport() {
   return {
@@ -991,6 +997,147 @@ describe("Windows MVP release gate", () => {
     expect(report.checks.every((check) => check.status === "pass")).toBe(true);
     expect(report.nextActions).toEqual([]);
     expect(exitCodeForWindowsMvpReleaseEvidenceSources(report)).toBe(0);
+  });
+
+  test("accepts resolved release evidence files with canonical manifest filenames", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-resolved-evidence-"));
+    const evidenceSourcesFile = join(tempDir, "windows-mvp-release-evidence-sources.json");
+    const qaReportFile = join(tempDir, WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport);
+    const soakReportFile = join(tempDir, WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport);
+
+    try {
+      writeJson(
+        evidenceSourcesFile,
+        buildWindowsMvpReleaseEvidenceSourcesReport({
+          sourceRunId: "27856073522",
+          manifestWritten: true,
+          dispatchInputsWritten: true,
+        }),
+      );
+      writeJson(qaReportFile, passingQaReport());
+      writeJson(soakReportFile, passingSoakReport());
+
+      const report = buildWindowsMvpReleaseResolvedEvidenceReport({
+        evidenceSourcesFile,
+        qaReportFile,
+        soakReportFile,
+      });
+      const formatted = JSON.stringify(report);
+
+      expect(report).toMatchObject({
+        schemaVersion: WINDOWS_MVP_RELEASE_RESOLVED_EVIDENCE_SCHEMA_VERSION,
+        ready: true,
+        evidenceSourcesFileProvided: true,
+        resolvedFiles: [
+          {
+            id: "qaReport",
+            fileProvided: true,
+            fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+            expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+            status: "pass",
+          },
+          {
+            id: "soakReport",
+            fileProvided: true,
+            fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+            expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+            status: "pass",
+          },
+        ],
+        privacy: {
+          includesSecretValues: false,
+          includesFullFilePaths: false,
+          includesArtifactPayloads: false,
+        },
+      });
+      expect(report.checks.every((check) => check.status === "pass")).toBe(true);
+      expect(report.nextActions).toEqual([]);
+      expect(formatted).not.toContain(tempDir);
+      expect(exitCodeForWindowsMvpReleaseResolvedEvidence(report)).toBe(0);
+      expect(
+        parseWindowsMvpReleaseResolvedEvidenceArgs([
+          "--evidence-sources-file",
+          "sources.json",
+          "--qa-report-file",
+          "windows-mvp-qa-report.json",
+          "--soak-report-file",
+          "windows-mvp-soak-report.json",
+        ]),
+      ).toEqual({
+        evidenceSourcesFile: "sources.json",
+        qaReportFile: "windows-mvp-qa-report.json",
+        soakReportFile: "windows-mvp-soak-report.json",
+      });
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects resolved release evidence filename drift before bundling", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-resolved-evidence-drift-"));
+    const evidenceSourcesFile = join(tempDir, "windows-mvp-release-evidence-sources.json");
+    const qaReportFile = join(tempDir, "qa-report.json");
+    const soakReportFile = join(tempDir, WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport);
+
+    try {
+      writeJson(
+        evidenceSourcesFile,
+        buildWindowsMvpReleaseEvidenceSourcesReport({
+          sourceRunId: "27856073522",
+          manifestWritten: true,
+          dispatchInputsWritten: true,
+        }),
+      );
+      writeJson(qaReportFile, passingQaReport());
+      writeJson(soakReportFile, passingSoakReport());
+
+      const report = buildWindowsMvpReleaseResolvedEvidenceReport({
+        evidenceSourcesFile,
+        qaReportFile,
+        soakReportFile,
+      });
+      const formatted = JSON.stringify(report);
+
+      expect(report.ready).toBe(false);
+      expect(report.resolvedFiles.find((file) => file.id === "qaReport")).toMatchObject({
+        status: "invalid",
+        detail: "fileNameMismatch",
+        fileName: "qa-report.json",
+        expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+      });
+      expect(report.checks.find((check) => check.id === "resolvedEvidenceFileNames")).toMatchObject(
+        {
+          status: "invalid",
+          detail: "resolvedEvidenceFileNamesNotReady",
+          missingFileIds: [],
+          invalidFileIds: ["qaReport"],
+        },
+      );
+      expect(report.nextActions).toContainEqual({
+        id: "resolveQaReportFile",
+        evidenceSourceId: "qaReport",
+        action: "download windows-mvp-qa-report.json as the expected release evidence JSON",
+        detail: "fileNameMismatch",
+      });
+      expect(formatted).not.toContain(tempDir);
+      expect(exitCodeForWindowsMvpReleaseResolvedEvidence(report)).toBe(1);
+      expect(() => parseWindowsMvpReleaseResolvedEvidenceArgs(["--qa-report-file"])).toThrow(
+        "--qa-report-file requires a non-empty value",
+      );
+      expect(() =>
+        parseWindowsMvpReleaseResolvedEvidenceArgs([
+          "--qa-report-file",
+          "windows-mvp-qa-report.json",
+          "--soak-report-file",
+          "windows-mvp-soak-report.json",
+        ]),
+      ).toThrow("--evidence-sources-file is required");
+      expect(() => parseWindowsMvpReleaseResolvedEvidenceArgs(["--unknown"])).toThrow(
+        "unknown Windows MVP release resolved evidence argument: --unknown",
+      );
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
   });
 
   test("writes release evidence sources and dispatch inputs from dedicated runs", () => {
