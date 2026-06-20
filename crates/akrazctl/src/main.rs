@@ -18,8 +18,9 @@ use akraz_ipc::{
     JsonRpcRequest, JsonRpcSuccess, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
     METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
     METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
-    METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe, PermissionsProbeParams,
-    SessionConnectParams, SessionDisconnectParams, build_diagnostics_latency_histogram,
+    METHOD_SESSION_DISCONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES, OsLocalIpcClient,
+    PermissionsProbe, PermissionsProbeParams, SessionConnectParams, SessionDisconnectParams,
+    SessionDiscoveryCandidatesParams, build_diagnostics_latency_histogram,
     build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
     resolve_current_default_endpoint,
 };
@@ -154,6 +155,13 @@ fn main() -> ExitCode {
                     ExitCode::from(2)
                 }
             },
+            Some("discovery-candidates") => match parse_endpoint_options(args) {
+                Ok(options) => print_session_discovery_candidates(options),
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            },
             Some("disconnect") => match parse_endpoint_options(args) {
                 Ok(options) => print_session_disconnect(options),
                 Err(error) => {
@@ -176,7 +184,7 @@ fn main() -> ExitCode {
         }
         None => {
             eprintln!(
-                "usage: akrazctl <status|diagnostics snapshot|diagnostics bundle|permissions probe|input release-all|identity show|identity list|identity trust|identity forget|session connect|session disconnect|daemon-args|--version>"
+                "usage: akrazctl <status|diagnostics snapshot|diagnostics bundle|permissions probe|input release-all|identity show|identity list|identity trust|identity forget|session connect|session discovery-candidates|session disconnect|daemon-args|--version>"
             );
             ExitCode::from(2)
         }
@@ -213,6 +221,11 @@ fn print_session_connect(options: SessionConnectOptions) -> ExitCode {
         },
     );
 
+    print_local_daemon_response(options.endpoint, &request)
+}
+
+fn print_session_discovery_candidates(options: EndpointOptions) -> ExitCode {
+    let request = session_discovery_candidates_request();
     print_local_daemon_response(options.endpoint, &request)
 }
 
@@ -526,6 +539,14 @@ fn input_release_all_request() -> JsonRpcRequest<InputReleaseAllParams> {
         LOCAL_REQUEST_ID,
         METHOD_INPUT_RELEASE_ALL,
         InputReleaseAllParams::default(),
+    )
+}
+
+fn session_discovery_candidates_request() -> JsonRpcRequest<SessionDiscoveryCandidatesParams> {
+    JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_SESSION_DISCOVERY_CANDIDATES,
+        SessionDiscoveryCandidatesParams::default(),
     )
 }
 
@@ -1559,14 +1580,16 @@ mod tests {
         IdentityListOptions, IdentityShowOptions, IdentityTrustOptions, LOCAL_REQUEST_ID,
         METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
         METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
-        SessionConnectOptions, build_daemon_client_with_resolver, build_pairing_identity_document,
+        METHOD_SESSION_DISCOVERY_CANDIDATES, SessionConnectOptions,
+        build_daemon_client_with_resolver, build_pairing_identity_document,
         daemon_logs_tail_request, daemon_status_request, default_pairing_capabilities,
         diagnostics_keyboard_layout_request, diagnostics_screen_topology_request,
         forget_trusted_peer_identity, format_daemon_call_error, format_daemon_command_line,
         input_release_all_request, list_trusted_peer_identities, parse_daemon_args_options,
         parse_endpoint_options, parse_identity_forget_options, parse_identity_list_options,
         parse_identity_show_options, parse_identity_trust_options, parse_json_rpc_response,
-        parse_session_connect_options, permissions_probe_request, trust_pairing_identity_document,
+        parse_session_connect_options, permissions_probe_request,
+        session_discovery_candidates_request, trust_pairing_identity_document,
     };
     use akraz_ipc::{
         JSONRPC_ERROR_PARSE, JSONRPC_VERSION, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
@@ -2393,6 +2416,18 @@ mod tests {
 
         assert_eq!(request.id, LOCAL_REQUEST_ID);
         assert_eq!(request.method, METHOD_SESSION_CONNECT);
+    }
+
+    #[test]
+    fn session_discovery_candidates_request_uses_session_discovery_ipc_method() {
+        let request = session_discovery_candidates_request();
+
+        assert_eq!(request.id, LOCAL_REQUEST_ID);
+        assert_eq!(request.method, METHOD_SESSION_DISCOVERY_CANDIDATES);
+        assert_eq!(
+            request.params,
+            akraz_ipc::SessionDiscoveryCandidatesParams::default()
+        );
     }
 
     #[test]
