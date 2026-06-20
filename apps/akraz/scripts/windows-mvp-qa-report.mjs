@@ -73,6 +73,73 @@ export function buildWindowsMvpQaReportTemplate(options = {}) {
   };
 }
 
+export function updateWindowsMvpQaReportResult(report, options, plan = buildWindowsMvpQaPlan()) {
+  const caseId = hasText(options.caseId) ? options.caseId.trim() : "";
+  const planCaseIds = new Set(plan.cases.map((testCase) => testCase.id));
+
+  if (!planCaseIds.has(caseId)) {
+    throw new Error(
+      `unknown Windows MVP QA case id: ${caseId}; available case ids: ${[...planCaseIds].join(
+        ", ",
+      )}`,
+    );
+  }
+
+  if (!RESULT_STATUSES.has(options.result)) {
+    throw new Error(`unsupported Windows MVP QA result: ${options.result}`);
+  }
+
+  if (options.result === "pass" && options.evidence.length === 0) {
+    throw new Error("--result pass requires at least one --evidence value");
+  }
+
+  if ((options.result === "fail" || options.result === "blocked") && !hasText(options.reason)) {
+    throw new Error(`--result ${options.result} requires --reason`);
+  }
+
+  if (
+    containsUnsafeReportText([
+      options.reason ?? "",
+      options.evidence,
+      options.sourceOs ?? "",
+      options.targetOs ?? "",
+      options.hardware ?? "",
+      options.environmentNotes ?? "",
+    ])
+  ) {
+    throw new Error("updated QA report values contain sensitive or local path data");
+  }
+
+  const nextReport = JSON.parse(JSON.stringify(report));
+  nextReport.executedAt = options.executedAt ?? nextReport.executedAt ?? null;
+  nextReport.environment ??= {};
+  nextReport.environment = {
+    ...nextReport.environment,
+    ...(options.sourceOs !== undefined ? { sourceOs: options.sourceOs } : {}),
+    ...(options.targetOs !== undefined ? { targetOs: options.targetOs } : {}),
+    ...(options.hardware !== undefined ? { hardware: options.hardware } : {}),
+    ...(options.environmentNotes !== undefined ? { notes: options.environmentNotes } : {}),
+  };
+
+  const nextResult = {
+    caseId,
+    result: options.result,
+    evidence: options.evidence,
+    ...(hasText(options.reason) ? { reason: options.reason } : {}),
+  };
+  const results = Array.isArray(nextReport.results) ? nextReport.results : [];
+  const existingIndex = results.findIndex((result) => result?.caseId === caseId);
+
+  if (existingIndex === -1) {
+    results.push(nextResult);
+  } else {
+    results[existingIndex] = nextResult;
+  }
+  nextReport.results = results;
+
+  return nextReport;
+}
+
 export function readWindowsMvpQaReport(reportFile) {
   return JSON.parse(readFileSync(reportFile, "utf8"));
 }
@@ -116,9 +183,18 @@ export function writeWindowsMvpQaReportOutputFile(outFile, payload) {
 export function parseWindowsMvpQaReportArgs(args) {
   const options = {
     template: false,
+    updateResult: false,
     reportFile: undefined,
     outFile: undefined,
     caseIds: [],
+    result: undefined,
+    reason: undefined,
+    evidence: [],
+    executedAt: undefined,
+    sourceOs: undefined,
+    targetOs: undefined,
+    hardware: undefined,
+    environmentNotes: undefined,
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -126,6 +202,9 @@ export function parseWindowsMvpQaReportArgs(args) {
     switch (arg) {
       case "--template":
         options.template = true;
+        break;
+      case "--update-result":
+        options.updateResult = true;
         break;
       case "--report-file":
         options.reportFile = readValue(args, ++index, arg);
@@ -136,13 +215,68 @@ export function parseWindowsMvpQaReportArgs(args) {
       case "--case-id":
         options.caseIds.push(readValue(args, ++index, arg));
         break;
+      case "--result":
+        options.result = readValue(args, ++index, arg);
+        break;
+      case "--reason":
+        options.reason = readValue(args, ++index, arg);
+        break;
+      case "--evidence":
+        options.evidence.push(readValue(args, ++index, arg));
+        break;
+      case "--executed-at":
+        options.executedAt = readValue(args, ++index, arg);
+        break;
+      case "--source-os":
+        options.sourceOs = readValue(args, ++index, arg);
+        break;
+      case "--target-os":
+        options.targetOs = readValue(args, ++index, arg);
+        break;
+      case "--hardware":
+        options.hardware = readValue(args, ++index, arg);
+        break;
+      case "--environment-notes":
+        options.environmentNotes = readValue(args, ++index, arg);
+        break;
       default:
         throw new Error(`unknown argument: ${arg}`);
     }
   }
 
+  if (options.template && options.updateResult) {
+    throw new Error("--template cannot be combined with --update-result");
+  }
+
   if (options.template && options.reportFile !== undefined) {
     throw new Error("--template cannot be combined with --report-file");
+  }
+
+  if (options.updateResult) {
+    if (options.reportFile === undefined) {
+      throw new Error("--update-result requires --report-file");
+    }
+    if (options.caseIds.length !== 1) {
+      throw new Error("--update-result requires exactly one --case-id");
+    }
+    if (options.result === undefined) {
+      throw new Error("--update-result requires --result");
+    }
+    return options;
+  }
+
+  const updateOnlyArgs = [
+    ["--result", options.result],
+    ["--reason", options.reason],
+    ["--evidence", options.evidence.length > 0 ? options.evidence : undefined],
+    ["--executed-at", options.executedAt],
+    ["--source-os", options.sourceOs],
+    ["--target-os", options.targetOs],
+    ["--hardware", options.hardware],
+    ["--environment-notes", options.environmentNotes],
+  ].filter(([, value]) => value !== undefined);
+  if (updateOnlyArgs.length > 0) {
+    throw new Error(`${updateOnlyArgs[0][0]} can only be used with --update-result`);
   }
 
   if (!options.template && options.caseIds.length > 0) {
@@ -439,6 +573,23 @@ if (import.meta.main) {
     const template = buildWindowsMvpQaReportTemplate({ caseIds: options.caseIds });
     writeWindowsMvpQaReportOutputFile(options.outFile, template);
     process.stdout.write(`${JSON.stringify(template, null, 2)}\n`);
+    process.exit(0);
+  }
+
+  if (options.updateResult) {
+    const report = updateWindowsMvpQaReportResult(readWindowsMvpQaReport(options.reportFile), {
+      caseId: options.caseIds[0],
+      result: options.result,
+      reason: options.reason,
+      evidence: options.evidence,
+      executedAt: options.executedAt,
+      sourceOs: options.sourceOs,
+      targetOs: options.targetOs,
+      hardware: options.hardware,
+      environmentNotes: options.environmentNotes,
+    });
+    writeWindowsMvpQaReportOutputFile(options.outFile, report);
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     process.exit(0);
   }
 

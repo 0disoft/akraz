@@ -13,6 +13,7 @@ import {
   evaluateWindowsMvpQaReport,
   exitCodeForWindowsMvpQaReport,
   parseWindowsMvpQaReportArgs,
+  updateWindowsMvpQaReportResult,
   writeWindowsMvpQaReportOutputFile,
 } from "../scripts/windows-mvp-qa-report.mjs";
 
@@ -164,9 +165,18 @@ describe("Windows MVP QA report evaluation", () => {
   test("parses report file argument", () => {
     expect(parseWindowsMvpQaReportArgs(["--report-file", "qa-report.json"])).toEqual({
       template: false,
+      updateResult: false,
       reportFile: "qa-report.json",
       outFile: undefined,
       caseIds: [],
+      result: undefined,
+      reason: undefined,
+      evidence: [],
+      executedAt: undefined,
+      sourceOs: undefined,
+      targetOs: undefined,
+      hardware: undefined,
+      environmentNotes: undefined,
     });
     expect(() => parseWindowsMvpQaReportArgs([])).toThrow("--report-file is required");
   });
@@ -215,9 +225,18 @@ describe("Windows MVP QA report evaluation", () => {
     expect(template.results.map((result) => result.caseId)).toEqual(["WIN-007"]);
     expect(parseWindowsMvpQaReportArgs(["--template", "--case-id", "WIN-007"])).toEqual({
       template: true,
+      updateResult: false,
       reportFile: undefined,
       outFile: undefined,
       caseIds: ["WIN-007"],
+      result: undefined,
+      reason: undefined,
+      evidence: [],
+      executedAt: undefined,
+      sourceOs: undefined,
+      targetOs: undefined,
+      hardware: undefined,
+      environmentNotes: undefined,
     });
     expect(() => buildWindowsMvpQaReportTemplate({ caseIds: ["NOPE-999"] })).toThrow(
       "unknown Windows MVP QA case id(s): NOPE-999",
@@ -230,6 +249,9 @@ describe("Windows MVP QA report evaluation", () => {
     ).toThrow("--template cannot be combined with --report-file");
     expect(() => parseWindowsMvpQaReportArgs(["--case-id", "WIN-007"])).toThrow(
       "--case-id can only be used with --template",
+    );
+    expect(() => parseWindowsMvpQaReportArgs(["--result", "pass"])).toThrow(
+      "--result can only be used with --update-result",
     );
   });
 
@@ -266,6 +288,127 @@ describe("Windows MVP QA report evaluation", () => {
     });
   });
 
+  test("updates one QA result without hand-editing the report JSON", () => {
+    const template = buildWindowsMvpQaReportTemplate();
+    const updatedReport = updateWindowsMvpQaReportResult(template, {
+      caseId: "WIN-006",
+      result: "pass",
+      evidence: ["WIN-006 support bundle artifact id"],
+      executedAt: "2026-06-20T01:02:03.004Z",
+      sourceOs: "Windows 11",
+      targetOs: "Windows 11",
+      hardware: "two physical Windows endpoints",
+      environmentNotes: "sleep resume qa bench",
+    });
+    const updatedEvaluation = evaluateWindowsMvpQaReport(updatedReport);
+
+    expect(updatedReport.executedAt).toBe("2026-06-20T01:02:03.004Z");
+    expect(updatedReport.environment).toEqual({
+      sourceOs: "Windows 11",
+      targetOs: "Windows 11",
+      hardware: "two physical Windows endpoints",
+      notes: "sleep resume qa bench",
+    });
+    expect(updatedReport.results.find((result) => result.caseId === "WIN-006")).toEqual({
+      caseId: "WIN-006",
+      result: "pass",
+      evidence: ["WIN-006 support bundle artifact id"],
+    });
+    expect(updatedEvaluation.checks.find((check) => check.id === "result:WIN-006")).toMatchObject({
+      status: "pass",
+    });
+    expect(
+      updatedEvaluation.checks.find((check) => check.id === "executionMetadata"),
+    ).toMatchObject({
+      status: "pass",
+    });
+  });
+
+  test("rejects unsafe or incomplete QA result updates", () => {
+    const template = buildWindowsMvpQaReportTemplate();
+
+    expect(() =>
+      updateWindowsMvpQaReportResult(template, {
+        caseId: "WIN-006",
+        result: "pass",
+        evidence: [],
+      }),
+    ).toThrow("--result pass requires at least one --evidence value");
+    expect(() =>
+      updateWindowsMvpQaReportResult(template, {
+        caseId: "WIN-006",
+        result: "blocked",
+        evidence: [],
+      }),
+    ).toThrow("--result blocked requires --reason");
+    expect(() =>
+      updateWindowsMvpQaReportResult(template, {
+        caseId: "NOPE-999",
+        result: "pass",
+        evidence: ["artifact"],
+      }),
+    ).toThrow("unknown Windows MVP QA case id");
+    expect(() =>
+      updateWindowsMvpQaReportResult(template, {
+        caseId: "WIN-006",
+        result: "pass",
+        evidence: ["C:\\Users\\cherr\\Desktop\\qa.json"],
+      }),
+    ).toThrow("updated QA report values contain sensitive or local path data");
+  });
+
+  test("parses QA result update mode arguments", () => {
+    expect(
+      parseWindowsMvpQaReportArgs([
+        "--update-result",
+        "--report-file",
+        "qa-report.json",
+        "--case-id",
+        "WIN-006",
+        "--result",
+        "pass",
+        "--evidence",
+        "support bundle artifact id",
+        "--executed-at",
+        "2026-06-20T01:02:03.004Z",
+        "--source-os",
+        "Windows 11",
+        "--target-os",
+        "Windows 11",
+        "--hardware",
+        "two physical Windows endpoints",
+        "--out-file",
+        "updated-report.json",
+      ]),
+    ).toEqual({
+      template: false,
+      updateResult: true,
+      reportFile: "qa-report.json",
+      outFile: "updated-report.json",
+      caseIds: ["WIN-006"],
+      result: "pass",
+      reason: undefined,
+      evidence: ["support bundle artifact id"],
+      executedAt: "2026-06-20T01:02:03.004Z",
+      sourceOs: "Windows 11",
+      targetOs: "Windows 11",
+      hardware: "two physical Windows endpoints",
+      environmentNotes: undefined,
+    });
+    expect(() => parseWindowsMvpQaReportArgs(["--update-result", "--result", "pass"])).toThrow(
+      "--update-result requires --report-file",
+    );
+    expect(() =>
+      parseWindowsMvpQaReportArgs([
+        "--update-result",
+        "--report-file",
+        "qa-report.json",
+        "--case-id",
+        "WIN-006",
+      ]),
+    ).toThrow("--update-result requires --result");
+  });
+
   test("parses and writes template or evaluation JSON to an output file", () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-qa-report-"));
     const templateFile = join(tempDirectory, "nested", "template.json");
@@ -282,9 +425,18 @@ describe("Windows MVP QA report evaluation", () => {
         ]),
       ).toEqual({
         template: true,
+        updateResult: false,
         reportFile: undefined,
         outFile: templateFile,
         caseIds: ["WIN-007"],
+        result: undefined,
+        reason: undefined,
+        evidence: [],
+        executedAt: undefined,
+        sourceOs: undefined,
+        targetOs: undefined,
+        hardware: undefined,
+        environmentNotes: undefined,
       });
 
       const template = buildWindowsMvpQaReportTemplate({ caseIds: ["WIN-007"] });
