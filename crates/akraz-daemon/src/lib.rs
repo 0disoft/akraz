@@ -2544,6 +2544,14 @@ where
         PowerResumeWatchdog::new(DEFAULT_POWER_RESUME_POLL_GAP, Instant::now());
     let mut router = CapturedInputRouter::new(routing);
 
+    environment_inspector.inspect(
+        &state,
+        &dispatcher,
+        &mut router,
+        logs.as_ref(),
+        Instant::now(),
+    )?;
+
     while running.load(Ordering::Acquire) {
         sync_capture_policy_with_state(&capture, &state)?;
         match capture.recv_timeout(idle_poll_interval) {
@@ -2646,7 +2654,7 @@ impl RuntimeEnvironmentWatchdog {
     fn new(poll_interval: Duration, now: Instant) -> Self {
         Self {
             poll_interval,
-            last_poll_at: now,
+            last_poll_at: now.checked_sub(poll_interval).unwrap_or(now),
             permissions_available: true,
         }
     }
@@ -3712,7 +3720,9 @@ mod tests {
         serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout,
         shared_daemon_log_buffer, shared_runtime_state, start_daemon_input_capture,
         start_daemon_input_capture_with_edge_bindings, start_daemon_input_capture_with_routing,
-        start_daemon_input_capture_with_routing_and_dispatcher, sync_capture_policy_with_state,
+        start_daemon_input_capture_with_routing_and_dispatcher,
+        start_monitored_daemon_input_capture_with_edge_bindings_dispatcher_and_logs,
+        sync_capture_policy_with_state,
     };
 
     fn status_or_panic(
@@ -6902,6 +6912,76 @@ mod tests {
 
         worker.stop().expect("stop capture worker");
         panic!("expected capture worker to dispatch panic hotkey recovery");
+    }
+
+    #[test]
+    fn monitored_daemon_input_capture_worker_recovers_after_permission_loss() {
+        let platform = FakePlatformAdapter::new(PlatformCapabilities {
+            can_capture_pointer: true,
+            can_capture_keyboard: false,
+            can_inject_pointer: true,
+            can_inject_keyboard: true,
+        });
+        let mut initial_state = RuntimeInputState::new();
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            })
+            .expect("remote entry request");
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-permission"),
+            })
+            .expect("remote entry confirmed");
+        let state = shared_runtime_state(initial_state);
+        let dispatcher = RecordingCoreActionDispatcher::default();
+        let logs = shared_daemon_log_buffer(8);
+        let expected_actions = vec![
+            CoreAction::ReleaseLocalInputs,
+            CoreAction::ReleaseAllInputs,
+            CoreAction::StopRemoteSession {
+                session_id: Some(SessionId::new("session-permission")),
+            },
+        ];
+
+        let worker = start_monitored_daemon_input_capture_with_edge_bindings_dispatcher_and_logs(
+            state.clone(),
+            &platform,
+            DaemonInputCaptureConfig {
+                input_capture: InputCaptureConfig {
+                    event_buffer_capacity: 8,
+                },
+                drain_batch_size: 8,
+                idle_poll_interval: std::time::Duration::from_millis(1),
+            },
+            vec![ScreenEdgeBinding {
+                local_edge: ScreenEdge::Right,
+                peer_id: PeerId::new("right-peer"),
+                remote_edge: ScreenEdge::Left,
+            }],
+            dispatcher.clone(),
+            logs.clone(),
+        )
+        .expect("monitored daemon capture worker");
+
+        for _ in 0..80 {
+            if dispatcher.snapshot() == expected_actions {
+                worker.stop().expect("stop capture worker");
+                assert_eq!(
+                    state.lock().expect("shared state lock").mode(),
+                    ControlMode::Local
+                );
+                let entries = logs.lock().expect("daemon logs lock").tail(8);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].level, DaemonLogLevel::Warn);
+                assert_eq!(entries[0].event, "input.capture.permissionLost");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        worker.stop().expect("stop capture worker");
+        panic!("expected monitored capture worker to recover after permission loss");
     }
 
     #[test]
