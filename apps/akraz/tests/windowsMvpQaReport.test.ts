@@ -403,6 +403,20 @@ describe("Windows MVP QA report evaluation", () => {
     );
   });
 
+  test("writes a filtered report template through the app package script", () => {
+    const result = runAppPackageScript("qa:windows-mvp-report-template", ["--case-id", "WIN-002"]);
+    const template = JSON.parse(result.stdout);
+
+    expect(result.status).toBe(0);
+    expect(template.schemaVersion).toBe(WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION);
+    expect(template.generatedFrom).toBe("qa:windows-mvp-report-template");
+    expect(template.results).toHaveLength(1);
+    expect(template.results[0].caseId).toBe("WIN-002");
+    expect(template.privacy.includesTypedContent).toBe(false);
+    expect(template.privacy.includesSecretValues).toBe(false);
+    expect(template.privacy.includesFullFilePaths).toBe(false);
+  });
+
   test("rejects conflicting template and report evaluation arguments", () => {
     expect(() =>
       parseWindowsMvpQaReportArgs(["--template", "--report-file", "qa-report.json"]),
@@ -739,6 +753,30 @@ describe("Windows MVP QA report evaluation", () => {
       expect(JSON.parse(readFileSync(evaluationFile, "utf8"))).toEqual(evaluation);
     } finally {
       rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("evaluates a completed QA report through the app package script", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-qa-report-eval-cli-"));
+    const reportFile = join(tempDir, "qa-report.json");
+
+    try {
+      writeWindowsMvpQaReportOutputFile(reportFile, passingReport());
+
+      const result = runAppPackageScript("qa:windows-mvp-report", ["--report-file", reportFile]);
+      const evaluation = JSON.parse(result.stdout);
+
+      expect(result.status).toBe(0);
+      expect(evaluation.ready).toBe(true);
+      expect(evaluation.summary.total).toBe(qaCaseCount());
+      expect(evaluation.summary.passed).toBe(qaCaseCount());
+      expect(evaluation.nextActions).toEqual([]);
+      expect(evaluation.privacy.includesReportPayload).toBe(false);
+      expect(evaluation.privacy.includesSecretValues).toBe(false);
+      expect(evaluation.privacy.includesFullFilePaths).toBe(false);
+      expect(result.stdout).not.toContain(reportFile);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
     }
   });
 });

@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
 
 import {
   WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
@@ -6,6 +8,14 @@ import {
   listWindowsMvpQaCaseIds,
   parseWindowsMvpQaPlanArgs,
 } from "../scripts/windows-mvp-qa-plan.mjs";
+
+function runAppPackageScript(scriptName, args) {
+  return spawnSync(process.execPath, ["run", scriptName, "--", ...args], {
+    cwd: join(import.meta.dir, ".."),
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
 
 describe("Windows MVP QA plan", () => {
   test("covers the release-blocking M8 manual QA cases", () => {
@@ -95,5 +105,31 @@ describe("Windows MVP QA plan", () => {
       list: false,
       caseIds: ["WIN-006", "REL-001"],
     });
+  });
+
+  test("lists QA case ids through the app package script", () => {
+    const result = runAppPackageScript("qa:windows-mvp-plan", ["--list"]);
+    const report = JSON.parse(result.stdout);
+
+    expect(result.status).toBe(0);
+    expect(report.cases).toEqual(listWindowsMvpQaCaseIds());
+  });
+
+  test("filters the QA plan through the app package script", () => {
+    const result = runAppPackageScript("qa:windows-mvp-plan", [
+      "--case-id",
+      "WIN-008",
+      "--case-id",
+      "I18N-001",
+    ]);
+    const plan = JSON.parse(result.stdout);
+
+    expect(result.status).toBe(0);
+    expect(plan.schemaVersion).toBe(WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION);
+    expect(plan.caseCount).toBe(2);
+    expect(plan.cases.map((testCase) => testCase.id)).toEqual(["WIN-008", "I18N-001"]);
+    expect(plan.privacy.includesTypedContent).toBe(false);
+    expect(plan.privacy.includesSecretValues).toBe(false);
+    expect(plan.privacy.includesFullFilePaths).toBe(false);
   });
 });

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,14 @@ import {
   buildWorkflowContractsReport,
   exitCodeForWorkflowContracts,
 } from "../scripts/verify-workflow-contracts.mjs";
+
+function runAppPackageScript(scriptName, args = []) {
+  return spawnSync(process.execPath, ["run", scriptName, "--", ...args], {
+    cwd: join(import.meta.dir, ".."),
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
 
 describe("GitHub Actions workflow contracts", () => {
   test("accepts the repository workflows and package scripts", () => {
@@ -47,6 +56,22 @@ describe("GitHub Actions workflow contracts", () => {
       includesWorkflowPayloads: false,
     });
     expect(exitCodeForWorkflowContracts(report)).toBe(0);
+  });
+
+  test("verifies workflow contracts through the app package script", () => {
+    const result = runAppPackageScript("verify:workflow-contracts");
+    const report = JSON.parse(result.stdout);
+
+    expect(result.status).toBe(0);
+    expect(report.schemaVersion).toBe(WORKFLOW_CONTRACTS_SCHEMA_VERSION);
+    expect(report.ready).toBe(true);
+    expect(report.checks.find((check) => check.id === "smokeWorkflowCoverage")).toMatchObject({
+      status: "pass",
+      workflowFile: "check.yml",
+    });
+    expect(report.privacy.includesSecretValues).toBe(false);
+    expect(report.privacy.includesFullFilePaths).toBe(false);
+    expect(report.privacy.includesWorkflowPayloads).toBe(false);
   });
 
   test("rejects workflow drift before Actions has to start a runner", () => {

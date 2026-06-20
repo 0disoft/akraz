@@ -1,10 +1,20 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
 
 import {
   evaluateReleaseMetadataVersions,
   parseCargoLockPackages,
   parseCargoWorkspacePackageVersion,
 } from "../scripts/verify-release-metadata.mjs";
+
+function runAppPackageScript(scriptName, args = []) {
+  return spawnSync(process.execPath, ["run", scriptName, "--", ...args], {
+    cwd: join(import.meta.dir, ".."),
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
 
 const releaseMetadataFixture = {
   rootPackageVersion: "0.4.69",
@@ -102,5 +112,16 @@ version = "0.4.69"
       { name: "akraz-core", version: "0.4.69" },
       { name: "akrazctl", version: "0.4.69" },
     ]);
+  });
+
+  test("verifies synchronized release metadata through the app package script", () => {
+    const result = runAppPackageScript("verify:release-metadata");
+    const report = JSON.parse(result.stdout);
+
+    expect(result.status).toBe(0);
+    expect(report.ready).toBe(true);
+    expect(report.schemaVersion).toBe("akraz.releaseMetadata/v1");
+    expect(report.expectedVersion).toBe("0.5.0");
+    expect(report.checks.every((check) => check.status === "pass")).toBe(true);
   });
 });
