@@ -115,6 +115,18 @@ describe("GitHub Actions workflow contracts", () => {
         "windows-mvp-updater-config-preflight.json",
       ],
     });
+    expect(
+      report.checks.find((check) => check.id === "releaseBundleArtifactIntegritySmokeContract"),
+    ).toMatchObject({
+      status: "pass",
+      scriptPath: "apps/akraz/scripts/smoke-windows-mvp-release-bundle.mjs",
+      guardedFields: [
+        "manifestArtifactFileMap",
+        "manifestFileNameMismatchList",
+        "manifestFileNameExpectedValue",
+        "manifestFileNameActualValue",
+      ],
+    });
     expect(report.checks.every((check) => check.status === "pass")).toBe(true);
     expect(report.privacy).toEqual({
       includesSecretValues: false,
@@ -529,6 +541,56 @@ describe("GitHub Actions workflow contracts", () => {
     }
   });
 
+  test("rejects release bundle smoke drift when manifest artifact file names are not checked", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-bundle-smoke-source-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory);
+      copyCurrentWorkflows(tempDirectory);
+
+      const smokeScriptPath = join(
+        tempDirectory,
+        "apps",
+        "akraz",
+        "scripts",
+        "smoke-windows-mvp-release-bundle.mjs",
+      );
+      const releaseBundleSmokeWithoutFileNameGuard = readFileSync(smokeScriptPath, "utf8")
+        .replaceAll("EXPECTED_MANIFEST_ARTIFACT_FILES", "DRIFTED_MANIFEST_ARTIFACT_FILES")
+        .replaceAll("mismatchedFileNames", "driftedFileNames");
+      writeFileSync(smokeScriptPath, releaseBundleSmokeWithoutFileNameGuard, "utf8");
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(
+        report.checks.find((check) => check.id === "releaseBundleArtifactIntegritySmokeContract"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "releaseBundleArtifactIntegritySmokeDrifted",
+        scriptPath: "apps/akraz/scripts/smoke-windows-mvp-release-bundle.mjs",
+        missingSnippets: [
+          "manifestArtifactFileMap",
+          "manifestFileNameMismatchList",
+          "manifestFileNameExpectedValue",
+        ],
+      });
+      expect(report.nextActions).toContainEqual({
+        id: "syncReleaseBundleArtifactIntegritySmoke",
+        action: "restore release bundle artifact integrity smoke manifest file-name checks",
+        scriptPath: "apps/akraz/scripts/smoke-windows-mvp-release-bundle.mjs",
+        missingSnippets: [
+          "manifestArtifactFileMap",
+          "manifestFileNameMismatchList",
+          "manifestFileNameExpectedValue",
+        ],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
   test("rejects release workflow drift when bundle output is not uploaded from the canonical directory", () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-bundle-output-contracts-"));
 
@@ -839,6 +901,12 @@ function writeCurrentAppPackageFixture(
   };
   mkdirSync(join(tempDirectory, "apps", "akraz"), { recursive: true });
   writeJson(join(tempDirectory, "apps", "akraz", "package.json"), appPackage);
+  mkdirSync(join(tempDirectory, "apps", "akraz", "scripts"), { recursive: true });
+  writeFileSync(
+    join(tempDirectory, "apps", "akraz", "scripts", "smoke-windows-mvp-release-bundle.mjs"),
+    readFileSync(join("apps", "akraz", "scripts", "smoke-windows-mvp-release-bundle.mjs"), "utf8"),
+    "utf8",
+  );
   mkdirSync(join(tempDirectory, "apps", "akraz", "src-tauri"), { recursive: true });
   writeFileSync(
     join(tempDirectory, "apps", "akraz", "src-tauri", "tauri.conf.json"),

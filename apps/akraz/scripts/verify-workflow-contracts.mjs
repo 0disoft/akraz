@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -33,10 +33,29 @@ const RELEASE_WORKFLOW_INPUTS_MANIFEST_PATH =
 const RELEASE_BUNDLE_ARTIFACT_NAME = "windows-mvp-release-bundle";
 const RELEASE_BUNDLE_DIRECTORY = "release-bundle";
 const RELEASE_BUNDLE_UPLOAD_PATH = `${RELEASE_BUNDLE_DIRECTORY}/*.json`;
+const RELEASE_BUNDLE_SMOKE_SCRIPT_PATH = "apps/akraz/scripts/smoke-windows-mvp-release-bundle.mjs";
 const RELEASE_BUNDLE_EVIDENCE_SOURCES_SNIPPET = [
   "bun run release:windows-mvp-bundle -- \\",
   `            --evidence-sources-file "${RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH}" \\`,
 ].join("\n");
+const RELEASE_BUNDLE_ARTIFACT_INTEGRITY_SMOKE_SNIPPETS = [
+  {
+    id: "manifestArtifactFileMap",
+    snippet: "EXPECTED_MANIFEST_ARTIFACT_FILES",
+  },
+  {
+    id: "manifestFileNameMismatchList",
+    snippet: "mismatchedFileNames",
+  },
+  {
+    id: "manifestFileNameExpectedValue",
+    snippet: "expectedFileName: EXPECTED_MANIFEST_ARTIFACT_FILES[artifact.id]",
+  },
+  {
+    id: "manifestFileNameActualValue",
+    snippet: 'actualFileName: typeof artifact.fileName === "string" ? artifact.fileName : null',
+  },
+];
 const RELEASE_EVIDENCE_SOURCES_ARGUMENT_SNIPPETS = [
   {
     id: "evidenceSourcesSourceRunIdArgument",
@@ -206,6 +225,7 @@ export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoo
     evaluateReleaseArtifactContract(workflows),
     evaluateReleaseEvidenceSourcesWiring(workflows),
     evaluateReleaseBundleOutputWiring(workflows),
+    evaluateReleaseBundleArtifactIntegritySmokeContract(workspaceRoot),
     evaluateSmokeWorkflowCoverage(workflows),
   ];
 
@@ -759,6 +779,42 @@ function evaluateReleaseBundleOutputWiring(workflows) {
   };
 }
 
+function evaluateReleaseBundleArtifactIntegritySmokeContract(workspaceRoot) {
+  const scriptPath = join(workspaceRoot, ...RELEASE_BUNDLE_SMOKE_SCRIPT_PATH.split("/"));
+  if (!existsSync(scriptPath)) {
+    return {
+      id: "releaseBundleArtifactIntegritySmokeContract",
+      status: "missing",
+      detail: "releaseBundleArtifactIntegritySmokeMissing",
+      scriptPath: RELEASE_BUNDLE_SMOKE_SCRIPT_PATH,
+    };
+  }
+
+  const scriptSource = readFileSync(scriptPath, "utf8");
+  const missingSnippets = RELEASE_BUNDLE_ARTIFACT_INTEGRITY_SMOKE_SNIPPETS.filter(
+    (requirement) => !scriptSource.includes(requirement.snippet),
+  ).map((requirement) => requirement.id);
+
+  if (missingSnippets.length === 0) {
+    return {
+      id: "releaseBundleArtifactIntegritySmokeContract",
+      status: "pass",
+      scriptPath: RELEASE_BUNDLE_SMOKE_SCRIPT_PATH,
+      guardedFields: RELEASE_BUNDLE_ARTIFACT_INTEGRITY_SMOKE_SNIPPETS.map(
+        (requirement) => requirement.id,
+      ),
+    };
+  }
+
+  return {
+    id: "releaseBundleArtifactIntegritySmokeContract",
+    status: "invalid",
+    detail: "releaseBundleArtifactIntegritySmokeDrifted",
+    scriptPath: RELEASE_BUNDLE_SMOKE_SCRIPT_PATH,
+    missingSnippets,
+  };
+}
+
 function evaluateSmokeWorkflowCoverage(workflows) {
   const checkWorkflow = workflows.find((workflow) => workflow.name === "check.yml");
   if (!checkWorkflow) {
@@ -959,6 +1015,16 @@ function buildNextActions(checks) {
             action: "restore release bundle out-dir, integrity smoke, and artifact upload wiring",
             workflowFile: check.workflowFile,
             missingSnippets: check.missingSnippets,
+          },
+        ];
+      case "releaseBundleArtifactIntegritySmokeMissing":
+      case "releaseBundleArtifactIntegritySmokeDrifted":
+        return [
+          {
+            id: "syncReleaseBundleArtifactIntegritySmoke",
+            action: "restore release bundle artifact integrity smoke manifest file-name checks",
+            scriptPath: check.scriptPath,
+            missingSnippets: check.missingSnippets ?? [],
           },
         ];
       case "smokeWorkflowCoverageDrifted":
