@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,6 +21,14 @@ import {
   selectSoakScenarios,
   writeSoakSummaryReportFile,
 } from "../scripts/windows-mvp-soak-report.mjs";
+
+function runAppPackageScript(scriptName, args) {
+  return spawnSync(process.execPath, ["run", scriptName, "--", ...args], {
+    cwd: join(import.meta.dir, ".."),
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
 
 describe("Windows MVP soak reporting", () => {
   test("defaults to the planned two hour soak duration", () => {
@@ -47,6 +56,20 @@ describe("Windows MVP soak reporting", () => {
     expect(() => selectSoakScenarios(parseSoakOptions(["--scenario", "missing"]))).toThrow(
       "unknown soak scenario",
     );
+  });
+
+  test("lists soak scenarios through the app package script", () => {
+    const result = runAppPackageScript("smoke:windows-mvp-soak", ["--list"]);
+    const report = JSON.parse(result.stdout);
+
+    expect(result.status).toBe(0);
+    expect(report.scenarios).toEqual([
+      "loopback-transport",
+      "peer-session",
+      "peer-session-executor",
+      "tcp-transport",
+      "session-connect-lifecycle",
+    ]);
   });
 
   test("extracts the last JSON report from noisy scenario output", () => {

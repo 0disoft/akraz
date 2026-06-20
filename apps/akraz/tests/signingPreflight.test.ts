@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -10,6 +11,17 @@ import {
   parseSigningPreflightArgs,
   writeSigningPreflightOutputFile,
 } from "../scripts/smoke-signing-preflight.mjs";
+
+function runAppPackageScript(scriptName, args, envOverrides = {}) {
+  const env = { ...process.env, ...envOverrides };
+
+  return spawnSync(process.execPath, ["run", scriptName, "--", ...args], {
+    cwd: join(import.meta.dir, ".."),
+    encoding: "utf8",
+    env,
+    windowsHide: true,
+  });
+}
 
 describe("signing preflight", () => {
   test("reports missing release signing inputs without secret values", () => {
@@ -90,6 +102,28 @@ describe("signing preflight", () => {
     expect(exitCodeForSigningPreflight(invalidReport, { expectMissing: true })).toBe(1);
     expect(exitCodeForSigningPreflight(readyReport, { expectMissing: true })).toBe(1);
     expect(exitCodeForSigningPreflight(readyReport)).toBe(0);
+  });
+
+  test("runs expect-missing smoke through the app package script", () => {
+    const result = runAppPackageScript("smoke:signing-preflight", [], {
+      AKRAZ_WINDOWS_SIGNING_CERT_BASE64: "",
+      AKRAZ_WINDOWS_SIGNING_CERT_PASSWORD: "",
+      AKRAZ_WINDOWS_SIGNING_CERT_PATH: "",
+      TAURI_SIGNING_PRIVATE_KEY: "",
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "",
+    });
+    const report = JSON.parse(result.stdout);
+
+    expect(result.status).toBe(0);
+    expect(report.ready).toBe(false);
+    expect(report.checks.map((check) => check.status)).toEqual([
+      "missing",
+      "missing",
+      "missing",
+      "missing",
+    ]);
+    expect(report.privacy.includesSecretValues).toBe(false);
+    expect(result.stdout).not.toContain("super-secret");
   });
 
   test("parses output file arguments and writes atomic JSON evidence", () => {

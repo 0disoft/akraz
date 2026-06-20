@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,6 +10,14 @@ import {
   parseUpdaterConfigPreflightArgs,
   writeUpdaterConfigPreflightOutputFile,
 } from "../scripts/smoke-updater-config-preflight.mjs";
+
+function runAppPackageScript(scriptName, args) {
+  return spawnSync(process.execPath, ["run", scriptName, "--", ...args], {
+    cwd: join(import.meta.dir, ".."),
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
 
 const completeUpdaterConfig = {
   bundle: {
@@ -159,6 +168,22 @@ describe("updater config preflight", () => {
     expect(exitCodeForUpdaterConfigPreflight(invalidReport, { expectMissing: true })).toBe(1);
     expect(exitCodeForUpdaterConfigPreflight(readyReport, { expectMissing: true })).toBe(1);
     expect(exitCodeForUpdaterConfigPreflight(readyReport)).toBe(0);
+  });
+
+  test("runs expect-missing smoke through the app package script", () => {
+    const result = runAppPackageScript("smoke:updater-config-preflight", []);
+    const report = JSON.parse(result.stdout);
+
+    expect(result.status).toBe(0);
+    expect(report.ready).toBe(false);
+    expect(report.checks.map((check) => check.status)).toEqual([
+      "missing",
+      "missing",
+      "missing",
+      "pass",
+      "pass",
+    ]);
+    expect(report.privacy.includesEndpointValues).toBe(false);
   });
 
   test("parses output file arguments and writes atomic JSON evidence", () => {
