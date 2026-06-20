@@ -1262,6 +1262,66 @@ describe("Windows MVP release gate", () => {
     }
   });
 
+  test("writes release evidence sources through the app package script", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-evidence-sources-cli-"));
+    const manifestFile = join(tempDir, "nested", "release-evidence-sources.json");
+    const dispatchInputsFile = join(tempDir, "nested", "release-workflow-inputs.json");
+
+    try {
+      const result = runAppPackageScript("release:windows-mvp-evidence-sources", [
+        "--qa-source-run-id",
+        "27855770983",
+        "--soak-source-run-id",
+        "27855465732",
+        "--qa-report-artifact",
+        "custom-qa-report",
+        "--soak-report-artifact",
+        "custom-soak-report",
+        "--out-file",
+        manifestFile,
+        "--dispatch-inputs-file",
+        dispatchInputsFile,
+      ]);
+
+      expect(result.status).toBe(0);
+
+      const report = JSON.parse(result.stdout);
+      const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
+      const dispatchInputs = JSON.parse(readFileSync(dispatchInputsFile, "utf8"));
+
+      expect(report).toMatchObject({
+        schemaVersion: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
+        ready: true,
+        workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+        manifestWritten: true,
+        dispatchInputsWritten: true,
+        privacy: {
+          includesSecretValues: false,
+          includesFullFilePaths: false,
+          includesArtifactPayloads: false,
+        },
+      });
+      expect(report.sources.map((source) => source.sourceRunId)).toEqual([
+        "27855770983",
+        "27855465732",
+      ]);
+      expect(report.sources.map((source) => source.artifactName)).toEqual([
+        "custom-qa-report",
+        "custom-soak-report",
+      ]);
+      expect(report.sources.map((source) => source.expectedFileName)).toEqual([
+        WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+        WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+      ]);
+      expect(manifest).toEqual(report);
+      expect(dispatchInputs).toEqual(report.dispatchInputs);
+      expect(readFileSync(manifestFile, "utf8").endsWith("\n")).toBe(true);
+      expect(readFileSync(dispatchInputsFile, "utf8").endsWith("\n")).toBe(true);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
   test("rejects malformed release evidence source inputs before writing dispatch inputs", () => {
     const missingRunIds = buildWindowsMvpReleaseEvidenceSourcesReport({
       qaSourceRunId: "27855770983",
