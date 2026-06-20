@@ -35,6 +35,7 @@ export function buildWindowsMvpQaWorkflowPayloadReport(report, options = {}) {
     inputName: "qa_report_base64",
     payloadEncoding: "base64",
     payloadWritten: Boolean(options.payloadWritten),
+    dispatchInputsWritten: Boolean(options.dispatchInputsWritten),
     payloadLength: payload.length,
     evaluation,
     nextActions: ready ? [] : evaluation.nextActions,
@@ -50,6 +51,7 @@ export function parseWindowsMvpQaWorkflowPayloadArgs(args) {
   const options = {
     reportFile: undefined,
     outFile: undefined,
+    dispatchInputsFile: undefined,
     evaluationOutFile: undefined,
   };
 
@@ -61,6 +63,9 @@ export function parseWindowsMvpQaWorkflowPayloadArgs(args) {
         break;
       case "--out-file":
         options.outFile = readValue(args, ++index, arg);
+        break;
+      case "--dispatch-inputs-file":
+        options.dispatchInputsFile = readValue(args, ++index, arg);
         break;
       case "--evaluation-out-file":
         options.evaluationOutFile = readValue(args, ++index, arg);
@@ -74,8 +79,8 @@ export function parseWindowsMvpQaWorkflowPayloadArgs(args) {
     throw new Error("--report-file is required");
   }
 
-  if (options.outFile === undefined) {
-    throw new Error("--out-file is required");
+  if (options.outFile === undefined && options.dispatchInputsFile === undefined) {
+    throw new Error("at least one of --out-file or --dispatch-inputs-file is required");
   }
 
   return options;
@@ -87,6 +92,17 @@ export function writeWindowsMvpQaWorkflowPayloadOutputFile(outFile, payload) {
   }
 
   return writeTextFileAtomic(outFile, `${payload}\n`);
+}
+
+export function writeWindowsMvpQaWorkflowDispatchInputsFile(outFile, payload) {
+  if (!outFile) {
+    throw new Error("--dispatch-inputs-file is required");
+  }
+
+  return writeTextFileAtomic(
+    outFile,
+    `${JSON.stringify({ qa_report_base64: payload }, null, 2)}\n`,
+  );
 }
 
 export function exitCodeForWindowsMvpQaWorkflowPayload(report) {
@@ -142,14 +158,20 @@ if (import.meta.main) {
   }
 
   const outputReport = initialReport.ready
-    ? buildWindowsMvpQaWorkflowPayloadReport(qaReport, { payloadWritten: true })
+    ? buildWindowsMvpQaWorkflowPayloadReport(qaReport, {
+        dispatchInputsWritten: options.dispatchInputsFile !== undefined,
+        payloadWritten: options.outFile !== undefined,
+      })
     : initialReport;
 
   if (outputReport.ready) {
-    writeWindowsMvpQaWorkflowPayloadOutputFile(
-      options.outFile,
-      buildWindowsMvpQaWorkflowPayload(qaReport),
-    );
+    const workflowPayload = buildWindowsMvpQaWorkflowPayload(qaReport);
+    if (options.outFile !== undefined) {
+      writeWindowsMvpQaWorkflowPayloadOutputFile(options.outFile, workflowPayload);
+    }
+    if (options.dispatchInputsFile !== undefined) {
+      writeWindowsMvpQaWorkflowDispatchInputsFile(options.dispatchInputsFile, workflowPayload);
+    }
   }
 
   process.stdout.write(`${JSON.stringify(outputReport, null, 2)}\n`);
