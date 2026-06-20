@@ -422,6 +422,65 @@ describe("Windows MVP release gate", () => {
     }
   });
 
+  test("writes release gate report through the app package script", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-gate-cli-"));
+    const qaReportFile = join(tempDir, "qa-report.json");
+    const soakReportFile = join(tempDir, "soak-report.json");
+    const signingFile = join(tempDir, "signing.json");
+    const updaterFile = join(tempDir, "updater.json");
+    const outputFile = join(tempDir, "nested", "gate.json");
+
+    try {
+      writeJson(qaReportFile, passingQaReport());
+      writeJson(soakReportFile, passingSoakReport());
+      writeJson(signingFile, passingSigningPreflight());
+      writeJson(updaterFile, passingUpdaterConfigPreflight());
+
+      const result = runAppPackageScript("release:windows-mvp-gate", [
+        "--qa-report-file",
+        qaReportFile,
+        "--soak-report-file",
+        soakReportFile,
+        "--signing-preflight-file",
+        signingFile,
+        "--updater-config-preflight-file",
+        updaterFile,
+        "--out-file",
+        outputFile,
+      ]);
+
+      expect(result.status).toBe(0);
+      expect(existsSync(outputFile)).toBe(true);
+
+      const report = JSON.parse(result.stdout);
+      const writtenReport = JSON.parse(readFileSync(outputFile, "utf8"));
+      const formatted = JSON.stringify(report);
+
+      expect(report).toMatchObject({
+        schemaVersion: WINDOWS_MVP_RELEASE_GATE_SCHEMA_VERSION,
+        releaseTarget: "Windows MVP alpha",
+        ready: true,
+        requiredSoakDurationMs: DEFAULT_DURATION_MS,
+        privacy: {
+          includesQaReportPayload: false,
+          includesSecretValues: false,
+          includesFullFilePaths: false,
+          includesEndpointValues: false,
+        },
+      });
+      expect(report.checks.every((check) => check.status === "pass")).toBe(true);
+      expect(report.nextActions).toEqual([]);
+      expect(writtenReport).toEqual(report);
+      expect(result.stdout.endsWith("\n")).toBe(true);
+      expect(readFileSync(outputFile, "utf8").endsWith("\n")).toBe(true);
+      expect(formatted).not.toContain(tempDir);
+      expect(formatted).not.toContain("super-secret");
+      expect(formatted).not.toContain("updates.example.com");
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
   test("rejects stale evidence schemas without leaking the input file path", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-gate-schema-"));
     const qaReportFile = join(tempDir, "qa-report.json");
