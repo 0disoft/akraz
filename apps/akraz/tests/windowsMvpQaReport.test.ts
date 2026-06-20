@@ -49,14 +49,26 @@ function passingReport() {
   };
 }
 
+function qaCaseCount() {
+  return listWindowsMvpQaCaseIds().length;
+}
+
+function replaceResult(report, caseId, result) {
+  const index = report.results.findIndex((candidate) => candidate.caseId === caseId);
+  if (index === -1) {
+    throw new Error(`missing QA result fixture for ${caseId}`);
+  }
+  report.results[index] = result;
+}
+
 describe("Windows MVP QA report evaluation", () => {
   test("accepts a complete sanitized release-blocking pass report", () => {
     const evaluation = evaluateWindowsMvpQaReport(passingReport());
 
     expect(evaluation.ready).toBe(true);
     expect(evaluation.summary).toEqual({
-      total: 5,
-      passed: 5,
+      total: qaCaseCount(),
+      passed: qaCaseCount(),
       failed: 0,
       blocked: 0,
       skipped: 0,
@@ -84,24 +96,24 @@ describe("Windows MVP QA report evaluation", () => {
     expect(evaluation.ready).toBe(false);
     expect(evaluation.checks.find((check) => check.id === "duplicateCaseIds")).toMatchObject({
       status: "invalid",
-      caseIds: ["WIN-006"],
+      caseIds: ["WIN-002"],
     });
     expect(evaluation.checks.find((check) => check.id === "releaseBlockingCoverage")).toMatchObject(
       {
         status: "missing",
-        caseIds: ["WIN-007", "I18N-001", "I18N-004", "REL-001"],
+        caseIds: listWindowsMvpQaCaseIds().filter((caseId) => caseId !== "WIN-002"),
       },
     );
     expect(evaluation.nextActions).toEqual([
       {
         id: "dedupeResults",
         action: "keep exactly one result per QA case id",
-        caseIds: ["WIN-006"],
+        caseIds: ["WIN-002"],
       },
       {
         id: "addReleaseBlockingResults",
         action: "add results for every missing release-blocking QA case",
-        caseIds: ["WIN-007", "I18N-001", "I18N-004", "REL-001"],
+        caseIds: listWindowsMvpQaCaseIds().filter((caseId) => caseId !== "WIN-002"),
       },
     ]);
     expect(exitCodeForWindowsMvpQaReport(evaluation)).toBe(1);
@@ -138,18 +150,18 @@ describe("Windows MVP QA report evaluation", () => {
 
   test("requires reason for blocked or failed cases and keeps the report not ready", () => {
     const blockedReport = passingReport();
-    blockedReport.results[1] = {
+    replaceResult(blockedReport, "WIN-007", {
       caseId: "WIN-007",
       result: "blocked",
       evidence: ["screen topology artifact id"],
       reason: "mixed DPI monitor unavailable in this run",
-    };
+    });
     const missingReasonReport = passingReport();
-    missingReasonReport.results[2] = {
+    replaceResult(missingReasonReport, "I18N-001", {
       caseId: "I18N-001",
       result: "fail",
       evidence: ["keyboard layout artifact id"],
-    };
+    });
 
     const blockedEvaluation = evaluateWindowsMvpQaReport(blockedReport);
     const missingReasonEvaluation = evaluateWindowsMvpQaReport(missingReasonReport);
@@ -185,9 +197,17 @@ describe("Windows MVP QA report evaluation", () => {
   test("rejects privacy flags and sensitive evidence payloads", () => {
     const privateReport = passingReport();
     privateReport.privacy.includesFullFilePaths = true;
-    privateReport.results[0].evidence = ["C:\\Users\\cherr\\Desktop\\qa.json"];
+    replaceResult(privateReport, "WIN-006", {
+      caseId: "WIN-006",
+      result: "pass",
+      evidence: ["C:\\Users\\cherr\\Desktop\\qa.json"],
+    });
     const typedContentReport = passingReport();
-    typedContentReport.results[2].evidence = ["안녕"];
+    replaceResult(typedContentReport, "I18N-001", {
+      caseId: "I18N-001",
+      result: "pass",
+      evidence: ["안녕"],
+    });
 
     const privateEvaluation = evaluateWindowsMvpQaReport(privateReport);
     const typedContentEvaluation = evaluateWindowsMvpQaReport(typedContentReport);
@@ -264,10 +284,10 @@ describe("Windows MVP QA report evaluation", () => {
     expect(template.results.every((result) => result.evidence.length === 0)).toBe(true);
     expect(evaluation.ready).toBe(false);
     expect(evaluation.summary).toEqual({
-      total: 5,
+      total: qaCaseCount(),
       passed: 0,
       failed: 0,
-      blocked: 5,
+      blocked: qaCaseCount(),
       skipped: 0,
     });
     expect(evaluation.checks.find((check) => check.id === "executionMetadata")).toMatchObject({

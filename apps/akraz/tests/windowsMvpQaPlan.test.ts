@@ -16,8 +16,13 @@ describe("Windows MVP QA plan", () => {
     expect(plan.caseCount).toBe(plan.cases.length);
     expect(plan.releaseBlockingCaseCount).toBe(plan.cases.length);
     expect(plan.cases.map((testCase) => testCase.id)).toEqual([
+      "WIN-002",
+      "WIN-003",
       "WIN-006",
       "WIN-007",
+      "WIN-008",
+      "WIN-010",
+      "WIN-011",
       "I18N-001",
       "I18N-004",
       "REL-001",
@@ -46,10 +51,10 @@ describe("Windows MVP QA plan", () => {
   });
 
   test("filters by case id and rejects unknown case ids", () => {
-    const plan = buildWindowsMvpQaPlan({ caseIds: ["WIN-007", "I18N-001"] });
+    const plan = buildWindowsMvpQaPlan({ caseIds: ["WIN-008", "I18N-001"] });
 
     expect(plan.caseCount).toBe(2);
-    expect(plan.cases.map((testCase) => testCase.id)).toEqual(["WIN-007", "I18N-001"]);
+    expect(plan.cases.map((testCase) => testCase.id)).toEqual(["WIN-008", "I18N-001"]);
     expect(() => buildWindowsMvpQaPlan({ caseIds: ["NOPE-999"] })).toThrow(
       "unknown Windows MVP QA case id",
     );
@@ -57,8 +62,13 @@ describe("Windows MVP QA plan", () => {
 
   test("parses list and repeated case id arguments", () => {
     expect(listWindowsMvpQaCaseIds()).toEqual([
+      "WIN-002",
+      "WIN-003",
       "WIN-006",
       "WIN-007",
+      "WIN-008",
+      "WIN-010",
+      "WIN-011",
       "I18N-001",
       "I18N-004",
       "REL-001",
