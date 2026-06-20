@@ -111,6 +111,16 @@ export function updateWindowsMvpQaReportResult(report, options, plan = buildWind
     throw new Error("updated QA report values contain sensitive or local path data");
   }
 
+  const planCase = plan.cases.find((testCase) => testCase.id === caseId);
+  if (options.result === "pass") {
+    const missingEvidence = findMissingPlannedEvidence({ evidence: options.evidence }, planCase);
+    if (missingEvidence.length > 0) {
+      throw new Error(
+        `--result pass requires planned evidence for ${caseId}: ${missingEvidence.join(", ")}`,
+      );
+    }
+  }
+
   const nextReport = JSON.parse(JSON.stringify(report));
   nextReport.executedAt = options.executedAt ?? nextReport.executedAt ?? null;
   nextReport.environment ??= {};
@@ -414,7 +424,7 @@ function evaluateReportResults(report, plan) {
     }
 
     reportedCaseIds.add(caseId);
-    checks.push(evaluateSingleResult(caseId, result));
+    checks.push(evaluateSingleResult(caseId, result, planCases.get(caseId)));
   }
 
   if (duplicateCaseIds.size > 0) {
@@ -447,7 +457,7 @@ function evaluateReportResults(report, plan) {
   return checks;
 }
 
-function evaluateSingleResult(caseId, result) {
+function evaluateSingleResult(caseId, result, testCase) {
   const status = result?.result;
 
   if (!RESULT_STATUSES.has(status)) {
@@ -475,6 +485,15 @@ function evaluateSingleResult(caseId, result) {
     return buildCheck(`result:${caseId}`, "invalid", {
       detail: "evidenceContainsSensitiveOrLocalPathData",
       caseId,
+    });
+  }
+
+  const missingEvidence = status === "pass" ? findMissingPlannedEvidence(result, testCase) : [];
+  if (missingEvidence.length > 0) {
+    return buildCheck(`result:${caseId}`, "invalid", {
+      detail: "passRequiresPlannedEvidence",
+      caseId,
+      missingEvidence,
     });
   }
 
@@ -607,6 +626,13 @@ function buildWindowsMvpQaNextAction(check) {
         action: "add sanitized evidence before marking the QA case as pass",
         caseId: check.caseId,
       };
+    case "passRequiresPlannedEvidence":
+      return {
+        id: "addPlannedEvidence",
+        action: "add sanitized evidence for every planned QA evidence item",
+        caseId: check.caseId,
+        missingEvidence: check.missingEvidence ?? [],
+      };
     case "nonPassRequiresReason":
       return {
         id: "addNonPassReason",
@@ -637,6 +663,29 @@ function buildWindowsMvpQaNextAction(check) {
 
 function hasEvidence(result) {
   return Array.isArray(result?.evidence) && result.evidence.some((entry) => hasText(entry));
+}
+
+function findMissingPlannedEvidence(result, testCase) {
+  const plannedEvidence = Array.isArray(testCase?.evidence) ? testCase.evidence : [];
+  if (plannedEvidence.length === 0) {
+    return [];
+  }
+
+  const evidenceText = Array.isArray(result?.evidence)
+    ? result.evidence.map(normalizeEvidenceText)
+    : [];
+
+  return plannedEvidence.filter((requiredEvidence) => {
+    const normalizedRequiredEvidence = normalizeEvidenceText(requiredEvidence);
+    return !evidenceText.some((entry) => entry.includes(normalizedRequiredEvidence));
+  });
+}
+
+function normalizeEvidenceText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function containsUnsafeEvidence(result) {

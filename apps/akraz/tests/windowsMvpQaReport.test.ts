@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
+  buildWindowsMvpQaPlan,
   listWindowsMvpQaCaseIds,
 } from "../scripts/windows-mvp-qa-plan.mjs";
 import {
@@ -27,6 +28,8 @@ import {
 } from "../scripts/windows-mvp-qa-workflow-payload.mjs";
 
 function passingReport() {
+  const plan = buildWindowsMvpQaPlan();
+
   return {
     schemaVersion: WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION,
     planSchemaVersion: WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
@@ -36,10 +39,10 @@ function passingReport() {
       targetOs: "Windows 11",
       hardware: "two physical Windows endpoints",
     },
-    results: listWindowsMvpQaCaseIds().map((caseId) => ({
-      caseId,
+    results: plan.cases.map((testCase) => ({
+      caseId: testCase.id,
       result: "pass",
-      evidence: [`${caseId} sanitized artifact id`],
+      evidence: testCase.evidence.map((evidence) => `${evidence} artifact id`),
     })),
     privacy: {
       includesTypedContent: false,
@@ -145,6 +148,29 @@ describe("Windows MVP QA report evaluation", () => {
       id: "removeUnknownCase",
       action: "remove or replace the unknown QA case id",
       caseId: "NOPE-999",
+    });
+  });
+
+  test("rejects pass results that omit planned evidence items", () => {
+    const report = passingReport();
+    replaceResult(report, "WIN-006", {
+      caseId: "WIN-006",
+      result: "pass",
+      evidence: ["Diagnostics support bundle after resume artifact id"],
+    });
+    const evaluation = evaluateWindowsMvpQaReport(report);
+
+    expect(evaluation.ready).toBe(false);
+    expect(evaluation.checks.find((check) => check.id === "result:WIN-006")).toMatchObject({
+      status: "invalid",
+      detail: "passRequiresPlannedEvidence",
+      missingEvidence: ["Windows MVP soak report with stuckInputSuspicions equal to 0"],
+    });
+    expect(evaluation.nextActions).toContainEqual({
+      id: "addPlannedEvidence",
+      action: "add sanitized evidence for every planned QA evidence item",
+      caseId: "WIN-006",
+      missingEvidence: ["Windows MVP soak report with stuckInputSuspicions equal to 0"],
     });
   });
 
@@ -398,7 +424,10 @@ describe("Windows MVP QA report evaluation", () => {
     const updatedReport = updateWindowsMvpQaReportResult(template, {
       caseId: "WIN-006",
       result: "pass",
-      evidence: ["WIN-006 support bundle artifact id"],
+      evidence: [
+        "Diagnostics support bundle after resume artifact id",
+        "Windows MVP soak report with stuckInputSuspicions equal to 0 artifact id",
+      ],
       executedAt: "2026-06-20T01:02:03.004Z",
       sourceOs: "Windows 11",
       targetOs: "Windows 11",
@@ -417,7 +446,10 @@ describe("Windows MVP QA report evaluation", () => {
     expect(updatedReport.results.find((result) => result.caseId === "WIN-006")).toEqual({
       caseId: "WIN-006",
       result: "pass",
-      evidence: ["WIN-006 support bundle artifact id"],
+      evidence: [
+        "Diagnostics support bundle after resume artifact id",
+        "Windows MVP soak report with stuckInputSuspicions equal to 0 artifact id",
+      ],
     });
     expect(updatedEvaluation.checks.find((check) => check.id === "result:WIN-006")).toMatchObject({
       status: "pass",
@@ -453,6 +485,15 @@ describe("Windows MVP QA report evaluation", () => {
         evidence: ["artifact"],
       }),
     ).toThrow("unknown Windows MVP QA case id");
+    expect(() =>
+      updateWindowsMvpQaReportResult(template, {
+        caseId: "WIN-006",
+        result: "pass",
+        evidence: ["Diagnostics support bundle after resume artifact id"],
+      }),
+    ).toThrow(
+      "--result pass requires planned evidence for WIN-006: Windows MVP soak report with stuckInputSuspicions equal to 0",
+    );
     expect(() =>
       updateWindowsMvpQaReportResult(template, {
         caseId: "WIN-006",

@@ -10,7 +10,7 @@ import {
 import { evaluateUpdaterConfigPreflight } from "../scripts/smoke-updater-config-preflight.mjs";
 import {
   WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
-  listWindowsMvpQaCaseIds,
+  buildWindowsMvpQaPlan,
 } from "../scripts/windows-mvp-qa-plan.mjs";
 import {
   WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION,
@@ -77,6 +77,8 @@ import {
 } from "../scripts/windows-mvp-release-resolved-evidence.mjs";
 
 function passingQaReport() {
+  const plan = buildWindowsMvpQaPlan();
+
   return {
     schemaVersion: WINDOWS_MVP_QA_REPORT_SCHEMA_VERSION,
     planSchemaVersion: WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
@@ -86,10 +88,10 @@ function passingQaReport() {
       targetOs: "Windows 11",
       hardware: "two physical Windows endpoints",
     },
-    results: listWindowsMvpQaCaseIds().map((caseId) => ({
-      caseId,
+    results: plan.cases.map((testCase) => ({
+      caseId: testCase.id,
       result: "pass",
-      evidence: [`${caseId} sanitized artifact id`],
+      evidence: testCase.evidence.map((evidence) => `${evidence} artifact id`),
     })),
     privacy: {
       includesTypedContent: false,
