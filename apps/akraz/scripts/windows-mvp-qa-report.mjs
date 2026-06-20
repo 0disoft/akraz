@@ -37,6 +37,7 @@ export function evaluateWindowsMvpQaReport(report, plan = buildWindowsMvpQaPlan(
     planSchemaVersion: WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
     ready: checks.every((check) => check.status === "pass") && summary.failed === 0,
     summary,
+    nextActions: buildWindowsMvpQaNextActions(checks),
     checks,
     privacy: {
       includesReportPayload: false,
@@ -513,6 +514,125 @@ function summarizeReportResults(report) {
   }
 
   return summary;
+}
+
+function buildWindowsMvpQaNextActions(checks) {
+  const actions = [];
+  const pushedActionKeys = new Set();
+
+  for (const check of checks) {
+    const action = buildWindowsMvpQaNextAction(check);
+    if (!action) {
+      continue;
+    }
+
+    const actionKey = `${action.id}:${action.caseId ?? ""}:${action.action}`;
+    if (pushedActionKeys.has(actionKey)) {
+      continue;
+    }
+
+    actions.push(action);
+    pushedActionKeys.add(actionKey);
+  }
+
+  return actions;
+}
+
+function buildWindowsMvpQaNextAction(check) {
+  if (!check || check.status === "pass") {
+    return undefined;
+  }
+
+  switch (check.detail) {
+    case "executedAtMustBeStrictIsoUtc":
+      return {
+        id: "setExecutionTimestamp",
+        action: "set executedAt to a strict ISO UTC timestamp with milliseconds",
+      };
+    case "environmentMissing":
+    case "environmentFieldsMissing":
+      return {
+        id: "setEnvironment",
+        action: "record sourceOs, targetOs, and hardware without local paths or secrets",
+        fields: check.fields ?? ["sourceOs", "targetOs", "hardware"],
+      };
+    case "environmentContainsSensitiveOrLocalPathData":
+      return {
+        id: "sanitizeEnvironment",
+        action: "replace environment values that contain typed content, secrets, or local paths",
+      };
+    case "privacyFlagsMustBeFalse":
+      return {
+        id: "sanitizePrivacy",
+        action: "set every privacy flag to false after removing private report data",
+        flags: check.flags ?? [],
+      };
+    case "resultsMissing":
+      return {
+        id: "addResults",
+        action: "add QA results for every release-blocking Windows MVP case",
+      };
+    case "caseIdMissing":
+      return {
+        id: "fixResultCaseId",
+        action: "set a valid caseId on every QA result entry",
+      };
+    case "unknownCaseId":
+      return {
+        id: "removeUnknownCase",
+        action: "remove or replace the unknown QA case id",
+        caseId: check.caseId,
+      };
+    case "duplicateCaseIds":
+      return {
+        id: "dedupeResults",
+        action: "keep exactly one result per QA case id",
+        caseIds: check.caseIds ?? [],
+      };
+    case "releaseBlockingCasesMissing":
+      return {
+        id: "addReleaseBlockingResults",
+        action: "add results for every missing release-blocking QA case",
+        caseIds: check.caseIds ?? [],
+      };
+    case "unsupportedResultStatus":
+      return {
+        id: "fixResultStatus",
+        action: "set result to pass, fail, blocked, or skipped",
+        caseId: check.caseId,
+      };
+    case "passRequiresEvidence":
+      return {
+        id: "addPassEvidence",
+        action: "add sanitized evidence before marking the QA case as pass",
+        caseId: check.caseId,
+      };
+    case "nonPassRequiresReason":
+      return {
+        id: "addNonPassReason",
+        action: "add a reason for each failed or blocked QA case",
+        caseId: check.caseId,
+      };
+    case "evidenceContainsSensitiveOrLocalPathData":
+      return {
+        id: "sanitizeEvidence",
+        action:
+          "replace evidence or reason values that contain typed content, secrets, or local paths",
+        caseId: check.caseId,
+      };
+    case "caseNotPassed":
+      return {
+        id: "rerunOrResolveCase",
+        action: "rerun the QA case or resolve the blocker before release",
+        caseId: check.caseId,
+      };
+    default:
+      return {
+        id: "reviewQaReportCheck",
+        action: "review the failing QA report check",
+        checkId: check.id,
+      };
+  }
 }
 
 function hasEvidence(result) {

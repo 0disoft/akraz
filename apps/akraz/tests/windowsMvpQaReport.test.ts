@@ -52,6 +52,7 @@ describe("Windows MVP QA report evaluation", () => {
       blocked: 0,
       skipped: 0,
     });
+    expect(evaluation.nextActions).toEqual([]);
     expect(evaluation.checks.every((check) => check.status === "pass")).toBe(true);
     expect(evaluation.privacy).toEqual({
       includesReportPayload: false,
@@ -82,6 +83,18 @@ describe("Windows MVP QA report evaluation", () => {
         caseIds: ["WIN-007", "I18N-001", "I18N-004", "REL-001"],
       },
     );
+    expect(evaluation.nextActions).toEqual([
+      {
+        id: "dedupeResults",
+        action: "keep exactly one result per QA case id",
+        caseIds: ["WIN-006"],
+      },
+      {
+        id: "addReleaseBlockingResults",
+        action: "add results for every missing release-blocking QA case",
+        caseIds: ["WIN-007", "I18N-001", "I18N-004", "REL-001"],
+      },
+    ]);
     expect(exitCodeForWindowsMvpQaReport(evaluation)).toBe(1);
   });
 
@@ -101,6 +114,16 @@ describe("Windows MVP QA report evaluation", () => {
     expect(evaluation.checks.find((check) => check.id === "result:NOPE-999")).toMatchObject({
       status: "invalid",
       detail: "unknownCaseId",
+    });
+    expect(evaluation.nextActions).toContainEqual({
+      id: "addPassEvidence",
+      action: "add sanitized evidence before marking the QA case as pass",
+      caseId: "WIN-006",
+    });
+    expect(evaluation.nextActions).toContainEqual({
+      id: "removeUnknownCase",
+      action: "remove or replace the unknown QA case id",
+      caseId: "NOPE-999",
     });
   });
 
@@ -128,12 +151,26 @@ describe("Windows MVP QA report evaluation", () => {
       status: "invalid",
       detail: "caseNotPassed",
     });
+    expect(blockedEvaluation.nextActions).toEqual([
+      {
+        id: "rerunOrResolveCase",
+        action: "rerun the QA case or resolve the blocker before release",
+        caseId: "WIN-007",
+      },
+    ]);
     expect(
       missingReasonEvaluation.checks.find((check) => check.id === "result:I18N-001"),
     ).toMatchObject({
       status: "invalid",
       detail: "nonPassRequiresReason",
     });
+    expect(missingReasonEvaluation.nextActions).toEqual([
+      {
+        id: "addNonPassReason",
+        action: "add a reason for each failed or blocked QA case",
+        caseId: "I18N-001",
+      },
+    ]);
   });
 
   test("rejects privacy flags and sensitive evidence payloads", () => {
@@ -159,6 +196,17 @@ describe("Windows MVP QA report evaluation", () => {
     ).toMatchObject({
       status: "invalid",
       detail: "evidenceContainsSensitiveOrLocalPathData",
+    });
+    expect(privateEvaluation.nextActions).toContainEqual({
+      id: "sanitizePrivacy",
+      action: "set every privacy flag to false after removing private report data",
+      flags: ["includesFullFilePaths"],
+    });
+    expect(privateEvaluation.nextActions).toContainEqual({
+      id: "sanitizeEvidence",
+      action:
+        "replace evidence or reason values that contain typed content, secrets, or local paths",
+      caseId: "WIN-006",
     });
   });
 
@@ -216,6 +264,15 @@ describe("Windows MVP QA report evaluation", () => {
     expect(evaluation.checks.find((check) => check.id === "executionMetadata")).toMatchObject({
       status: "invalid",
       detail: "executedAtMustBeStrictIsoUtc",
+    });
+    expect(evaluation.nextActions).toContainEqual({
+      id: "setExecutionTimestamp",
+      action: "set executedAt to a strict ISO UTC timestamp with milliseconds",
+    });
+    expect(evaluation.nextActions).toContainEqual({
+      id: "rerunOrResolveCase",
+      action: "rerun the QA case or resolve the blocker before release",
+      caseId: "WIN-006",
     });
   });
 
@@ -286,6 +343,25 @@ describe("Windows MVP QA report evaluation", () => {
       status: "invalid",
       detail: "environmentContainsSensitiveOrLocalPathData",
     });
+    expect(missingMetadataEvaluation.nextActions).toEqual([
+      {
+        id: "setEnvironment",
+        action: "record sourceOs, targetOs, and hardware without local paths or secrets",
+        fields: ["sourceOs", "targetOs", "hardware"],
+      },
+    ]);
+    expect(invalidTimestampEvaluation.nextActions).toEqual([
+      {
+        id: "setExecutionTimestamp",
+        action: "set executedAt to a strict ISO UTC timestamp with milliseconds",
+      },
+    ]);
+    expect(unsafeEnvironmentEvaluation.nextActions).toEqual([
+      {
+        id: "sanitizeEnvironment",
+        action: "replace environment values that contain typed content, secrets, or local paths",
+      },
+    ]);
   });
 
   test("updates one QA result without hand-editing the report JSON", () => {
