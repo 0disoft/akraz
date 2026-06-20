@@ -138,17 +138,25 @@ export function mergeSoakMetrics(target, source) {
 }
 
 export function parseLastJsonObject(output) {
-  const lines = String(output ?? "").split(/\r?\n/);
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index].trim();
-    if (!line.startsWith("{")) {
-      continue;
-    }
-
-    try {
-      return JSON.parse(line);
-    } catch {
-      continue;
+  const text = String(output ?? "");
+  for (
+    let endIndex = text.lastIndexOf("}");
+    endIndex !== -1;
+    endIndex = text.lastIndexOf("}", endIndex - 1)
+  ) {
+    for (
+      let startIndex = text.lastIndexOf("{", endIndex);
+      startIndex !== -1;
+      startIndex = text.lastIndexOf("{", startIndex - 1)
+    ) {
+      try {
+        const value = JSON.parse(text.slice(startIndex, endIndex + 1));
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+          return value;
+        }
+      } catch {
+        continue;
+      }
     }
   }
 

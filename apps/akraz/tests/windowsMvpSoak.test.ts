@@ -55,6 +55,29 @@ describe("Windows MVP soak reporting", () => {
     expect(report).toEqual({ final: true });
   });
 
+  test("extracts a pretty printed final JSON report from noisy scenario output", () => {
+    const finalReport = {
+      final: true,
+      nested: {
+        releaseAllCount: 1,
+      },
+      injectedInputs: [{ kind: "pointerMoved", deltaX: 8, deltaY: 2 }],
+    };
+    const report = parseLastJsonObject(
+      `first line\n{"old":true}\nScenario passed.\n${JSON.stringify(
+        finalReport,
+        null,
+        2,
+      )}\nWindows MVP soak passed.\n`,
+    );
+
+    expect(report).toEqual(finalReport);
+  });
+
+  test("returns undefined when scenario output has no JSON object", () => {
+    expect(parseLastJsonObject("first line\nScenario passed.\n")).toBeUndefined();
+  });
+
   test("turns transport smoke reports into stuck-input metrics", () => {
     const metrics = collectScenarioMetrics("loopback-transport", {
       commands: [
