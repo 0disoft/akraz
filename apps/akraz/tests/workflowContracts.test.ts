@@ -26,6 +26,11 @@ describe("GitHub Actions workflow contracts", () => {
     expect(report.workflowScripts).toContain("release:windows-mvp-evidence-sources");
     expect(report.workflowScripts).toContain("release:windows-mvp-resolved-evidence");
     expect(report.workflowScripts).toContain("smoke:windows-mvp-soak");
+    expect(report.checks.find((check) => check.id === "smokeWorkflowCoverage")).toMatchObject({
+      status: "pass",
+      workflowFile: "check.yml",
+      soakReportPath: "apps/akraz/reports/windows-mvp-soak-smoke.json",
+    });
     expect(
       report.checks.find((check) => check.id === "releaseEvidenceSourcesWiring"),
     ).toMatchObject({
@@ -287,6 +292,109 @@ describe("GitHub Actions workflow contracts", () => {
         status: "invalid",
         detail: "releaseEvidenceSourcesWiringDrifted",
         missingSnippets: ["resolvedEvidenceCommand"],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects smoke workflow drift when required runtime smoke scripts are removed", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-smoke-workflow-contracts-"));
+
+    try {
+      writeFileSync(
+        join(tempDirectory, "package.json"),
+        readFileSync("package.json", "utf8"),
+        "utf8",
+      );
+      mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
+      for (const workflowFile of [
+        "windows-mvp-qa.yml",
+        "windows-mvp-release.yml",
+        "windows-mvp-soak.yml",
+      ]) {
+        writeFileSync(
+          join(tempDirectory, ".github", "workflows", workflowFile),
+          readFileSync(join(".github", "workflows", workflowFile), "utf8"),
+          "utf8",
+        );
+      }
+
+      const checkWorkflowWithoutPeerSessionSmoke = readFileSync(
+        join(".github", "workflows", "check.yml"),
+        "utf8",
+      ).replace("      - run: bun run smoke:peer-session\n", "");
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "check.yml"),
+        checkWorkflowWithoutPeerSessionSmoke,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "smokeWorkflowCoverage")).toMatchObject({
+        status: "invalid",
+        detail: "smokeWorkflowCoverageDrifted",
+        missingScripts: ["smoke:peer-session"],
+        missingSnippets: [],
+      });
+      expect(report.nextActions).toContainEqual({
+        id: "syncSmokeWorkflowCoverage",
+        action: "restore the Windows smoke workflow scripts and soak report artifact wiring",
+        workflowFile: "check.yml",
+        missingScripts: ["smoke:peer-session"],
+        missingSnippets: [],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects smoke workflow drift when soak evidence is not uploaded", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-smoke-soak-contracts-"));
+
+    try {
+      writeFileSync(
+        join(tempDirectory, "package.json"),
+        readFileSync("package.json", "utf8"),
+        "utf8",
+      );
+      mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
+      for (const workflowFile of [
+        "windows-mvp-qa.yml",
+        "windows-mvp-release.yml",
+        "windows-mvp-soak.yml",
+      ]) {
+        writeFileSync(
+          join(tempDirectory, ".github", "workflows", workflowFile),
+          readFileSync(join(".github", "workflows", workflowFile), "utf8"),
+          "utf8",
+        );
+      }
+
+      const checkWorkflowWithoutSoakUpload = readFileSync(
+        join(".github", "workflows", "check.yml"),
+        "utf8",
+      )
+        .replace(" --report-file reports/windows-mvp-soak-smoke.json", "")
+        .replace("          path: apps/akraz/reports/windows-mvp-soak-smoke.json\n", "");
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "check.yml"),
+        checkWorkflowWithoutSoakUpload,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "smokeWorkflowCoverage")).toMatchObject({
+        status: "invalid",
+        detail: "smokeWorkflowCoverageDrifted",
+        missingScripts: [],
+        missingSnippets: ["smokeSoakReportFile", "smokeSoakUploadPath"],
       });
       expect(exitCodeForWorkflowContracts(report)).toBe(1);
     } finally {

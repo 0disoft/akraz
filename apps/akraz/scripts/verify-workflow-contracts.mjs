@@ -26,6 +26,18 @@ const RESOLVED_EVIDENCE_COMMAND_SNIPPET = [
   '            --qa-report-file "$qa_report_file" \\',
   '            --soak-report-file "$soak_report_file"',
 ].join("\n");
+const REQUIRED_SMOKE_WORKFLOW_SCRIPTS = [
+  "smoke:loopback-transport",
+  "smoke:tcp-transport",
+  "smoke:peer-session",
+  "smoke:peer-session-executor",
+  "smoke:session-connect-lifecycle",
+  "smoke:diagnostics-snapshot",
+  "smoke:daemon-lifecycle",
+  "smoke:settings-start",
+  "smoke:windows-mvp-soak",
+];
+const SMOKE_SOAK_REPORT_PATH = "apps/akraz/reports/windows-mvp-soak-smoke.json";
 
 export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoot()) {
   const rootPackage = readJsonFile(join(workspaceRoot, "package.json"));
@@ -40,6 +52,7 @@ export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoo
     evaluateReleaseWorkflowFile(workflows),
     evaluateReleaseArtifactContract(workflows),
     evaluateReleaseEvidenceSourcesWiring(workflows),
+    evaluateSmokeWorkflowCoverage(workflows),
   ];
 
   return {
@@ -316,6 +329,82 @@ function evaluateReleaseEvidenceSourcesWiring(workflows) {
   };
 }
 
+function evaluateSmokeWorkflowCoverage(workflows) {
+  const checkWorkflow = workflows.find((workflow) => workflow.name === "check.yml");
+  if (!checkWorkflow) {
+    return {
+      id: "smokeWorkflowCoverage",
+      status: "missing",
+      detail: "checkWorkflowMissing",
+      workflowFile: "check.yml",
+      requiredScripts: REQUIRED_SMOKE_WORKFLOW_SCRIPTS,
+    };
+  }
+
+  const workflowScripts = uniqueWorkflowScripts([checkWorkflow]);
+  const missingScripts = REQUIRED_SMOKE_WORKFLOW_SCRIPTS.filter(
+    (scriptName) => !workflowScripts.includes(scriptName),
+  );
+  const requiredSnippets = [
+    {
+      id: "smokeNeedsRust",
+      snippet: "      - rust",
+    },
+    {
+      id: "smokeNeedsFrontend",
+      snippet: "      - frontend",
+    },
+    {
+      id: "smokeRunsOnWindows",
+      snippet: "runs-on: windows-latest",
+    },
+    {
+      id: "smokeSoakDuration",
+      snippet: "--duration-ms 1",
+    },
+    {
+      id: "smokeSoakMaxCycles",
+      snippet: "--max-cycles 1",
+    },
+    {
+      id: "smokeSoakReportFile",
+      snippet: "--report-file reports/windows-mvp-soak-smoke.json",
+    },
+    {
+      id: "smokeSoakUploadArtifact",
+      snippet: "name: windows-mvp-soak-smoke-report",
+    },
+    {
+      id: "smokeSoakUploadPath",
+      snippet: `path: ${SMOKE_SOAK_REPORT_PATH}`,
+    },
+  ];
+  const missingSnippets = requiredSnippets
+    .filter((requirement) => !checkWorkflow.source.includes(requirement.snippet))
+    .map((requirement) => requirement.id);
+
+  if (missingScripts.length === 0 && missingSnippets.length === 0) {
+    return {
+      id: "smokeWorkflowCoverage",
+      status: "pass",
+      workflowFile: "check.yml",
+      requiredScripts: REQUIRED_SMOKE_WORKFLOW_SCRIPTS,
+      soakReportPath: SMOKE_SOAK_REPORT_PATH,
+    };
+  }
+
+  return {
+    id: "smokeWorkflowCoverage",
+    status: "invalid",
+    detail: "smokeWorkflowCoverageDrifted",
+    workflowFile: "check.yml",
+    missingScripts,
+    missingSnippets,
+    requiredScripts: REQUIRED_SMOKE_WORKFLOW_SCRIPTS,
+    soakReportPath: SMOKE_SOAK_REPORT_PATH,
+  };
+}
+
 function buildNextActions(checks) {
   return checks.flatMap((check) => {
     if (check.status === "pass") {
@@ -372,6 +461,16 @@ function buildNextActions(checks) {
             id: "syncReleaseEvidenceSourcesWiring",
             action: "wire the release evidence source manifest generation into the bundle command",
             workflowFile: check.workflowFile,
+            missingSnippets: check.missingSnippets,
+          },
+        ];
+      case "smokeWorkflowCoverageDrifted":
+        return [
+          {
+            id: "syncSmokeWorkflowCoverage",
+            action: "restore the Windows smoke workflow scripts and soak report artifact wiring",
+            workflowFile: check.workflowFile,
+            missingScripts: check.missingScripts,
             missingSnippets: check.missingSnippets,
           },
         ];
