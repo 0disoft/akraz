@@ -658,6 +658,103 @@ describe("Windows MVP release gate", () => {
     }
   });
 
+  test("writes release bundle files through the app package script", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-bundle-cli-"));
+    const outDir = join(tempDir, "bundle");
+    const qaReportFile = join(tempDir, "qa-report.json");
+    const soakReportFile = join(tempDir, "soak-report.json");
+    const signingFile = join(tempDir, "signing.json");
+    const updaterFile = join(tempDir, "updater.json");
+    const evidenceSourcesFile = join(tempDir, "evidence-sources.json");
+
+    try {
+      writeJson(
+        evidenceSourcesFile,
+        buildWindowsMvpReleaseEvidenceSourcesReport({
+          sourceRunId: "27856073522",
+          manifestWritten: true,
+          dispatchInputsWritten: true,
+        }),
+      );
+      writeJson(qaReportFile, passingQaReport());
+      writeJson(soakReportFile, passingSoakReport());
+      writeJson(signingFile, passingSigningPreflight());
+      writeJson(updaterFile, passingUpdaterConfigPreflight());
+
+      const result = runAppPackageScript("release:windows-mvp-bundle", [
+        "--evidence-sources-file",
+        evidenceSourcesFile,
+        "--qa-report-file",
+        qaReportFile,
+        "--soak-report-file",
+        soakReportFile,
+        "--signing-preflight-file",
+        signingFile,
+        "--updater-config-preflight-file",
+        updaterFile,
+        "--out-dir",
+        outDir,
+      ]);
+
+      expect(result.status).toBe(0);
+
+      const report = JSON.parse(result.stdout);
+      const manifestPath = join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.manifest);
+      const gatePath = join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.releaseGate);
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      const gateReport = JSON.parse(readFileSync(gatePath, "utf8"));
+      const formatted = JSON.stringify(report);
+
+      expect(report).toMatchObject({
+        schemaVersion: WINDOWS_MVP_RELEASE_BUNDLE_SCHEMA_VERSION,
+        releaseTarget: "Windows MVP alpha",
+        ready: true,
+        releaseGateReady: true,
+        bundleFiles: {
+          manifest: WINDOWS_MVP_RELEASE_BUNDLE_FILES.manifest,
+          releaseGate: WINDOWS_MVP_RELEASE_BUNDLE_FILES.releaseGate,
+          evidenceSources: WINDOWS_MVP_RELEASE_BUNDLE_FILES.evidenceSources,
+        },
+        privacy: {
+          includesQaReportPayload: false,
+          includesSecretValues: false,
+          includesFullFilePaths: false,
+          includesEndpointValues: false,
+          includesSourceEvidencePaths: false,
+        },
+      });
+      expect(report.artifacts.every((artifact) => artifact.included)).toBe(true);
+      expect(report.checks.every((check) => check.status === "pass")).toBe(true);
+      expect(report.nextActions).toEqual([]);
+      expect(manifest).toEqual(report);
+      expect(gateReport).toMatchObject({
+        schemaVersion: WINDOWS_MVP_RELEASE_GATE_SCHEMA_VERSION,
+        ready: true,
+      });
+      expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.evidenceSources))).toBe(true);
+      expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.qaReport))).toBe(true);
+      expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.soakReport))).toBe(true);
+      expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.signingPreflight))).toBe(
+        true,
+      );
+      expect(
+        existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.updaterConfigPreflight)),
+      ).toBe(true);
+
+      const integrityReport = buildWindowsMvpReleaseBundleArtifactIntegrityReport(outDir);
+      expect(integrityReport.ready).toBe(true);
+      expect(integrityReport.checks.every((check) => check.status === "pass")).toBe(true);
+      expect(result.stdout.endsWith("\n")).toBe(true);
+      expect(readFileSync(manifestPath, "utf8").endsWith("\n")).toBe(true);
+      expect(readFileSync(gatePath, "utf8").endsWith("\n")).toBe(true);
+      expect(formatted).not.toContain(tempDir);
+      expect(formatted).not.toContain("super-secret");
+      expect(formatted).not.toContain("updates.example.com");
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
   test("rejects a release bundle directory with missing or stale canonical artifacts", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-bundle-integrity-"));
     const outDir = join(tempDir, "bundle");
