@@ -62,6 +62,7 @@ import {
   writeWindowsMvpReleaseWorkflowInputsFile,
 } from "../scripts/windows-mvp-release-workflow-inputs.mjs";
 import {
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS,
   WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
   WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES,
   buildWindowsMvpReleaseEvidenceSourcesReport,
@@ -1663,6 +1664,69 @@ describe("Windows MVP release gate", () => {
         evidenceSourceId: "qaReport",
         action: "regenerate the Windows MVP release evidence sources manifest",
         detail: "expectedFileNameDrift",
+      });
+      expect(formatted).not.toContain(tempDir);
+      expect(exitCodeForWindowsMvpReleaseResolvedEvidence(report)).toBe(1);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects resolved release evidence source bundle mapping drift before bundling", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-resolved-bundle-drift-"));
+    const evidenceSourcesFile = join(tempDir, "windows-mvp-release-evidence-sources.json");
+    const qaReportFile = join(tempDir, WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport);
+    const soakReportFile = join(tempDir, WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport);
+
+    try {
+      const evidenceSources = buildWindowsMvpReleaseEvidenceSourcesReport({
+        sourceRunId: "27856073522",
+        manifestWritten: true,
+        dispatchInputsWritten: true,
+      });
+      const qaSource = evidenceSources.sources.find((source) => source.id === "qaReport");
+      qaSource.bundle = {
+        ...qaSource.bundle,
+        artifactId: "qaEvidence",
+      };
+      writeJson(evidenceSourcesFile, evidenceSources);
+      writeJson(qaReportFile, passingQaReport());
+      writeJson(soakReportFile, passingSoakReport());
+
+      const report = buildWindowsMvpReleaseResolvedEvidenceReport({
+        evidenceSourcesFile,
+        qaReportFile,
+        soakReportFile,
+      });
+      const formatted = JSON.stringify(report);
+
+      expect(report.ready).toBe(false);
+      expect(report.resolvedFiles.find((file) => file.id === "qaReport")).toMatchObject({
+        status: "invalid",
+        detail: "bundleMappingDrift",
+        fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+        expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+        canonicalExpectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+        bundle: {
+          artifactId: "qaEvidence",
+          releaseGateCheckId: "qaReport",
+          fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+        },
+        canonicalBundle: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS.qaReport,
+      });
+      expect(report.checks.find((check) => check.id === "resolvedEvidenceFileNames")).toMatchObject(
+        {
+          status: "invalid",
+          detail: "resolvedEvidenceFileNamesNotReady",
+          missingFileIds: [],
+          invalidFileIds: ["qaReport"],
+        },
+      );
+      expect(report.nextActions).toContainEqual({
+        id: "regenerateQaReportEvidenceSource",
+        evidenceSourceId: "qaReport",
+        action: "regenerate the Windows MVP release evidence sources manifest",
+        detail: "bundleMappingDrift",
       });
       expect(formatted).not.toContain(tempDir);
       expect(exitCodeForWindowsMvpReleaseResolvedEvidence(report)).toBe(1);

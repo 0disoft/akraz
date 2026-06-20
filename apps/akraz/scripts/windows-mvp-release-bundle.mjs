@@ -18,8 +18,8 @@ import {
   exitCodeForWindowsMvpReleaseGate,
 } from "./windows-mvp-release-gate.mjs";
 import {
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS,
   WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
-  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES,
 } from "./windows-mvp-release-evidence-sources.mjs";
 
 export const WINDOWS_MVP_RELEASE_BUNDLE_SCHEMA_VERSION = "akraz.windowsMvpReleaseBundle/v1";
@@ -68,22 +68,15 @@ const OPTIONAL_EVIDENCE_OPTIONS = [
     source: "evidenceSourcesFile",
     fileName: WINDOWS_MVP_RELEASE_BUNDLE_FILES.evidenceSources,
     expectedSchemaVersion: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
-    expectedSourceBundleMappings: [
-      {
-        id: "qaReport",
-        artifactId: "qaReport",
-        releaseGateCheckId: "qaReport",
-        fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
-      },
-      {
-        id: "soakReport",
-        artifactId: "soakReport",
-        releaseGateCheckId: "soakReport",
-        fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
-      },
-    ],
+    expectedSourceBundleMappings: buildExpectedSourceBundleMappings(),
   },
 ];
+
+function buildExpectedSourceBundleMappings() {
+  return Object.entries(WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS).map(([id, bundle]) =>
+    Object.assign({ id }, bundle),
+  );
+}
 
 export function buildWindowsMvpReleaseBundleReport(
   options = {},

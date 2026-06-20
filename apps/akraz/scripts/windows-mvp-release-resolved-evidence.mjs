@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 
 import {
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS,
   WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES,
   WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
 } from "./windows-mvp-release-evidence-sources.mjs";
@@ -15,12 +16,14 @@ const RESOLVED_EVIDENCE_FILES = [
     optionKey: "qaReportFile",
     flag: "--qa-report-file",
     expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+    expectedBundle: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS.qaReport,
   },
   {
     id: "soakReport",
     optionKey: "soakReportFile",
     flag: "--soak-report-file",
     expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+    expectedBundle: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS.soakReport,
   },
 ];
 
@@ -98,12 +101,15 @@ function buildResolvedEvidenceFile(definition, options, evidenceSources) {
   const actualFileName = fileProvided ? basename(filePath) : null;
   const expectedFileName =
     typeof source?.expectedFileName === "string" ? source.expectedFileName : null;
+  const bundle = readEvidenceSourceBundle(source);
   const status = resolvedEvidenceFileStatus(
     fileProvided,
     source,
     actualFileName,
     expectedFileName,
     definition.expectedFileName,
+    bundle,
+    definition.expectedBundle,
   );
 
   return {
@@ -113,6 +119,8 @@ function buildResolvedEvidenceFile(definition, options, evidenceSources) {
     fileName: actualFileName,
     expectedFileName,
     canonicalExpectedFileName: definition.expectedFileName,
+    bundle,
+    canonicalBundle: definition.expectedBundle,
     status: status.status,
     ...(status.detail ? { detail: status.detail } : {}),
   };
@@ -124,6 +132,8 @@ function resolvedEvidenceFileStatus(
   actualFileName,
   expectedFileName,
   canonicalExpectedFileName,
+  bundle,
+  canonicalBundle,
 ) {
   if (!fileProvided) {
     return {
@@ -146,6 +156,13 @@ function resolvedEvidenceFileStatus(
     };
   }
 
+  if (!evidenceSourceBundleMatches(bundle, canonicalBundle)) {
+    return {
+      status: "invalid",
+      detail: "bundleMappingDrift",
+    };
+  }
+
   if (actualFileName !== canonicalExpectedFileName) {
     return {
       status: "invalid",
@@ -156,6 +173,25 @@ function resolvedEvidenceFileStatus(
   return {
     status: "pass",
   };
+}
+
+function readEvidenceSourceBundle(source) {
+  return {
+    artifactId: typeof source?.bundle?.artifactId === "string" ? source.bundle.artifactId : null,
+    releaseGateCheckId:
+      typeof source?.bundle?.releaseGateCheckId === "string"
+        ? source.bundle.releaseGateCheckId
+        : null,
+    fileName: typeof source?.bundle?.fileName === "string" ? source.bundle.fileName : null,
+  };
+}
+
+function evidenceSourceBundleMatches(bundle, canonicalBundle) {
+  return (
+    bundle.artifactId === canonicalBundle.artifactId &&
+    bundle.releaseGateCheckId === canonicalBundle.releaseGateCheckId &&
+    bundle.fileName === canonicalBundle.fileName
+  );
 }
 
 function evaluateEvidenceSourcesManifest(evidenceSourcesRead) {
@@ -259,7 +295,7 @@ function buildNextActions(checks, resolvedFiles) {
       return resolvedFiles
         .filter((file) => file.status !== "pass")
         .map((file) => {
-          if (file.detail === "expectedFileNameDrift") {
+          if (file.detail === "expectedFileNameDrift" || file.detail === "bundleMappingDrift") {
             return {
               id: `regenerate${capitalize(file.id)}EvidenceSource`,
               evidenceSourceId: file.id,

@@ -25,6 +25,19 @@ export const WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES = {
   soakReport: "windows-mvp-soak-report.json",
 };
 
+export const WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS = {
+  qaReport: {
+    artifactId: "qaReport",
+    releaseGateCheckId: "qaReport",
+    fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+  },
+  soakReport: {
+    artifactId: "soakReport",
+    releaseGateCheckId: "soakReport",
+    fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+  },
+};
+
 export function buildWindowsMvpReleaseEvidenceSourcesReport(options = {}) {
   const workflowInputsReport = buildWindowsMvpReleaseWorkflowInputsReport(options);
   const sources = buildEvidenceSources(workflowInputsReport);
@@ -125,22 +138,14 @@ function buildEvidenceSources(workflowInputsReport) {
       sourceRunId: workflowInputsReport.resolvedRunIds.qa,
       artifactName: inputs.qa_report_artifact,
       expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
-      bundle: {
-        artifactId: "qaReport",
-        releaseGateCheckId: "qaReport",
-        fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
-      },
+      bundle: { ...WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS.qaReport },
     },
     {
       id: "soakReport",
       sourceRunId: workflowInputsReport.resolvedRunIds.soak,
       artifactName: inputs.soak_report_artifact,
       expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
-      bundle: {
-        artifactId: "soakReport",
-        releaseGateCheckId: "soakReport",
-        fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
-      },
+      bundle: { ...WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS.soakReport },
     },
   ];
 }
