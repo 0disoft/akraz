@@ -1617,6 +1617,60 @@ describe("Windows MVP release gate", () => {
     }
   });
 
+  test("rejects resolved release evidence source filename drift before bundling", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-resolved-source-drift-"));
+    const evidenceSourcesFile = join(tempDir, "windows-mvp-release-evidence-sources.json");
+    const qaReportFile = join(tempDir, "qa-report.json");
+    const soakReportFile = join(tempDir, WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport);
+
+    try {
+      const evidenceSources = buildWindowsMvpReleaseEvidenceSourcesReport({
+        sourceRunId: "27856073522",
+        manifestWritten: true,
+        dispatchInputsWritten: true,
+      });
+      const qaSource = evidenceSources.sources.find((source) => source.id === "qaReport");
+      qaSource.expectedFileName = "qa-report.json";
+      writeJson(evidenceSourcesFile, evidenceSources);
+      writeJson(qaReportFile, passingQaReport());
+      writeJson(soakReportFile, passingSoakReport());
+
+      const report = buildWindowsMvpReleaseResolvedEvidenceReport({
+        evidenceSourcesFile,
+        qaReportFile,
+        soakReportFile,
+      });
+      const formatted = JSON.stringify(report);
+
+      expect(report.ready).toBe(false);
+      expect(report.resolvedFiles.find((file) => file.id === "qaReport")).toMatchObject({
+        status: "invalid",
+        detail: "expectedFileNameDrift",
+        fileName: "qa-report.json",
+        expectedFileName: "qa-report.json",
+        canonicalExpectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+      });
+      expect(report.checks.find((check) => check.id === "resolvedEvidenceFileNames")).toMatchObject(
+        {
+          status: "invalid",
+          detail: "resolvedEvidenceFileNamesNotReady",
+          missingFileIds: [],
+          invalidFileIds: ["qaReport"],
+        },
+      );
+      expect(report.nextActions).toContainEqual({
+        id: "regenerateQaReportEvidenceSource",
+        evidenceSourceId: "qaReport",
+        action: "regenerate the Windows MVP release evidence sources manifest",
+        detail: "expectedFileNameDrift",
+      });
+      expect(formatted).not.toContain(tempDir);
+      expect(exitCodeForWindowsMvpReleaseResolvedEvidence(report)).toBe(1);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
   test("writes release evidence sources and dispatch inputs from dedicated runs", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-evidence-sources-"));
     const manifestFile = join(tempDir, "nested", "release-evidence-sources.json");

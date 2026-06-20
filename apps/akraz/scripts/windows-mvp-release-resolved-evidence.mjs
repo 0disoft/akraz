@@ -1,7 +1,10 @@
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 
-import { WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION } from "./windows-mvp-release-evidence-sources.mjs";
+import {
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES,
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
+} from "./windows-mvp-release-evidence-sources.mjs";
 
 export const WINDOWS_MVP_RELEASE_RESOLVED_EVIDENCE_SCHEMA_VERSION =
   "akraz.windowsMvpReleaseResolvedEvidence/v1";
@@ -11,11 +14,13 @@ const RESOLVED_EVIDENCE_FILES = [
     id: "qaReport",
     optionKey: "qaReportFile",
     flag: "--qa-report-file",
+    expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
   },
   {
     id: "soakReport",
     optionKey: "soakReportFile",
     flag: "--soak-report-file",
+    expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
   },
 ];
 
@@ -93,7 +98,13 @@ function buildResolvedEvidenceFile(definition, options, evidenceSources) {
   const actualFileName = fileProvided ? basename(filePath) : null;
   const expectedFileName =
     typeof source?.expectedFileName === "string" ? source.expectedFileName : null;
-  const status = resolvedEvidenceFileStatus(fileProvided, source, actualFileName, expectedFileName);
+  const status = resolvedEvidenceFileStatus(
+    fileProvided,
+    source,
+    actualFileName,
+    expectedFileName,
+    definition.expectedFileName,
+  );
 
   return {
     id: definition.id,
@@ -101,12 +112,19 @@ function buildResolvedEvidenceFile(definition, options, evidenceSources) {
     fileProvided,
     fileName: actualFileName,
     expectedFileName,
+    canonicalExpectedFileName: definition.expectedFileName,
     status: status.status,
     ...(status.detail ? { detail: status.detail } : {}),
   };
 }
 
-function resolvedEvidenceFileStatus(fileProvided, source, actualFileName, expectedFileName) {
+function resolvedEvidenceFileStatus(
+  fileProvided,
+  source,
+  actualFileName,
+  expectedFileName,
+  canonicalExpectedFileName,
+) {
   if (!fileProvided) {
     return {
       status: "missing",
@@ -121,7 +139,14 @@ function resolvedEvidenceFileStatus(fileProvided, source, actualFileName, expect
     };
   }
 
-  if (!expectedFileName || actualFileName !== expectedFileName) {
+  if (expectedFileName !== canonicalExpectedFileName) {
+    return {
+      status: "invalid",
+      detail: "expectedFileNameDrift",
+    };
+  }
+
+  if (actualFileName !== canonicalExpectedFileName) {
     return {
       status: "invalid",
       detail: "fileNameMismatch",
@@ -233,12 +258,25 @@ function buildNextActions(checks, resolvedFiles) {
     if (check.id === "resolvedEvidenceFileNames") {
       return resolvedFiles
         .filter((file) => file.status !== "pass")
-        .map((file) => ({
-          id: `resolve${capitalize(file.id)}File`,
-          evidenceSourceId: file.id,
-          action: `download ${file.expectedFileName ?? file.id} as the expected release evidence JSON`,
-          detail: file.detail,
-        }));
+        .map((file) => {
+          if (file.detail === "expectedFileNameDrift") {
+            return {
+              id: `regenerate${capitalize(file.id)}EvidenceSource`,
+              evidenceSourceId: file.id,
+              action: "regenerate the Windows MVP release evidence sources manifest",
+              detail: file.detail,
+            };
+          }
+
+          return {
+            id: `resolve${capitalize(file.id)}File`,
+            evidenceSourceId: file.id,
+            action: `download ${
+              file.canonicalExpectedFileName ?? file.expectedFileName ?? file.id
+            } as the expected release evidence JSON`,
+            detail: file.detail,
+          };
+        });
     }
 
     return [
