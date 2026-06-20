@@ -1,0 +1,77 @@
+name: windows-mvp-soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Soak duration in minutes. The Windows MVP release gate requires at least 120."
+        required: true
+        type: string
+        default: "120"
+      max_cycles:
+        description: "Optional positive cycle cap for diagnostics. Leave blank for release evidence."
+        required: false
+        type: string
+        default: ""
+
+run-name: windows-mvp-soak ${{ inputs.duration_minutes }}m
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-mvp-soak-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - run: bun install --frozen-lockfile
+
+      - name: Run Windows MVP soak
+        shell: pwsh
+        env:
+          SOAK_DURATION_MINUTES: ${{ inputs.duration_minutes }}
+          SOAK_MAX_CYCLES: ${{ inputs.max_cycles }}
+        run: |
+          if ($env:SOAK_DURATION_MINUTES -notmatch '^[1-9][0-9]*$') {
+            throw "duration_minutes must be a positive integer"
+          }
+
+          $argsList = @(
+            "run",
+            "smoke:windows-mvp-soak",
+            "--",
+            "--duration-minutes",
+            $env:SOAK_DURATION_MINUTES,
+            "--report-file",
+            "reports/windows-mvp-soak-report.json"
+          )
+
+          if ($env:SOAK_MAX_CYCLES.Trim().Length -gt 0) {
+            if ($env:SOAK_MAX_CYCLES -notmatch '^[1-9][0-9]*$') {
+              throw "max_cycles must be blank or a positive integer"
+            }
+
+            $argsList += @("--max-cycles", $env:SOAK_MAX_CYCLES)
+          }
+
+          & bun @argsList
+
+      - name: Upload Windows MVP soak report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-mvp-soak-report
+          path: apps/akraz/reports/windows-mvp-soak-report.json
+          if-no-files-found: warn
+          retention-days: 14
