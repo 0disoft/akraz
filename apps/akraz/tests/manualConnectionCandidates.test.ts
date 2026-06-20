@@ -217,6 +217,32 @@ describe("manual connection candidates", () => {
     });
   });
 
+  test("carries registerable discovery documents without marking candidates ready", () => {
+    expect(
+      buildConnectionCandidates({
+        trustedPeers: [],
+        manualPeerAddresses: [],
+        discoveryCandidates: [
+          discoveryCandidate("new-peer", {
+            fingerprint: "AKRZ-new-peer",
+            peerDocumentJson: '{"kind":"akraz.peerIdentity"}',
+            trusted: false,
+          }),
+        ],
+        peerStatuses: [],
+        localDeviceId: "windows-desktop",
+        draftLocalDeviceId: "",
+      })[0],
+    ).toMatchObject({
+      peerId: "new-peer",
+      fingerprint: "AKRZ-new-peer",
+      peerDocumentJson: '{"kind":"akraz.peerIdentity"}',
+      trusted: false,
+      ready: false,
+      source: "discovery",
+    });
+  });
+
   test("marks connected discovery candidates as unavailable for another session", () => {
     expect(
       buildConnectionCandidates({

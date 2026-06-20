@@ -229,6 +229,7 @@ export interface SessionDiscoveryCandidate {
   peerId: string;
   displayName: string;
   fingerprint?: string;
+  peerDocumentJson?: string;
   trusted: boolean;
   address: string;
   buildVersion: string;

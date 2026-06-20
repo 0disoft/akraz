@@ -6,7 +6,7 @@ use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use akraz_identity::TrustedPeerIdentity;
+use akraz_identity::{PairingIdentityDocument, TrustedPeerIdentity};
 use akraz_protocol::CapabilityFlags;
 
 /// DNS-SD service type used by Akraz mDNS discovery.
@@ -17,6 +17,9 @@ pub const AKRAZ_DISCOVERY_TXT_VERSION: u16 = 1;
 
 const TXT_VERSION_KEY: &str = "v";
 const TXT_DEVICE_ID_KEY: &str = "device_id";
+const TXT_DISPLAY_NAME_KEY: &str = "display_name";
+const TXT_IDENTITY_PUBLIC_KEY_KEY: &str = "identity_public_key";
+const TXT_FINGERPRINT_KEY: &str = "fingerprint";
 const TXT_CAPABILITIES_KEY: &str = "caps";
 const TXT_BUILD_VERSION_KEY: &str = "build";
 
@@ -30,6 +33,9 @@ const CAPABILITY_SCREEN_LAYOUT: &str = "screen-layout";
 pub struct DiscoveryTxtRecord {
     pub version: u16,
     pub device_id: String,
+    pub display_name: Option<String>,
+    pub identity_public_key: Option<String>,
+    pub fingerprint: Option<String>,
     pub capabilities: CapabilityFlags,
     pub build_version: String,
 }
@@ -132,6 +138,7 @@ pub struct DiscoverySessionCandidate {
     pub peer_id: String,
     pub display_name: String,
     pub fingerprint: Option<String>,
+    pub peer_document_json: Option<String>,
     pub trusted: bool,
     pub address: SocketAddr,
     pub build_version: String,
@@ -210,18 +217,48 @@ fn discovery_session_candidate(
     let peer_id = peer.txt.device_id.clone();
     let trusted_peer = trusted_peers.get(peer_id.as_str()).copied();
     let address = peer.primary_socket_addr()?;
+    let display_name = trusted_peer
+        .map(|trusted| trusted.display_name().to_string())
+        .or_else(|| peer.txt.display_name.clone())
+        .unwrap_or_else(|| discovery_instance_label(&peer.instance_name));
+    let pairing_document = trusted_peer
+        .is_none()
+        .then(|| discovery_pairing_document(peer, &display_name))
+        .flatten();
+    let peer_document_json = pairing_document
+        .as_ref()
+        .and_then(|document| serde_json::to_string(document).ok());
 
     Some(DiscoverySessionCandidate {
         peer_id,
-        display_name: trusted_peer
-            .map(|trusted| trusted.display_name().to_string())
-            .unwrap_or_else(|| discovery_instance_label(&peer.instance_name)),
-        fingerprint: trusted_peer.map(|trusted| trusted.fingerprint().to_string()),
+        display_name,
+        fingerprint: trusted_peer
+            .map(|trusted| trusted.fingerprint().to_string())
+            .or_else(|| {
+                pairing_document
+                    .as_ref()
+                    .map(|document| document.fingerprint().to_string())
+            }),
+        peer_document_json,
         trusted: trusted_peer.is_some(),
         address,
         build_version: peer.txt.build_version.clone(),
         capabilities: peer.txt.capabilities,
     })
+}
+
+fn discovery_pairing_document(
+    peer: &DiscoveredPeer,
+    display_name: &str,
+) -> Option<PairingIdentityDocument> {
+    PairingIdentityDocument::from_public_wire_fields(
+        peer.txt.device_id.clone(),
+        display_name.trim(),
+        peer.txt.identity_public_key.as_deref()?,
+        peer.txt.fingerprint.as_deref()?,
+        peer.txt.capabilities,
+    )
+    .ok()
 }
 
 fn discovery_instance_label(instance_name: &str) -> String {
@@ -255,6 +292,24 @@ where
     Ok(DiscoveryTxtRecord {
         version,
         device_id: normalize_device_id(required_txt_field(&fields, TXT_DEVICE_ID_KEY)?)?,
+        display_name: optional_txt_field(&fields, TXT_DISPLAY_NAME_KEY)
+            .map(normalize_display_name)
+            .transpose()?
+            .filter(|value| !value.is_empty()),
+        identity_public_key: optional_txt_field(&fields, TXT_IDENTITY_PUBLIC_KEY_KEY)
+            .map(|value| {
+                normalize_no_space_token(value, |value, reason| {
+                    DiscoveryTxtError::InvalidIdentityPublicKey { value, reason }
+                })
+            })
+            .transpose()?,
+        fingerprint: optional_txt_field(&fields, TXT_FINGERPRINT_KEY)
+            .map(|value| {
+                normalize_no_space_token(value, |value, reason| {
+                    DiscoveryTxtError::InvalidFingerprint { value, reason }
+                })
+            })
+            .transpose()?,
         capabilities: parse_capabilities(required_txt_field(&fields, TXT_CAPABILITIES_KEY)?)?,
         build_version: normalize_build_version(required_txt_field(
             &fields,
@@ -265,7 +320,7 @@ where
 
 /// Build the DNS-SD TXT entries that advertise one local Akraz peer.
 pub fn build_discovery_txt_record(record: &DiscoveryTxtRecord) -> Vec<String> {
-    vec![
+    let mut entries = vec![
         format!("{TXT_VERSION_KEY}={}", record.version),
         format!("{TXT_DEVICE_ID_KEY}={}", record.device_id),
         format!(
@@ -273,7 +328,20 @@ pub fn build_discovery_txt_record(record: &DiscoveryTxtRecord) -> Vec<String> {
             capability_names(record.capabilities).join(",")
         ),
         format!("{TXT_BUILD_VERSION_KEY}={}", record.build_version),
-    ]
+    ];
+    if let Some(display_name) = &record.display_name {
+        entries.push(format!("{TXT_DISPLAY_NAME_KEY}={display_name}"));
+    }
+    if let Some(identity_public_key) = &record.identity_public_key {
+        entries.push(format!(
+            "{TXT_IDENTITY_PUBLIC_KEY_KEY}={identity_public_key}"
+        ));
+    }
+    if let Some(fingerprint) = &record.fingerprint {
+        entries.push(format!("{TXT_FINGERPRINT_KEY}={fingerprint}"));
+    }
+
+    entries
 }
 
 fn collect_txt_fields<I, S>(entries: I) -> Result<BTreeMap<String, String>, DiscoveryTxtError>
@@ -321,6 +389,13 @@ fn required_txt_field<'a>(
         .ok_or(DiscoveryTxtError::MissingField { key })
 }
 
+fn optional_txt_field<'a>(
+    fields: &'a BTreeMap<String, String>,
+    key: &'static str,
+) -> Option<&'a str> {
+    fields.get(key).map(String::as_str)
+}
+
 fn parse_discovery_version(value: &str) -> Result<u16, DiscoveryTxtError> {
     value
         .parse::<u16>()
@@ -350,6 +425,21 @@ fn normalize_build_version(value: &str) -> Result<String, DiscoveryTxtError> {
     normalize_no_space_token(value, |value, reason| {
         DiscoveryTxtError::InvalidBuildVersion { value, reason }
     })
+}
+
+fn normalize_display_name(value: &str) -> Result<String, DiscoveryTxtError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.chars().any(char::is_control) {
+        return Err(DiscoveryTxtError::InvalidDisplayName {
+            value: value.to_string(),
+            reason: "field cannot contain control characters",
+        });
+    }
+
+    Ok(value.to_string())
 }
 
 fn normalize_no_space_token(
@@ -434,6 +524,9 @@ pub enum DiscoveryTxtError {
     InvalidVersion { value: String },
     UnsupportedVersion { version: u16 },
     InvalidDeviceId { value: String, reason: &'static str },
+    InvalidDisplayName { value: String, reason: &'static str },
+    InvalidIdentityPublicKey { value: String, reason: &'static str },
+    InvalidFingerprint { value: String, reason: &'static str },
     InvalidBuildVersion { value: String, reason: &'static str },
     InvalidCapability { value: String },
     EmptyCapabilityList,
@@ -458,6 +551,24 @@ impl Display for DiscoveryTxtError {
             }
             Self::InvalidDeviceId { value, reason } => {
                 write!(formatter, "invalid discovery device_id {value:?}: {reason}")
+            }
+            Self::InvalidDisplayName { value, reason } => {
+                write!(
+                    formatter,
+                    "invalid discovery display_name {value:?}: {reason}"
+                )
+            }
+            Self::InvalidIdentityPublicKey { value, reason } => {
+                write!(
+                    formatter,
+                    "invalid discovery identity_public_key {value:?}: {reason}"
+                )
+            }
+            Self::InvalidFingerprint { value, reason } => {
+                write!(
+                    formatter,
+                    "invalid discovery fingerprint {value:?}: {reason}"
+                )
             }
             Self::InvalidBuildVersion { value, reason } => {
                 write!(formatter, "invalid discovery build {value:?}: {reason}")
@@ -514,6 +625,9 @@ impl Error for DiscoveryPeerRejectReason {}
 mod tests {
     use std::collections::BTreeSet;
 
+    use akraz_identity::{
+        DeviceIdentity, Ed25519IdentityKey, PairingIdentityDocument, fingerprint_for_public_key,
+    };
     use akraz_protocol::CapabilityFlags;
 
     use super::{
@@ -528,6 +642,9 @@ mod tests {
         DiscoveryTxtRecord {
             version: AKRAZ_DISCOVERY_TXT_VERSION,
             device_id: "linux-laptop".to_string(),
+            display_name: None,
+            identity_public_key: None,
+            fingerprint: None,
             capabilities: CapabilityFlags::POINTER
                 | CapabilityFlags::KEYBOARD
                 | CapabilityFlags::SCREEN_LAYOUT,
@@ -609,6 +726,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_optional_public_pairing_txt_fields() {
+        let document = public_pairing_document("linux-laptop", "Linux Laptop");
+        let record = parse_discovery_txt_record([
+            "v=1",
+            "device_id=linux-laptop",
+            "display_name=Linux Laptop",
+            &format!("identity_public_key={}", document.identity_public_key()),
+            &format!("fingerprint={}", document.fingerprint()),
+            "caps=pointer,keyboard",
+            "build=0.5.7",
+        ])
+        .expect("parse TXT record");
+
+        assert_eq!(record.display_name.as_deref(), Some("Linux Laptop"));
+        assert_eq!(
+            record.identity_public_key.as_deref(),
+            Some(document.identity_public_key())
+        );
+        assert_eq!(record.fingerprint.as_deref(), Some(document.fingerprint()));
+    }
+
+    #[test]
     fn builds_deterministic_txt_records_for_publishers() {
         assert_eq!(
             build_discovery_txt_record(&txt_record()),
@@ -617,6 +756,31 @@ mod tests {
                 "device_id=linux-laptop",
                 "caps=pointer,keyboard,screen-layout",
                 "build=0.5.7",
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_optional_public_pairing_txt_records_for_publishers() {
+        let document = public_pairing_document("linux-laptop", "Linux Laptop");
+        let record = DiscoveryTxtRecord {
+            display_name: Some("Linux Laptop".to_string()),
+            identity_public_key: Some(document.identity_public_key().to_string()),
+            fingerprint: Some(document.fingerprint().to_string()),
+            capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            ..txt_record()
+        };
+
+        assert_eq!(
+            build_discovery_txt_record(&record),
+            vec![
+                "v=1".to_string(),
+                "device_id=linux-laptop".to_string(),
+                "caps=pointer,keyboard".to_string(),
+                "build=0.5.7".to_string(),
+                "display_name=Linux Laptop".to_string(),
+                format!("identity_public_key={}", document.identity_public_key()),
+                format!("fingerprint={}", document.fingerprint()),
             ]
         );
     }
@@ -783,6 +947,7 @@ mod tests {
                 peer_id: "linux-laptop".to_string(),
                 display_name: "Linux Laptop".to_string(),
                 fingerprint: Some("AKRZ-TRUSTED".to_string()),
+                peer_document_json: None,
                 trusted: true,
                 address: "127.0.0.1:4455".parse().expect("candidate address"),
                 build_version: "0.5.7".to_string(),
@@ -810,11 +975,67 @@ mod tests {
                 peer_id: "new-laptop".to_string(),
                 display_name: "new-laptop".to_string(),
                 fingerprint: None,
+                peer_document_json: None,
                 trusted: false,
                 address: "127.0.0.1:4455".parse().expect("candidate address"),
                 build_version: "0.5.7".to_string(),
                 capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
             }]
         );
+    }
+
+    #[test]
+    fn builds_registerable_discovery_candidates_from_public_pairing_txt_fields() {
+        let document = public_pairing_document("new-laptop", "New Laptop");
+        let mut discovered = peer(
+            "new-laptop",
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+        discovered.txt.display_name = Some("New Laptop".to_string());
+        discovered.txt.identity_public_key = Some(document.identity_public_key().to_string());
+        discovered.txt.fingerprint = Some(document.fingerprint().to_string());
+
+        let candidates = build_discovery_session_candidates(
+            [&discovered],
+            &DiscoveryPeerFilter::default(),
+            Vec::<&akraz_identity::TrustedPeerIdentity>::new(),
+        );
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.display_name, "New Laptop");
+        assert_eq!(
+            candidate.fingerprint.as_deref(),
+            Some(document.fingerprint())
+        );
+        assert!(!candidate.trusted);
+        let peer_document_json = candidate
+            .peer_document_json
+            .as_deref()
+            .expect("peer document JSON");
+        let decoded: PairingIdentityDocument =
+            serde_json::from_str(peer_document_json).expect("candidate document JSON");
+        assert_eq!(decoded.device_id(), "new-laptop");
+        assert_eq!(decoded.display_name(), "New Laptop");
+        assert_eq!(
+            decoded.identity_public_key(),
+            document.identity_public_key()
+        );
+        assert_eq!(decoded.fingerprint(), document.fingerprint());
+    }
+
+    fn public_pairing_document(device_id: &str, display_name: &str) -> PairingIdentityDocument {
+        let secret_key = Ed25519IdentityKey::generate();
+        let public_key = secret_key.public_key_bytes();
+        let identity = DeviceIdentity::new(
+            device_id,
+            display_name,
+            public_key,
+            fingerprint_for_public_key(&public_key),
+        );
+        PairingIdentityDocument::from_device_identity(
+            &identity,
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        )
     }
 }

@@ -461,6 +461,29 @@ impl PairingIdentityDocument {
         }
     }
 
+    /// Build a public pairing document from wire fields advertised by a peer.
+    pub fn from_public_wire_fields(
+        device_id: impl Into<String>,
+        display_name: impl Into<String>,
+        identity_public_key: impl Into<String>,
+        fingerprint: impl Into<String>,
+        capabilities: CapabilityFlags,
+    ) -> Result<Self, IdentityDocumentError> {
+        let device_id = device_id.into();
+        let display_name = display_name.into();
+        let document = Self {
+            kind: PAIRING_IDENTITY_DOCUMENT_KIND.to_string(),
+            version: PAIRING_IDENTITY_DOCUMENT_VERSION,
+            device_id: device_id.trim().to_string(),
+            display_name: normalize_display_name(&display_name),
+            identity_public_key: identity_public_key.into(),
+            fingerprint: fingerprint.into(),
+            capabilities,
+        };
+        document.clone().into_trusted_peer_identity()?;
+        Ok(document)
+    }
+
     /// Convert a decoded public pairing document into a trusted peer identity.
     pub fn into_trusted_peer_identity(self) -> Result<TrustedPeerIdentity, IdentityDocumentError> {
         if self.kind != PAIRING_IDENTITY_DOCUMENT_KIND {
@@ -507,6 +530,11 @@ impl PairingIdentityDocument {
     /// Human-readable display name exported by the pairing document.
     pub fn display_name(&self) -> &str {
         &self.display_name
+    }
+
+    /// Base64-encoded public identity key exported by the pairing document.
+    pub fn identity_public_key(&self) -> &str {
+        &self.identity_public_key
     }
 
     /// User-visible fingerprint exported by the pairing document.
@@ -1498,6 +1526,31 @@ mod tests {
             CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
         );
         assert!(!encoded.contains("identitySecretKey"));
+    }
+
+    #[test]
+    fn pairing_identity_document_builds_from_public_wire_fields() {
+        let secret_key = Ed25519IdentityKey::generate();
+        let public_key = secret_key.public_key_bytes();
+        let fingerprint = fingerprint_for_public_key(&public_key);
+        let source = PairingIdentityDocument::from_device_identity(
+            &DeviceIdentity::new("device-b", "Device B", public_key, &fingerprint),
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+
+        let document = PairingIdentityDocument::from_public_wire_fields(
+            source.device_id(),
+            " Device B ",
+            source.identity_public_key(),
+            source.fingerprint(),
+            source.capabilities(),
+        )
+        .expect("public wire fields");
+
+        assert_eq!(document.device_id(), "device-b");
+        assert_eq!(document.display_name(), "Device B");
+        assert_eq!(document.identity_public_key(), source.identity_public_key());
+        assert_eq!(document.fingerprint(), source.fingerprint());
     }
 
     #[test]

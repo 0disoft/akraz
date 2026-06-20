@@ -3065,6 +3065,7 @@ mod tests {
                 peer_id: "linux-laptop".to_string(),
                 display_name: "Linux Laptop".to_string(),
                 fingerprint: Some("AKRZ-TRUSTED".to_string()),
+                peer_document_json: None,
                 trusted: true,
                 address: "127.0.0.1:4455".to_string(),
                 build_version: env!("CARGO_PKG_VERSION").to_string(),

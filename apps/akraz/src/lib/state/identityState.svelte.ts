@@ -32,12 +32,22 @@ export class IdentityState {
   }
 
   async trust() {
+    await this.trustDocument(this.peerDocumentJson, true);
+  }
+
+  async trustPeerDocumentJson(peerDocumentJson: string) {
+    await this.trustDocument(peerDocumentJson, false);
+  }
+
+  private async trustDocument(peerDocumentJson: string, clearPeerDocumentJson: boolean) {
     await this.run("trust", async () => {
       this.trusted = await identityClient.trust({
-        peerDocumentJson: this.peerDocumentJson,
+        peerDocumentJson,
       });
       this.trustedPeers = upsertTrustedPeer(this.trustedPeers, this.trusted);
-      this.peerDocumentJson = "";
+      if (clearPeerDocumentJson) {
+        this.peerDocumentJson = "";
+      }
     });
   }
 

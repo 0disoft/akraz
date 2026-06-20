@@ -544,6 +544,13 @@ h3 {
   list-style: none;
 }
 
+.connection-candidate-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
 .connection-candidate-button {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -597,6 +604,11 @@ h3 {
 
 .connection-candidate-status.ok {
   color: #2f6f43;
+}
+
+.connection-candidate-action {
+  min-width: 76px;
+  align-self: stretch;
 }
 
 .edge-row label,
@@ -1164,10 +1176,12 @@ h3 {
   .edge-row,
   .session-row,
   .manual-address-row,
+  .connection-candidate-row,
   .connection-candidate-button {
     grid-template-columns: 1fr;
   }
 
+  .connection-candidate-action,
   .connection-candidate-status {
     justify-self: start;
   }

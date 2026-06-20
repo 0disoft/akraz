@@ -13,3 +13,4 @@ workspace = true
 [dependencies]
 akraz-identity = { path = "../akraz-identity" }
 akraz-protocol = { path = "../akraz-protocol" }
+serde_json = { workspace = true }

@@ -1329,6 +1329,8 @@ pub struct SessionDiscoveryCandidate {
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_document_json: Option<String>,
     pub trusted: bool,
     pub address: String,
     pub build_version: String,
@@ -2519,6 +2521,7 @@ mod tests {
                     peer_id: "linux-laptop".to_string(),
                     display_name: "Linux Laptop".to_string(),
                     fingerprint: Some("AKRZ-TRUSTED".to_string()),
+                    peer_document_json: None,
                     trusted: true,
                     address: "127.0.0.1:24888".to_string(),
                     build_version: CURRENT_TEST_VERSION.to_string(),
@@ -2542,6 +2545,49 @@ mod tests {
                         "displayName": "Linux Laptop",
                         "fingerprint": "AKRZ-TRUSTED",
                         "trusted": true,
+                        "address": "127.0.0.1:24888",
+                        "buildVersion": CURRENT_TEST_VERSION,
+                        "capabilities": 3
+                    }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn session_discovery_candidates_response_serializes_pairing_document_when_present() {
+        let response = JsonRpcSuccess::new(
+            "req_1",
+            SessionDiscoveryCandidatesResult {
+                candidates: vec![SessionDiscoveryCandidate {
+                    peer_id: "new-laptop".to_string(),
+                    display_name: "New Laptop".to_string(),
+                    fingerprint: Some("AKRZ-PAIRABLE".to_string()),
+                    peer_document_json: Some(r#"{"kind":"akraz.peerIdentity"}"#.to_string()),
+                    trusted: false,
+                    address: "127.0.0.1:24888".to_string(),
+                    build_version: CURRENT_TEST_VERSION.to_string(),
+                    capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+                }],
+            },
+        );
+        let line = match to_json_line(&response) {
+            Ok(line) => line,
+            Err(error) => panic!("expected response serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "result": {
+                    "candidates": [{
+                        "peerId": "new-laptop",
+                        "displayName": "New Laptop",
+                        "fingerprint": "AKRZ-PAIRABLE",
+                        "peerDocumentJson": "{\"kind\":\"akraz.peerIdentity\"}",
+                        "trusted": false,
                         "address": "127.0.0.1:24888",
                         "buildVersion": CURRENT_TEST_VERSION,
                         "capabilities": 3

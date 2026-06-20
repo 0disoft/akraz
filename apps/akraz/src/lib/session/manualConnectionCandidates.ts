@@ -42,6 +42,7 @@ export interface ConnectionCandidate {
   trusted: boolean;
   ready: boolean;
   source: ConnectionCandidateSource;
+  peerDocumentJson?: string;
   buildVersion?: string;
 }
 
@@ -112,6 +113,9 @@ export function buildConnectionCandidates(input: ConnectionCandidatesInput): Con
 
     if (fingerprint !== undefined) {
       connectionCandidate.fingerprint = fingerprint;
+    }
+    if (candidate.peerDocumentJson !== undefined) {
+      connectionCandidate.peerDocumentJson = candidate.peerDocumentJson;
     }
 
     return [connectionCandidate];

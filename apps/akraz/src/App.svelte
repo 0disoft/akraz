@@ -92,6 +92,7 @@
   let selectedLayoutBindingIndex = $state(0);
   let draggedLayoutBindingIndex = $state<number | null>(null);
   let layoutTestMessage = $state('');
+  let registeringCandidatePeerId = $state<string | null>(null);
 
   onMount(() => {
     void daemonState.refresh();
@@ -444,11 +445,36 @@
     sessionAddress = candidate.address;
   }
 
+  function canRegisterConnectionCandidate(candidate: ConnectionCandidate) {
+    return (
+      !candidate.trusted &&
+      !identityState.isBusy &&
+      (candidate.peerDocumentJson?.trim().length ?? 0) > 0
+    );
+  }
+
+  async function registerConnectionCandidate(candidate: ConnectionCandidate) {
+    const peerDocumentJson = candidate.peerDocumentJson?.trim();
+    if (!peerDocumentJson || !canRegisterConnectionCandidate(candidate)) {
+      return;
+    }
+
+    registeringCandidatePeerId = candidate.peerId;
+    await identityState.trustPeerDocumentJson(peerDocumentJson);
+    registeringCandidatePeerId = null;
+    if (!identityState.lastError && daemonState.status !== null) {
+      await daemonState.refreshSessionDiscoveryCandidates();
+    }
+  }
+
   function connectionCandidateStatus(candidate: ConnectionCandidate) {
     if (candidate.connected) {
       return '연결됨';
     }
     if (!candidate.trusted) {
+      if ((candidate.peerDocumentJson?.trim().length ?? 0) > 0) {
+        return '등록 가능';
+      }
       return '등록 필요';
     }
     if (candidate.ready) {
@@ -1370,34 +1396,48 @@
           <ul class="connection-candidate-list" aria-label="바로 연결">
             {#each connectionCandidates() as candidate (candidate.peerId)}
               <li>
-                <button
-                  type="button"
-                  class="connection-candidate-button"
-                  disabled={daemonState.isBusy || hasConnectedPeer() || !candidate.ready}
-                  onclick={() => selectConnectionCandidate(candidate)}
-                >
-                  <span class="connection-candidate-main">
-                    <strong>{candidate.displayName}</strong>
-                    <span class="connection-candidate-meta">
-                      <span>{connectionCandidateSourceLabel(candidate)}</span>
-                      <code>{candidate.peerId}</code>
-                      {#if candidate.address.length > 0}
-                        <code>{candidate.address}</code>
-                      {:else}
-                        <span>주소 없음</span>
-                      {/if}
-                      {#if candidate.buildVersion}
-                        <span>{candidate.buildVersion}</span>
-                      {/if}
-                    </span>
-                  </span>
-                  <strong
-                    class:ok={candidate.ready || candidate.connected}
-                    class="connection-candidate-status"
+                <div class="connection-candidate-row">
+                  <button
+                    type="button"
+                    class="connection-candidate-button"
+                    disabled={daemonState.isBusy || hasConnectedPeer() || !candidate.ready}
+                    onclick={() => selectConnectionCandidate(candidate)}
                   >
-                    {connectionCandidateStatus(candidate)}
-                  </strong>
-                </button>
+                    <span class="connection-candidate-main">
+                      <strong>{candidate.displayName}</strong>
+                      <span class="connection-candidate-meta">
+                        <span>{connectionCandidateSourceLabel(candidate)}</span>
+                        <code>{candidate.peerId}</code>
+                        {#if candidate.address.length > 0}
+                          <code>{candidate.address}</code>
+                        {:else}
+                          <span>주소 없음</span>
+                        {/if}
+                        {#if candidate.buildVersion}
+                          <span>{candidate.buildVersion}</span>
+                        {/if}
+                      </span>
+                    </span>
+                    <strong
+                      class:ok={candidate.ready || candidate.connected}
+                      class="connection-candidate-status"
+                    >
+                      {connectionCandidateStatus(candidate)}
+                    </strong>
+                  </button>
+                  {#if !candidate.trusted && (candidate.peerDocumentJson?.trim().length ?? 0) > 0}
+                    <button
+                      type="button"
+                      class="control-button secondary connection-candidate-action"
+                      disabled={!canRegisterConnectionCandidate(candidate)}
+                      onclick={() => registerConnectionCandidate(candidate)}
+                    >
+                      {registeringCandidatePeerId === candidate.peerId && identityState.operation === 'trust'
+                        ? '등록 중'
+                        : '등록'}
+                    </button>
+                  {/if}
+                </div>
               </li>
             {/each}
           </ul>
