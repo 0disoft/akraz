@@ -4,9 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       qa_report_json:
-        description: "Complete sanitized Windows MVP QA report JSON."
-        required: true
+        description: "Complete sanitized Windows MVP QA report JSON. Use either this or qa_report_base64."
+        required: false
         type: string
+        default: ""
+      qa_report_base64:
+        description: "Base64-encoded sanitized Windows MVP QA report JSON. Use either this or qa_report_json."
+        required: false
+        type: string
+        default: ""
 
 run-name: windows-mvp-qa report
 
@@ -31,6 +37,7 @@ jobs:
 
       - name: Write QA report input
         env:
+          QA_REPORT_BASE64: ${{ inputs.qa_report_base64 }}
           QA_REPORT_FILE: ${{ github.workspace }}/release-evidence/qa/windows-mvp-qa-report.json
           QA_REPORT_JSON: ${{ inputs.qa_report_json }}
         run: |
@@ -40,13 +47,25 @@ jobs:
           bun --eval '
             import { writeFileSync } from "node:fs";
 
+            const base64Report = (process.env.QA_REPORT_BASE64 ?? "").trim();
             const reportFile = process.env.QA_REPORT_FILE;
-            const reportJson = process.env.QA_REPORT_JSON ?? "";
+            const inlineReport = (process.env.QA_REPORT_JSON ?? "").trim();
             if (!reportFile) {
               throw new Error("QA_REPORT_FILE is required");
             }
+            const hasInlineReport = inlineReport.length > 0;
+            const hasBase64Report = base64Report.length > 0;
+            if (hasInlineReport === hasBase64Report) {
+              throw new Error("provide exactly one of qa_report_json or qa_report_base64");
+            }
 
-            writeFileSync(reportFile, `${reportJson.trimEnd()}\n`, "utf8");
+            const reportJson =
+              hasBase64Report
+                ? Buffer.from(base64Report, "base64").toString("utf8").trimEnd()
+                : inlineReport;
+
+            JSON.parse(reportJson);
+            writeFileSync(reportFile, `${reportJson}\n`, "utf8");
           '
 
       - name: Validate Windows MVP QA report
