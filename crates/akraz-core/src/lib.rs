@@ -408,6 +408,8 @@ pub enum RuntimeEvent {
     RemoteLeaveRequested,
     LocalControlConfirmed,
     EmergencyRecoveryRequested,
+    ScreenLayoutChanged,
+    PermissionLost,
     SystemResumed,
     TransportLost,
     RecoveryCompleted,
@@ -530,6 +532,8 @@ impl RuntimeInputState {
             RuntimeEvent::RemoteLeaveRequested => self.request_remote_leave(),
             RuntimeEvent::LocalControlConfirmed => self.confirm_local_control(),
             RuntimeEvent::EmergencyRecoveryRequested => Ok(self.handle_panic_hotkey()),
+            RuntimeEvent::ScreenLayoutChanged => Ok(self.handle_recovery_interrupt()),
+            RuntimeEvent::PermissionLost => Ok(self.handle_recovery_interrupt()),
             RuntimeEvent::SystemResumed => Ok(self.handle_system_resumed()),
             RuntimeEvent::TransportLost => Ok(self.handle_transport_lost()),
             RuntimeEvent::RecoveryCompleted => self.complete_recovery(),
@@ -700,6 +704,10 @@ impl RuntimeInputState {
     }
 
     fn handle_system_resumed(&mut self) -> Vec<CoreAction> {
+        self.handle_recovery_interrupt()
+    }
+
+    fn handle_recovery_interrupt(&mut self) -> Vec<CoreAction> {
         self.handle_panic_hotkey()
     }
 
@@ -1246,6 +1254,52 @@ mod tests {
     }
 
     #[test]
+    fn screen_layout_change_recovers_local_control_and_releases_remote_inputs() {
+        let mut state = remote_state_with_pressed_shift("session-layout");
+
+        let actions = apply_ok(&mut state, RuntimeEvent::ScreenLayoutChanged);
+
+        assert_eq!(
+            actions,
+            vec![
+                CoreAction::ReleaseLocalInputs,
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-layout")),
+                },
+            ]
+        );
+        assert_eq!(state.mode(), ControlMode::Local);
+        assert!(state.pressed_keys().is_empty());
+        assert_eq!(state.modifiers(), Default::default());
+        assert!(state.active_peer_id().is_none());
+        assert!(state.active_session_id().is_none());
+    }
+
+    #[test]
+    fn permission_loss_recovers_local_control_and_releases_remote_inputs() {
+        let mut state = remote_state_with_pressed_shift("session-permission");
+
+        let actions = apply_ok(&mut state, RuntimeEvent::PermissionLost);
+
+        assert_eq!(
+            actions,
+            vec![
+                CoreAction::ReleaseLocalInputs,
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-permission")),
+                },
+            ]
+        );
+        assert_eq!(state.mode(), ControlMode::Local);
+        assert!(state.pressed_keys().is_empty());
+        assert_eq!(state.modifiers(), Default::default());
+        assert!(state.active_peer_id().is_none());
+        assert!(state.active_session_id().is_none());
+    }
+
+    #[test]
     fn remote_leave_releases_input_and_waits_for_local_confirmation() {
         let mut state = RuntimeInputState::new();
 
@@ -1384,6 +1438,30 @@ mod tests {
                 remote_edge: ScreenEdge::Left,
             }],
         )
+    }
+
+    fn remote_state_with_pressed_shift(session_id: &str) -> RuntimeInputState {
+        let mut state = RuntimeInputState::new();
+        apply_ok(
+            &mut state,
+            RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            },
+        );
+        apply_ok(
+            &mut state,
+            RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new(session_id),
+            },
+        );
+        apply_ok(
+            &mut state,
+            RuntimeEvent::Input(CapturedInputEvent::Key {
+                key: PhysicalKey::LeftShift,
+                state: PressState::Pressed,
+            }),
+        );
+        state
     }
 
     fn replay_ok(events: &[RuntimeEvent]) -> super::RuntimeReplayResult {
