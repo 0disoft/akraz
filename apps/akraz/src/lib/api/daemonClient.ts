@@ -6,6 +6,12 @@ import type {
   DiagnosticsSnapshot,
   DiagnosticsScreenTopology,
   DiagnosticsSupportBundle,
+  PairingAcceptParams,
+  PairingAcceptResult,
+  PairingRejectParams,
+  PairingRejectResult,
+  PairingStartParams,
+  PairingStartResult,
   PermissionsProbe,
   SessionConnectParams,
   SessionDiscoveryCandidatesResult,
@@ -50,6 +56,18 @@ export const daemonClient = {
 
   sessionDiscoveryCandidates(): Promise<SessionDiscoveryCandidatesResult> {
     return invoke<SessionDiscoveryCandidatesResult>("session_discovery_candidates");
+  },
+
+  startPairing(params: PairingStartParams): Promise<PairingStartResult> {
+    return invoke<PairingStartResult>("pairing_start", { params });
+  },
+
+  acceptPairing(params: PairingAcceptParams): Promise<PairingAcceptResult> {
+    return invoke<PairingAcceptResult>("pairing_accept", { params });
+  },
+
+  rejectPairing(params: PairingRejectParams): Promise<PairingRejectResult> {
+    return invoke<PairingRejectResult>("pairing_reject", { params });
   },
 
   disconnectSession(): Promise<DaemonLifecycleSnapshot> {

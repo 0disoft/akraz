@@ -611,6 +611,101 @@ h3 {
   align-self: stretch;
 }
 
+.pairing-panel {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #d8cab1;
+  border-radius: 8px;
+  background: #fffaf0;
+}
+
+.pairing-heading {
+  display: flex;
+  min-width: 0;
+  gap: 10px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.pairing-heading h3 {
+  margin: 0;
+}
+
+.pairing-heading span {
+  min-width: 0;
+  color: #687280;
+  font-size: 0.82rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.pairing-heading span.error-text {
+  color: #9b3f27;
+}
+
+.pairing-facts {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.pairing-facts div {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+}
+
+.pairing-facts dt {
+  color: #687280;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.pairing-facts dd {
+  min-width: 0;
+  margin: 0;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.pairing-facts code {
+  color: #4d5560;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.pairing-code {
+  display: inline-block;
+  font-size: 1.35rem;
+  letter-spacing: 0;
+}
+
+.pairing-actions {
+  margin-top: 0;
+}
+
+.pairing-result {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  margin: 0;
+}
+
+.pairing-result strong,
+.pairing-result span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.pairing-result span {
+  color: #687280;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
 .edge-row label,
 .session-row label {
   display: grid;
@@ -1184,6 +1279,15 @@ h3 {
   .connection-candidate-action,
   .connection-candidate-status {
     justify-self: start;
+  }
+
+  .pairing-heading {
+    display: grid;
+  }
+
+  .pairing-facts div {
+    grid-template-columns: 1fr;
+    gap: 2px;
   }
 
   .layout-board {

@@ -246,6 +246,40 @@ export interface SessionDisconnectResult {
   mode: ControlMode;
 }
 
+export interface PairingStartParams {
+  peerDocumentJson: string;
+}
+
+export interface PairingStartResult {
+  peerId: string;
+  displayName: string;
+  fingerprint: string;
+  verificationCode: string;
+  capabilities: number;
+}
+
+export interface PairingAcceptParams {
+  peerId: string;
+  verificationCode: string;
+}
+
+export interface PairingAcceptResult {
+  trusted: boolean;
+  peerId: string;
+  displayName: string;
+  fingerprint: string;
+  capabilities: number;
+}
+
+export interface PairingRejectParams {
+  peerId: string;
+}
+
+export interface PairingRejectResult {
+  rejected: boolean;
+  peerId: string;
+}
+
 export interface PairingIdentityDocument {
   kind: string;
   version: number;

@@ -5,6 +5,7 @@
   import { diagnosticsState } from './lib/state/diagnosticsState.svelte';
   import { identityState } from './lib/state/identityState.svelte';
   import { layoutState } from './lib/state/layoutState.svelte';
+  import { pairingState } from './lib/state/pairingState.svelte';
   import { permissionState } from './lib/state/permissionState.svelte';
   import { settingsState } from './lib/state/settingsState.svelte';
   import {
@@ -92,7 +93,7 @@
   let selectedLayoutBindingIndex = $state(0);
   let draggedLayoutBindingIndex = $state<number | null>(null);
   let layoutTestMessage = $state('');
-  let registeringCandidatePeerId = $state<string | null>(null);
+  let pairingCandidatePeerId = $state<string | null>(null);
 
   onMount(() => {
     void daemonState.refresh();
@@ -445,26 +446,63 @@
     sessionAddress = candidate.address;
   }
 
-  function canRegisterConnectionCandidate(candidate: ConnectionCandidate) {
+  function canStartConnectionCandidatePairing(candidate: ConnectionCandidate) {
     return (
+      daemonState.status !== null &&
       !candidate.trusted &&
       !identityState.isBusy &&
+      !pairingState.isBusy &&
       (candidate.peerDocumentJson?.trim().length ?? 0) > 0
     );
   }
 
-  async function registerConnectionCandidate(candidate: ConnectionCandidate) {
+  async function startConnectionCandidatePairing(candidate: ConnectionCandidate) {
     const peerDocumentJson = candidate.peerDocumentJson?.trim();
-    if (!peerDocumentJson || !canRegisterConnectionCandidate(candidate)) {
+    if (!peerDocumentJson || !canStartConnectionCandidatePairing(candidate)) {
       return;
     }
 
-    registeringCandidatePeerId = candidate.peerId;
-    await identityState.trustPeerDocumentJson(peerDocumentJson);
-    registeringCandidatePeerId = null;
-    if (!identityState.lastError && daemonState.status !== null) {
+    pairingCandidatePeerId = candidate.peerId;
+    await pairingState.start(peerDocumentJson);
+    pairingCandidatePeerId = null;
+  }
+
+  async function acceptPendingPairing() {
+    const accepted = await pairingState.accept();
+    if (!accepted) {
+      return;
+    }
+
+    identityState.upsertTrusted(accepted);
+    if (daemonState.status !== null) {
       await daemonState.refreshSessionDiscoveryCandidates();
     }
+  }
+
+  async function rejectPendingPairing() {
+    await pairingState.reject();
+  }
+
+  function pairingMessage() {
+    if (pairingState.operation === 'start') {
+      return '확인 준비 중';
+    }
+    if (pairingState.operation === 'accept') {
+      return '등록 중';
+    }
+    if (pairingState.operation === 'reject') {
+      return '취소 중';
+    }
+    if (pairingState.lastError) {
+      return pairingState.lastError;
+    }
+    if (pairingState.pending) {
+      return `${pairingState.pending.displayName} 확인 대기`;
+    }
+    if (pairingState.accepted) {
+      return `${pairingState.accepted.displayName} 등록됨`;
+    }
+    return '대기 중';
   }
 
   function connectionCandidateStatus(candidate: ConnectionCandidate) {
@@ -473,7 +511,7 @@
     }
     if (!candidate.trusted) {
       if ((candidate.peerDocumentJson?.trim().length ?? 0) > 0) {
-        return '등록 가능';
+        return '확인 필요';
       }
       return '등록 필요';
     }
@@ -1429,18 +1467,76 @@
                     <button
                       type="button"
                       class="control-button secondary connection-candidate-action"
-                      disabled={!canRegisterConnectionCandidate(candidate)}
-                      onclick={() => registerConnectionCandidate(candidate)}
+                      disabled={!canStartConnectionCandidatePairing(candidate)}
+                      onclick={() => startConnectionCandidatePairing(candidate)}
                     >
-                      {registeringCandidatePeerId === candidate.peerId && identityState.operation === 'trust'
-                        ? '등록 중'
-                        : '등록'}
+                      {pairingCandidatePeerId === candidate.peerId && pairingState.operation === 'start'
+                        ? '확인 중'
+                        : '확인'}
                     </button>
                   {/if}
                 </div>
               </li>
             {/each}
           </ul>
+
+          {#if pairingState.pending || pairingState.accepted || pairingState.lastError}
+            <div class="pairing-panel" aria-live="polite">
+              <div class="pairing-heading">
+                <h3>기기 확인</h3>
+                <span class:error-text={pairingState.lastError}>{pairingMessage()}</span>
+              </div>
+
+              {#if pairingState.pending}
+                <dl class="pairing-facts">
+                  <div>
+                    <dt>기기</dt>
+                    <dd>{pairingState.pending.displayName}</dd>
+                  </div>
+                  <div>
+                    <dt>기기 ID</dt>
+                    <dd><code>{pairingState.pending.peerId}</code></dd>
+                  </div>
+                  <div>
+                    <dt>확인 코드</dt>
+                    <dd><strong class="pairing-code">{pairingState.pending.verificationCode}</strong></dd>
+                  </div>
+                  <div>
+                    <dt>지문</dt>
+                    <dd><code>{pairingState.pending.fingerprint}</code></dd>
+                  </div>
+                  <div>
+                    <dt>권한</dt>
+                    <dd>{capabilityLabel(pairingState.pending.capabilities)}</dd>
+                  </div>
+                </dl>
+
+                <div class="settings-actions pairing-actions">
+                  <button
+                    type="button"
+                    class="control-button secondary"
+                    disabled={pairingState.isBusy}
+                    onclick={rejectPendingPairing}
+                  >
+                    {pairingState.operation === 'reject' ? '취소 중' : '취소'}
+                  </button>
+                  <button
+                    type="button"
+                    class="control-button"
+                    disabled={pairingState.isBusy}
+                    onclick={acceptPendingPairing}
+                  >
+                    {pairingState.operation === 'accept' ? '등록 중' : '등록'}
+                  </button>
+                </div>
+              {:else if pairingState.accepted}
+                <p class="pairing-result">
+                  <strong>{pairingState.accepted.displayName}</strong>
+                  <span>{capabilityLabel(pairingState.accepted.capabilities)}</span>
+                </p>
+              {/if}
+            </div>
+          {/if}
         </div>
       {/if}
 

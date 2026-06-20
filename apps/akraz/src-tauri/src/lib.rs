@@ -17,14 +17,16 @@ use akraz_ipc::{
     InputReleaseAllResult, IpcCallError, IpcEndpoint, IpcTransportError, JSONRPC_VERSION,
     JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_LOGS_TAIL,
     METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
-    METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
-    METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES,
-    OsLocalIpcClient, PermissionsProbe, PermissionsProbeParams, SessionConnectResult,
-    SessionDisconnectParams, SessionDisconnectResult, SessionDiscoveryCandidatesParams,
-    SessionDiscoveryCandidatesResult, build_diagnostics_latency_histogram,
-    build_diagnostics_runtime_environment, build_diagnostics_snapshot,
-    build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
-    resolve_current_default_endpoint,
+    METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PAIRING_ACCEPT,
+    METHOD_PAIRING_REJECT, METHOD_PAIRING_START, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
+    METHOD_SESSION_DISCONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES, OsLocalIpcClient,
+    PairingAcceptParams, PairingAcceptResult, PairingRejectParams, PairingRejectResult,
+    PairingStartParams, PairingStartResult, PermissionsProbe, PermissionsProbeParams,
+    SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
+    SessionDiscoveryCandidatesParams, SessionDiscoveryCandidatesResult,
+    build_diagnostics_latency_histogram, build_diagnostics_runtime_environment,
+    build_diagnostics_snapshot, build_diagnostics_support_bundle_with_previous_crash,
+    call_json_rpc, resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 use serde::{Deserialize, Serialize};
@@ -94,6 +96,9 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
             daemon_stop,
             session_connect,
             session_discovery_candidates,
+            pairing_start,
+            pairing_accept,
+            pairing_reject,
             session_disconnect,
             input_release_all,
             identity_show,
@@ -419,6 +424,27 @@ async fn session_discovery_candidates() -> Result<SessionDiscoveryCandidatesResu
 }
 
 #[tauri::command]
+async fn pairing_start(params: PairingStartOptions) -> Result<PairingStartResult, String> {
+    tauri::async_runtime::spawn_blocking(move || call_daemon_pairing_start(params))
+        .await
+        .map_err(|error| format!("pairing start task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn pairing_accept(params: PairingAcceptOptions) -> Result<PairingAcceptResult, String> {
+    tauri::async_runtime::spawn_blocking(move || call_daemon_pairing_accept(params))
+        .await
+        .map_err(|error| format!("pairing accept task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn pairing_reject(params: PairingRejectOptions) -> Result<PairingRejectResult, String> {
+    tauri::async_runtime::spawn_blocking(move || call_daemon_pairing_reject(params))
+        .await
+        .map_err(|error| format!("pairing reject task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn session_disconnect() -> Result<DaemonLifecycleSnapshot, String> {
     tauri::async_runtime::spawn_blocking(disconnect_daemon_session)
         .await
@@ -587,6 +613,25 @@ struct SessionConnectOptions {
     peer_id: String,
     local_device_id: String,
     address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingStartOptions {
+    peer_document_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingAcceptOptions {
+    peer_id: String,
+    verification_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingRejectOptions {
+    peer_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1361,6 +1406,36 @@ fn call_daemon_session_discovery_candidates() -> Result<SessionDiscoveryCandidat
     )
 }
 
+fn call_daemon_pairing_start(params: PairingStartOptions) -> Result<PairingStartResult, String> {
+    let params = normalize_pairing_start_options(params)?;
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    call_daemon_json_rpc::<PairingStartResult, _>(
+        &client,
+        &JsonRpcRequest::new(LOCAL_REQUEST_ID, METHOD_PAIRING_START, params),
+        "pairing start",
+    )
+}
+
+fn call_daemon_pairing_accept(params: PairingAcceptOptions) -> Result<PairingAcceptResult, String> {
+    let params = normalize_pairing_accept_options(params)?;
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    call_daemon_json_rpc::<PairingAcceptResult, _>(
+        &client,
+        &JsonRpcRequest::new(LOCAL_REQUEST_ID, METHOD_PAIRING_ACCEPT, params),
+        "pairing accept",
+    )
+}
+
+fn call_daemon_pairing_reject(params: PairingRejectOptions) -> Result<PairingRejectResult, String> {
+    let params = normalize_pairing_reject_options(params)?;
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    call_daemon_json_rpc::<PairingRejectResult, _>(
+        &client,
+        &JsonRpcRequest::new(LOCAL_REQUEST_ID, METHOD_PAIRING_REJECT, params),
+        "pairing reject",
+    )
+}
+
 fn disconnect_daemon_session() -> Result<DaemonLifecycleSnapshot, String> {
     call_daemon_session_disconnect()?;
     call_daemon_status_result()
@@ -1740,6 +1815,48 @@ fn normalize_optional_session_address(address: &str) -> Result<String, String> {
     }
 
     Ok(normalize_session_address(address)?.to_string())
+}
+
+fn normalize_pairing_start_options(
+    options: PairingStartOptions,
+) -> Result<PairingStartParams, String> {
+    let peer_document_json = options.peer_document_json.trim();
+    if peer_document_json.is_empty() {
+        return Err("peer identity document is required.".to_string());
+    }
+
+    Ok(PairingStartParams {
+        peer_document_json: peer_document_json.to_string(),
+    })
+}
+
+fn normalize_pairing_accept_options(
+    options: PairingAcceptOptions,
+) -> Result<PairingAcceptParams, String> {
+    Ok(PairingAcceptParams {
+        peer_id: normalize_session_peer_id(&options.peer_id)?.to_string(),
+        verification_code: normalize_pairing_verification_code(&options.verification_code)?
+            .to_string(),
+    })
+}
+
+fn normalize_pairing_reject_options(
+    options: PairingRejectOptions,
+) -> Result<PairingRejectParams, String> {
+    Ok(PairingRejectParams {
+        peer_id: normalize_session_peer_id(&options.peer_id)?.to_string(),
+    })
+}
+
+fn normalize_pairing_verification_code(verification_code: &str) -> Result<&str, String> {
+    let verification_code =
+        normalize_required_session_value("pairing verification code", verification_code)?;
+    if verification_code.len() != 6 || !verification_code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("pairing verification code must be exactly 6 digits.".to_string());
+    }
+
+    Ok(verification_code)
 }
 
 fn normalize_session_connect_options(
@@ -2160,9 +2277,10 @@ mod tests {
         DaemonStatus, DiagnosticsKeyboardLayout, DiagnosticsMonitorSnapshot,
         DiagnosticsScreenTopology, InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities,
         IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LogicalPointSnapshot,
-        LogicalRectSnapshot, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
-        SessionConnectResult, SessionDiscoveryCandidate, SessionDiscoveryCandidatesResult,
-        SessionStatus, to_json_line,
+        LogicalRectSnapshot, PairingAcceptParams, PairingAcceptResult, PairingRejectParams,
+        PairingRejectResult, PairingStartParams, PairingStartResult, PermissionIssue,
+        PermissionsProbe, ProtocolVersionSnapshot, SessionConnectResult, SessionDiscoveryCandidate,
+        SessionDiscoveryCandidatesResult, SessionStatus, to_json_line,
     };
 
     use super::{
@@ -2181,7 +2299,9 @@ mod tests {
         default_pairing_capabilities, forget_trusted_identity_from_path, format_edge_binding_arg,
         graceful_stop_outcome_if_settled, has_exact_arg, identity_store_path_from_config_dir,
         list_trusted_identities_from_path, load_layout_from_path, load_settings_from_path,
-        normalize_session_connect_options, parse_daemon_status_response, parse_json_rpc_response,
+        normalize_pairing_accept_options, normalize_pairing_reject_options,
+        normalize_pairing_start_options, normalize_session_connect_options,
+        parse_daemon_status_response, parse_json_rpc_response,
         previous_daemon_crash_start_blocked_snapshot, read_previous_daemon_crash_from_path,
         resolve_env_daemon_executable_from, save_layout_to_path, save_settings_to_path,
         settings_start_smoke_settings, stop_outcome_without_managed_child,
@@ -3082,6 +3202,116 @@ mod tests {
                 &line,
                 "session discovery candidates"
             ),
+            Ok(result)
+        );
+    }
+
+    #[test]
+    fn pairing_options_normalize_values() {
+        assert_eq!(
+            normalize_pairing_start_options(super::PairingStartOptions {
+                peer_document_json: " {\"kind\":\"akraz.peerIdentity\"} ".to_string(),
+            }),
+            Ok(PairingStartParams {
+                peer_document_json: "{\"kind\":\"akraz.peerIdentity\"}".to_string(),
+            })
+        );
+        assert_eq!(
+            normalize_pairing_accept_options(super::PairingAcceptOptions {
+                peer_id: " linux-laptop ".to_string(),
+                verification_code: " 123456 ".to_string(),
+            }),
+            Ok(PairingAcceptParams {
+                peer_id: "linux-laptop".to_string(),
+                verification_code: "123456".to_string(),
+            })
+        );
+        assert_eq!(
+            normalize_pairing_reject_options(super::PairingRejectOptions {
+                peer_id: " linux-laptop ".to_string(),
+            }),
+            Ok(PairingRejectParams {
+                peer_id: "linux-laptop".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn pairing_options_reject_invalid_values() {
+        assert_eq!(
+            normalize_pairing_start_options(super::PairingStartOptions {
+                peer_document_json: " ".to_string(),
+            }),
+            Err("peer identity document is required.".to_string())
+        );
+        assert_eq!(
+            normalize_pairing_accept_options(super::PairingAcceptOptions {
+                peer_id: "linux-laptop".to_string(),
+                verification_code: "12345x".to_string(),
+            }),
+            Err("pairing verification code must be exactly 6 digits.".to_string())
+        );
+        assert_eq!(
+            normalize_pairing_reject_options(super::PairingRejectOptions {
+                peer_id: "linux:laptop".to_string(),
+            }),
+            Err("peer id cannot contain ':' or '@'.".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_pairing_start_success_response() {
+        let result = PairingStartResult {
+            peer_id: "linux-laptop".to_string(),
+            display_name: "Linux Laptop".to_string(),
+            fingerprint: "AKRZ-TRUSTED".to_string(),
+            verification_code: "123456".to_string(),
+            capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        };
+        let line = match to_json_line(&JsonRpcSuccess::new("tauri", result.clone())) {
+            Ok(line) => line,
+            Err(error) => panic!("expected pairing start JSON: {error}"),
+        };
+
+        assert_eq!(
+            parse_json_rpc_response::<PairingStartResult>(&line, "pairing start"),
+            Ok(result)
+        );
+    }
+
+    #[test]
+    fn parses_pairing_accept_success_response() {
+        let result = PairingAcceptResult {
+            trusted: true,
+            peer_id: "linux-laptop".to_string(),
+            display_name: "Linux Laptop".to_string(),
+            fingerprint: "AKRZ-TRUSTED".to_string(),
+            capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        };
+        let line = match to_json_line(&JsonRpcSuccess::new("tauri", result.clone())) {
+            Ok(line) => line,
+            Err(error) => panic!("expected pairing accept JSON: {error}"),
+        };
+
+        assert_eq!(
+            parse_json_rpc_response::<PairingAcceptResult>(&line, "pairing accept"),
+            Ok(result)
+        );
+    }
+
+    #[test]
+    fn parses_pairing_reject_success_response() {
+        let result = PairingRejectResult {
+            rejected: true,
+            peer_id: "linux-laptop".to_string(),
+        };
+        let line = match to_json_line(&JsonRpcSuccess::new("tauri", result.clone())) {
+            Ok(line) => line,
+            Err(error) => panic!("expected pairing reject JSON: {error}"),
+        };
+
+        assert_eq!(
+            parse_json_rpc_response::<PairingRejectResult>(&line, "pairing reject"),
             Ok(result)
         );
     }
