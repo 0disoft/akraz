@@ -54,6 +54,7 @@ jobs:
       - name: Download QA and soak evidence artifacts
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_EVIDENCE_DIR: ${{ github.workspace }}/release-evidence
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           QA_SOURCE_RUN_ID: ${{ inputs.qa_source_run_id }}
           SOAK_SOURCE_RUN_ID: ${{ inputs.soak_source_run_id }}
@@ -62,7 +63,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p release-evidence/qa release-evidence/soak
+          mkdir -p "$RELEASE_EVIDENCE_DIR/qa" "$RELEASE_EVIDENCE_DIR/soak"
 
           resolve_source_run_id() {
             local explicit_run_id="$1"
@@ -89,14 +90,16 @@ jobs:
           gh run download "$qa_source_run_id" \
             --repo "$GITHUB_REPOSITORY" \
             --name "$QA_REPORT_ARTIFACT" \
-            --dir release-evidence/qa
+            --dir "$RELEASE_EVIDENCE_DIR/qa"
 
           gh run download "$soak_source_run_id" \
             --repo "$GITHUB_REPOSITORY" \
             --name "$SOAK_REPORT_ARTIFACT" \
-            --dir release-evidence/soak
+            --dir "$RELEASE_EVIDENCE_DIR/soak"
 
       - name: Resolve downloaded evidence files
+        env:
+          RELEASE_EVIDENCE_DIR: ${{ github.workspace }}/release-evidence
         run: |
           set -euo pipefail
 
@@ -110,8 +113,8 @@ jobs:
             printf '%s\n' "${files[0]}"
           }
 
-          qa_report_file="$(resolve_json release-evidence/qa)"
-          soak_report_file="$(resolve_json release-evidence/soak)"
+          qa_report_file="$(resolve_json "$RELEASE_EVIDENCE_DIR/qa")"
+          soak_report_file="$(resolve_json "$RELEASE_EVIDENCE_DIR/soak")"
 
           {
             echo "QA_REPORT_FILE=$qa_report_file"
@@ -120,6 +123,7 @@ jobs:
 
       - name: Generate release environment preflight evidence
         env:
+          RELEASE_EVIDENCE_DIR: ${{ github.workspace }}/release-evidence
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           AKRAZ_WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.AKRAZ_WINDOWS_SIGNING_CERT_BASE64 }}
@@ -127,24 +131,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p release-evidence/signing release-evidence/updater
+          mkdir -p "$RELEASE_EVIDENCE_DIR/signing" "$RELEASE_EVIDENCE_DIR/updater"
 
           bun run release:signing-preflight -- \
-            --out-file release-evidence/signing/windows-mvp-signing-preflight.json
+            --out-file "$RELEASE_EVIDENCE_DIR/signing/windows-mvp-signing-preflight.json"
 
           bun run release:updater-config-preflight -- \
-            --out-file release-evidence/updater/windows-mvp-updater-config-preflight.json
+            --out-file "$RELEASE_EVIDENCE_DIR/updater/windows-mvp-updater-config-preflight.json"
 
       - name: Build Windows MVP release bundle
+        env:
+          RELEASE_BUNDLE_DIR: ${{ github.workspace }}/release-bundle
+          RELEASE_EVIDENCE_DIR: ${{ github.workspace }}/release-evidence
         run: |
           set -euo pipefail
 
           bun run release:windows-mvp-bundle -- \
             --qa-report-file "$QA_REPORT_FILE" \
             --soak-report-file "$SOAK_REPORT_FILE" \
-            --signing-preflight-file release-evidence/signing/windows-mvp-signing-preflight.json \
-            --updater-config-preflight-file release-evidence/updater/windows-mvp-updater-config-preflight.json \
-            --out-dir release-bundle
+            --signing-preflight-file "$RELEASE_EVIDENCE_DIR/signing/windows-mvp-signing-preflight.json" \
+            --updater-config-preflight-file "$RELEASE_EVIDENCE_DIR/updater/windows-mvp-updater-config-preflight.json" \
+            --out-dir "$RELEASE_BUNDLE_DIR"
 
       - name: Upload Windows MVP release bundle
         if: always()

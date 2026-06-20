@@ -1,0 +1,79 @@
+name: windows-mvp-qa
+
+on:
+  workflow_dispatch:
+    inputs:
+      qa_report_json:
+        description: "Complete sanitized Windows MVP QA report JSON."
+        required: true
+        type: string
+
+run-name: windows-mvp-qa report
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-mvp-qa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - run: bun install --frozen-lockfile
+
+      - name: Write QA report input
+        env:
+          QA_REPORT_FILE: ${{ github.workspace }}/release-evidence/qa/windows-mvp-qa-report.json
+          QA_REPORT_JSON: ${{ inputs.qa_report_json }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "$QA_REPORT_FILE")"
+          bun --eval '
+            import { writeFileSync } from "node:fs";
+
+            const reportFile = process.env.QA_REPORT_FILE;
+            const reportJson = process.env.QA_REPORT_JSON ?? "";
+            if (!reportFile) {
+              throw new Error("QA_REPORT_FILE is required");
+            }
+
+            writeFileSync(reportFile, `${reportJson.trimEnd()}\n`, "utf8");
+          '
+
+      - name: Validate Windows MVP QA report
+        env:
+          QA_EVALUATION_FILE: ${{ github.workspace }}/release-evidence/qa-evaluation/windows-mvp-qa-report-evaluation.json
+          QA_REPORT_FILE: ${{ github.workspace }}/release-evidence/qa/windows-mvp-qa-report.json
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "$QA_EVALUATION_FILE")"
+          bun run qa:windows-mvp-report -- \
+            --report-file "$QA_REPORT_FILE" \
+            --out-file "$QA_EVALUATION_FILE"
+
+      - name: Upload Windows MVP QA report
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-mvp-qa-report
+          path: release-evidence/qa/windows-mvp-qa-report.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows MVP QA evaluation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-mvp-qa-evaluation
+          path: release-evidence/qa-evaluation/windows-mvp-qa-report-evaluation.json
+          if-no-files-found: warn
+          retention-days: 14
