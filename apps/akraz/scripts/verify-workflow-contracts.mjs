@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { WINDOWS_MVP_RELEASE_BUNDLE_FILES } from "./windows-mvp-release-bundle.mjs";
 import {
   DEFAULT_QA_REPORT_ARTIFACT,
   DEFAULT_SOAK_REPORT_ARTIFACT,
@@ -19,6 +20,9 @@ const RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH =
   "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json";
 const RELEASE_WORKFLOW_INPUTS_MANIFEST_PATH =
   "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-workflow-inputs.json";
+const RELEASE_BUNDLE_ARTIFACT_NAME = "windows-mvp-release-bundle";
+const RELEASE_BUNDLE_DIRECTORY = "release-bundle";
+const RELEASE_BUNDLE_UPLOAD_PATH = `${RELEASE_BUNDLE_DIRECTORY}/*.json`;
 const RELEASE_BUNDLE_EVIDENCE_SOURCES_SNIPPET = [
   "bun run release:windows-mvp-bundle -- \\",
   `            --evidence-sources-file "${RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH}" \\`,
@@ -40,6 +44,7 @@ const REQUIRED_SMOKE_WORKFLOW_SCRIPTS = [
   "smoke:settings-start",
   "smoke:windows-mvp-soak",
 ];
+const EXPECTED_RELEASE_BUNDLE_FILES = Object.values(WINDOWS_MVP_RELEASE_BUNDLE_FILES).toSorted();
 const SMOKE_SOAK_REPORT_PATH = "apps/akraz/reports/windows-mvp-soak-smoke.json";
 const QA_WORKFLOW_INPUT_ENVIRONMENT = [
   {
@@ -163,6 +168,7 @@ export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoo
     evaluateReleaseWorkflowInputWiring(workflows),
     evaluateReleaseArtifactContract(workflows),
     evaluateReleaseEvidenceSourcesWiring(workflows),
+    evaluateReleaseBundleOutputWiring(workflows),
     evaluateSmokeWorkflowCoverage(workflows),
   ];
 
@@ -576,6 +582,70 @@ function evaluateReleaseEvidenceSourcesWiring(workflows) {
   };
 }
 
+function evaluateReleaseBundleOutputWiring(workflows) {
+  const releaseWorkflow = workflows.find(
+    (workflow) => workflow.name === WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+  );
+  if (!releaseWorkflow) {
+    return {
+      id: "releaseBundleOutputWiring",
+      status: "missing",
+      detail: "releaseWorkflowFileMissing",
+      workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+    };
+  }
+
+  const requiredSnippets = [
+    {
+      id: "releaseBundleDirectoryEnv",
+      snippet: `RELEASE_BUNDLE_DIR: \${{ github.workspace }}/${RELEASE_BUNDLE_DIRECTORY}`,
+    },
+    {
+      id: "releaseBundleOutDirArgument",
+      snippet: '--out-dir "$RELEASE_BUNDLE_DIR"',
+    },
+    {
+      id: "releaseBundleIntegritySmokeCommand",
+      snippet: 'bun run smoke:windows-mvp-release-bundle -- --bundle-dir "$RELEASE_BUNDLE_DIR"',
+    },
+    {
+      id: "releaseBundleUploadArtifactName",
+      snippet: `name: ${RELEASE_BUNDLE_ARTIFACT_NAME}`,
+    },
+    {
+      id: "releaseBundleUploadPath",
+      snippet: `path: ${RELEASE_BUNDLE_UPLOAD_PATH}`,
+    },
+  ];
+  const missingSnippets = requiredSnippets
+    .filter((requirement) => !releaseWorkflow.source.includes(requirement.snippet))
+    .map((requirement) => requirement.id);
+
+  if (missingSnippets.length === 0) {
+    return {
+      id: "releaseBundleOutputWiring",
+      status: "pass",
+      workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+      artifactName: RELEASE_BUNDLE_ARTIFACT_NAME,
+      uploadPath: RELEASE_BUNDLE_UPLOAD_PATH,
+      expectedBundleFiles: EXPECTED_RELEASE_BUNDLE_FILES,
+    };
+  }
+
+  return {
+    id: "releaseBundleOutputWiring",
+    status: "invalid",
+    detail: "releaseBundleOutputWiringDrifted",
+    workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+    missingSnippets,
+    expected: {
+      artifactName: RELEASE_BUNDLE_ARTIFACT_NAME,
+      uploadPath: RELEASE_BUNDLE_UPLOAD_PATH,
+      expectedBundleFiles: EXPECTED_RELEASE_BUNDLE_FILES,
+    },
+  };
+}
+
 function evaluateSmokeWorkflowCoverage(workflows) {
   const checkWorkflow = workflows.find((workflow) => workflow.name === "check.yml");
   if (!checkWorkflow) {
@@ -755,6 +825,16 @@ function buildNextActions(checks) {
           {
             id: "syncReleaseEvidenceSourcesWiring",
             action: "wire the release evidence source manifest generation into the bundle command",
+            workflowFile: check.workflowFile,
+            missingSnippets: check.missingSnippets,
+          },
+        ];
+      case "releaseBundleOutputWiringDrifted":
+        return [
+          {
+            id: "syncReleaseBundleOutputWiring",
+            action:
+              "restore release bundle out-dir, integrity smoke, and artifact upload wiring",
             workflowFile: check.workflowFile,
             missingSnippets: check.missingSnippets,
           },

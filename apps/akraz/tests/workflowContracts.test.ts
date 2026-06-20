@@ -76,6 +76,22 @@ describe("GitHub Actions workflow contracts", () => {
           "soak_report_artifact",
         ],
       });
+    expect(report.checks.find((check) => check.id === "releaseBundleOutputWiring"))
+      .toMatchObject({
+        status: "pass",
+        workflowFile: "windows-mvp-release.yml",
+        artifactName: "windows-mvp-release-bundle",
+        uploadPath: "release-bundle/*.json",
+        expectedBundleFiles: [
+          "windows-mvp-qa-report.json",
+          "windows-mvp-release-bundle.json",
+          "windows-mvp-release-evidence-sources.json",
+          "windows-mvp-release-gate.json",
+          "windows-mvp-signing-preflight.json",
+          "windows-mvp-soak-report.json",
+          "windows-mvp-updater-config-preflight.json",
+        ],
+      });
     expect(report.checks.every((check) => check.status === "pass")).toBe(true);
     expect(report.privacy).toEqual({
       includesSecretValues: false,
@@ -390,6 +406,59 @@ describe("GitHub Actions workflow contracts", () => {
           "releaseBundleIntegritySmokeScript",
           "releaseBundleIntegrityBundleDirArgument",
         ],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects release workflow drift when bundle output is not uploaded from the canonical directory", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-bundle-output-contracts-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory);
+      copyCurrentWorkflows(tempDirectory);
+
+      const releaseWorkflowWithoutCanonicalBundleOutput = readFileSync(
+        join(".github", "workflows", "windows-mvp-release.yml"),
+        "utf8",
+      )
+        .replace('            --out-dir "$RELEASE_BUNDLE_DIR"\n', "")
+        .replace("          path: release-bundle/*.json", "          path: release-output/*.json");
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "windows-mvp-release.yml"),
+        releaseWorkflowWithoutCanonicalBundleOutput,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "releaseBundleOutputWiring"))
+        .toMatchObject({
+          status: "invalid",
+          detail: "releaseBundleOutputWiringDrifted",
+          missingSnippets: ["releaseBundleOutDirArgument", "releaseBundleUploadPath"],
+          expected: {
+            artifactName: "windows-mvp-release-bundle",
+            uploadPath: "release-bundle/*.json",
+            expectedBundleFiles: [
+              "windows-mvp-qa-report.json",
+              "windows-mvp-release-bundle.json",
+              "windows-mvp-release-evidence-sources.json",
+              "windows-mvp-release-gate.json",
+              "windows-mvp-signing-preflight.json",
+              "windows-mvp-soak-report.json",
+              "windows-mvp-updater-config-preflight.json",
+            ],
+          },
+        });
+      expect(report.nextActions).toContainEqual({
+        id: "syncReleaseBundleOutputWiring",
+        action: "restore release bundle out-dir, integrity smoke, and artifact upload wiring",
+        workflowFile: "windows-mvp-release.yml",
+        missingSnippets: ["releaseBundleOutDirArgument", "releaseBundleUploadPath"],
       });
       expect(exitCodeForWorkflowContracts(report)).toBe(1);
     } finally {
