@@ -80,6 +80,15 @@ pub const METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT: &str = "diagnostics.keyboardLayout
 /// JSON-RPC method for emergency input release and local-control recovery.
 pub const METHOD_INPUT_RELEASE_ALL: &str = "input.releaseAll";
 
+/// JSON-RPC method for starting a local peer pairing confirmation.
+pub const METHOD_PAIRING_START: &str = "pairing.start";
+
+/// JSON-RPC method for accepting a pending peer pairing.
+pub const METHOD_PAIRING_ACCEPT: &str = "pairing.accept";
+
+/// JSON-RPC method for rejecting a pending peer pairing.
+pub const METHOD_PAIRING_REJECT: &str = "pairing.reject";
+
 /// JSON-RPC method for connecting the active peer session transport.
 pub const METHOD_SESSION_CONNECT: &str = "session.connect";
 
@@ -784,6 +793,9 @@ pub enum IpcRequest {
     DiagnosticsScreenTopology(JsonRpcRequest<DiagnosticsScreenTopologyParams>),
     DiagnosticsKeyboardLayout(JsonRpcRequest<DiagnosticsKeyboardLayoutParams>),
     InputReleaseAll(JsonRpcRequest<InputReleaseAllParams>),
+    PairingStart(JsonRpcRequest<PairingStartParams>),
+    PairingAccept(JsonRpcRequest<PairingAcceptParams>),
+    PairingReject(JsonRpcRequest<PairingRejectParams>),
     SessionConnect(JsonRpcRequest<SessionConnectParams>),
     SessionDiscoveryCandidates(JsonRpcRequest<SessionDiscoveryCandidatesParams>),
     SessionDisconnect(JsonRpcRequest<SessionDisconnectParams>),
@@ -800,6 +812,9 @@ impl IpcRequest {
             Self::DiagnosticsScreenTopology(request) => &request.id,
             Self::DiagnosticsKeyboardLayout(request) => &request.id,
             Self::InputReleaseAll(request) => &request.id,
+            Self::PairingStart(request) => &request.id,
+            Self::PairingAccept(request) => &request.id,
+            Self::PairingReject(request) => &request.id,
             Self::SessionConnect(request) => &request.id,
             Self::SessionDiscoveryCandidates(request) => &request.id,
             Self::SessionDisconnect(request) => &request.id,
@@ -816,6 +831,9 @@ impl IpcRequest {
             Self::DiagnosticsScreenTopology(request) => &request.method,
             Self::DiagnosticsKeyboardLayout(request) => &request.method,
             Self::InputReleaseAll(request) => &request.method,
+            Self::PairingStart(request) => &request.method,
+            Self::PairingAccept(request) => &request.method,
+            Self::PairingReject(request) => &request.method,
             Self::SessionConnect(request) => &request.method,
             Self::SessionDiscoveryCandidates(request) => &request.method,
             Self::SessionDisconnect(request) => &request.method,
@@ -932,6 +950,28 @@ pub struct DiagnosticsKeyboardLayoutParams {}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputReleaseAllParams {}
+
+/// Params for `pairing.start`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingStartParams {
+    pub peer_document_json: String,
+}
+
+/// Params for `pairing.accept`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingAcceptParams {
+    pub peer_id: String,
+    pub verification_code: String,
+}
+
+/// Params for `pairing.reject`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingRejectParams {
+    pub peer_id: String,
+}
 
 /// Params for `session.connect`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1301,6 +1341,36 @@ pub struct DiagnosticsPrivacySnapshot {
 pub struct InputReleaseAllResult {
     pub released: bool,
     pub mode: ControlModeSnapshot,
+}
+
+/// `pairing.start` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingStartResult {
+    pub peer_id: String,
+    pub display_name: String,
+    pub fingerprint: String,
+    pub verification_code: String,
+    pub capabilities: akraz_protocol::CapabilityFlags,
+}
+
+/// `pairing.accept` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingAcceptResult {
+    pub trusted: bool,
+    pub peer_id: String,
+    pub display_name: String,
+    pub fingerprint: String,
+    pub capabilities: akraz_protocol::CapabilityFlags,
+}
+
+/// `pairing.reject` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingRejectResult {
+    pub rejected: bool,
+    pub peer_id: String,
 }
 
 /// Wire-safe active peer session snapshot.
@@ -1692,6 +1762,9 @@ pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
             parse_typed_request(raw).map(IpcRequest::DiagnosticsKeyboardLayout)
         }
         METHOD_INPUT_RELEASE_ALL => parse_typed_request(raw).map(IpcRequest::InputReleaseAll),
+        METHOD_PAIRING_START => parse_typed_request(raw).map(IpcRequest::PairingStart),
+        METHOD_PAIRING_ACCEPT => parse_typed_request(raw).map(IpcRequest::PairingAccept),
+        METHOD_PAIRING_REJECT => parse_typed_request(raw).map(IpcRequest::PairingReject),
         METHOD_SESSION_CONNECT => parse_typed_request(raw).map(IpcRequest::SessionConnect),
         METHOD_SESSION_DISCOVERY_CANDIDATES => {
             parse_typed_request(raw).map(IpcRequest::SessionDiscoveryCandidates)
@@ -1753,15 +1826,18 @@ mod tests {
         LocalIpcClient, LocalIpcServer, LogicalPointSnapshot, LogicalRectSnapshot,
         METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS,
         METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
-        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
-        METHOD_SESSION_DISCOVERY_CANDIDATES, OsLocalIpcClient, PeerStatus, PermissionIssue,
-        PermissionsProbe, ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult,
-        SessionDisconnectParams, SessionDisconnectResult, SessionDiscoveryCandidate,
-        SessionDiscoveryCandidatesParams, SessionDiscoveryCandidatesResult, SessionStatus,
-        build_diagnostics_latency_histogram, build_diagnostics_snapshot,
-        build_diagnostics_support_bundle, build_diagnostics_support_bundle_with_previous_crash,
-        call_json_rpc, diagnostics_session_type_from_values, parse_request_line,
-        resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
+        METHOD_INPUT_RELEASE_ALL, METHOD_PAIRING_ACCEPT, METHOD_PAIRING_REJECT,
+        METHOD_PAIRING_START, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
+        METHOD_SESSION_DISCOVERY_CANDIDATES, OsLocalIpcClient, PairingAcceptParams,
+        PairingAcceptResult, PairingRejectParams, PairingRejectResult, PairingStartParams,
+        PairingStartResult, PeerStatus, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
+        SessionConnectParams, SessionConnectResult, SessionDisconnectParams,
+        SessionDisconnectResult, SessionDiscoveryCandidate, SessionDiscoveryCandidatesParams,
+        SessionDiscoveryCandidatesResult, SessionStatus, build_diagnostics_latency_histogram,
+        build_diagnostics_snapshot, build_diagnostics_support_bundle,
+        build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
+        diagnostics_session_type_from_values, parse_request_line, resolve_default_endpoint,
+        serve_os_local_ipc_once, to_json_line,
     };
     use akraz_protocol::CapabilityFlags;
     use serde_json::json;
@@ -2449,6 +2525,219 @@ mod tests {
                     "address": "127.0.0.1:24888"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn pairing_start_request_uses_camel_case_contract() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_PAIRING_START,
+            PairingStartParams {
+                peer_document_json: r#"{"kind":"akraz.peerIdentity"}"#.to_string(),
+            },
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "method": "pairing.start",
+                "params": {
+                    "peerDocumentJson": "{\"kind\":\"akraz.peerIdentity\"}"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn pairing_start_response_uses_camel_case_contract() {
+        let response = JsonRpcSuccess::new(
+            "req_1",
+            PairingStartResult {
+                peer_id: "linux-laptop".to_string(),
+                display_name: "Linux Laptop".to_string(),
+                fingerprint: "AKRZ-PAIRING".to_string(),
+                verification_code: "123456".to_string(),
+                capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            },
+        );
+        let line = match to_json_line(&response) {
+            Ok(line) => line,
+            Err(error) => panic!("expected response serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "result": {
+                    "peerId": "linux-laptop",
+                    "displayName": "Linux Laptop",
+                    "fingerprint": "AKRZ-PAIRING",
+                    "verificationCode": "123456",
+                    "capabilities": 3
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn pairing_accept_request_uses_camel_case_contract() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_PAIRING_ACCEPT,
+            PairingAcceptParams {
+                peer_id: "linux-laptop".to_string(),
+                verification_code: "123456".to_string(),
+            },
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "method": "pairing.accept",
+                "params": {
+                    "peerId": "linux-laptop",
+                    "verificationCode": "123456"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn pairing_accept_response_uses_camel_case_contract() {
+        let response = JsonRpcSuccess::new(
+            "req_1",
+            PairingAcceptResult {
+                trusted: true,
+                peer_id: "linux-laptop".to_string(),
+                display_name: "Linux Laptop".to_string(),
+                fingerprint: "AKRZ-TRUSTED".to_string(),
+                capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            },
+        );
+        let line = match to_json_line(&response) {
+            Ok(line) => line,
+            Err(error) => panic!("expected response serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "result": {
+                    "trusted": true,
+                    "peerId": "linux-laptop",
+                    "displayName": "Linux Laptop",
+                    "fingerprint": "AKRZ-TRUSTED",
+                    "capabilities": 3
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn pairing_reject_request_and_response_use_camel_case_contract() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_PAIRING_REJECT,
+            PairingRejectParams {
+                peer_id: "linux-laptop".to_string(),
+            },
+        );
+        let request_line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+        let response = JsonRpcSuccess::new(
+            "req_1",
+            PairingRejectResult {
+                rejected: true,
+                peer_id: "linux-laptop".to_string(),
+            },
+        );
+        let response_line = match to_json_line(&response) {
+            Ok(line) => line,
+            Err(error) => panic!("expected response serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&request_line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "method": "pairing.reject",
+                "params": {
+                    "peerId": "linux-laptop"
+                }
+            })
+        );
+        assert_eq!(
+            json_value_or_panic(&response_line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "result": {
+                    "rejected": true,
+                    "peerId": "linux-laptop"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn parses_pairing_request_lines() {
+        let start_request = JsonRpcRequest::new(
+            "req_start",
+            METHOD_PAIRING_START,
+            PairingStartParams {
+                peer_document_json: r#"{"kind":"akraz.peerIdentity"}"#.to_string(),
+            },
+        );
+        let accept_request = JsonRpcRequest::new(
+            "req_accept",
+            METHOD_PAIRING_ACCEPT,
+            PairingAcceptParams {
+                peer_id: "linux-laptop".to_string(),
+                verification_code: "123456".to_string(),
+            },
+        );
+        let reject_request = JsonRpcRequest::new(
+            "req_reject",
+            METHOD_PAIRING_REJECT,
+            PairingRejectParams {
+                peer_id: "linux-laptop".to_string(),
+            },
+        );
+        let start_line = to_json_line(&start_request).expect("start request line");
+        let accept_line = to_json_line(&accept_request).expect("accept request line");
+        let reject_line = to_json_line(&reject_request).expect("reject request line");
+
+        assert_eq!(
+            parse_request_line(&start_line),
+            Ok(IpcRequest::PairingStart(start_request))
+        );
+        assert_eq!(
+            parse_request_line(&accept_line),
+            Ok(IpcRequest::PairingAccept(accept_request))
+        );
+        assert_eq!(
+            parse_request_line(&reject_line),
+            Ok(IpcRequest::PairingReject(reject_request))
         );
     }
 

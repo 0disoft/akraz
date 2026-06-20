@@ -26,6 +26,7 @@ const ED25519_SECRET_KEY_LEN: usize = 32;
 const ED25519_PUBLIC_KEY_LEN: usize = 32;
 const FINGERPRINT_BODY_LEN: usize = 32;
 const FINGERPRINT_GROUP_LEN: usize = 4;
+const PAIRING_VERIFICATION_CODE_MODULUS: u32 = 1_000_000;
 const DEFAULT_DISPLAY_NAME: &str = "Akraz Device";
 
 /// Build the stable Akraz fingerprint shown to users when they compare devices.
@@ -41,6 +42,54 @@ pub fn fingerprint_for_public_key(identity_public_key: &[u8]) -> String {
         }
     }
     fingerprint
+}
+
+/// Build the six-digit code users compare before accepting a peer identity.
+pub fn pairing_verification_code(
+    local_identity: &DeviceIdentity,
+    peer_identity: &TrustedPeerIdentity,
+) -> String {
+    let (first_id, first_key, first_fingerprint, second_id, second_key, second_fingerprint) =
+        if local_identity.identity_public_key() <= peer_identity.identity_public_key() {
+            (
+                local_identity.device_id(),
+                local_identity.identity_public_key(),
+                local_identity.fingerprint(),
+                peer_identity.peer_id(),
+                peer_identity.identity_public_key(),
+                peer_identity.fingerprint(),
+            )
+        } else {
+            (
+                peer_identity.peer_id(),
+                peer_identity.identity_public_key(),
+                peer_identity.fingerprint(),
+                local_identity.device_id(),
+                local_identity.identity_public_key(),
+                local_identity.fingerprint(),
+            )
+        };
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"akraz.pairing.verificationCode.v1");
+    update_pairing_verification_component(&mut hasher, first_id.as_bytes());
+    update_pairing_verification_component(&mut hasher, first_key);
+    update_pairing_verification_component(&mut hasher, first_fingerprint.as_bytes());
+    update_pairing_verification_component(&mut hasher, second_id.as_bytes());
+    update_pairing_verification_component(&mut hasher, second_key);
+    update_pairing_verification_component(&mut hasher, second_fingerprint.as_bytes());
+
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+    let value = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        % PAIRING_VERIFICATION_CODE_MODULUS;
+    format!("{value:06}")
+}
+
+fn update_pairing_verification_component(hasher: &mut blake3::Hasher, value: &[u8]) {
+    let length = u32::try_from(value.len()).unwrap_or(u32::MAX);
+    hasher.update(&length.to_be_bytes());
+    hasher.update(value);
 }
 
 /// Ed25519 signing key used as the local long-lived Akraz identity key.
@@ -1267,7 +1316,7 @@ mod tests {
         CorruptIdentityFileSource, DeviceIdentity, Ed25519IdentityKey, Ed25519PublicKey,
         FileIdentityStore, IdentityDocumentError, IdentityPublicKey, IdentitySecretKey,
         IdentityStoreError, LocalIdentity, PairingIdentityDocument, TrustedPeer,
-        TrustedPeerIdentity, fingerprint_for_public_key,
+        TrustedPeerIdentity, fingerprint_for_public_key, pairing_verification_code,
     };
 
     #[test]
@@ -1578,6 +1627,84 @@ mod tests {
             error,
             IdentityDocumentError::FingerprintMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn pairing_verification_code_is_symmetric_for_two_public_identities() {
+        let local_secret = Ed25519IdentityKey::generate();
+        let local_public = local_secret.public_key_bytes();
+        let local_identity = DeviceIdentity::new(
+            "device-a",
+            "Device A",
+            local_public,
+            fingerprint_for_public_key(&local_public),
+        );
+        let peer_secret = Ed25519IdentityKey::generate();
+        let peer_public = peer_secret.public_key_bytes();
+        let peer_identity = TrustedPeerIdentity::new(
+            "device-b",
+            "Device B",
+            peer_public,
+            fingerprint_for_public_key(&peer_public),
+            CapabilityFlags::POINTER,
+        );
+        let peer_as_local = DeviceIdentity::new(
+            peer_identity.peer_id(),
+            peer_identity.display_name(),
+            peer_identity.identity_public_key(),
+            peer_identity.fingerprint(),
+        );
+        let local_as_peer = TrustedPeerIdentity::new(
+            local_identity.device_id(),
+            local_identity.display_name(),
+            local_identity.identity_public_key(),
+            local_identity.fingerprint(),
+            CapabilityFlags::KEYBOARD,
+        );
+
+        let code = pairing_verification_code(&local_identity, &peer_identity);
+
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|character| character.is_ascii_digit()));
+        assert_eq!(
+            code,
+            pairing_verification_code(&peer_as_local, &local_as_peer)
+        );
+    }
+
+    #[test]
+    fn pairing_verification_code_changes_when_peer_identity_key_changes() {
+        let local_secret = Ed25519IdentityKey::generate();
+        let local_public = local_secret.public_key_bytes();
+        let local_identity = DeviceIdentity::new(
+            "device-a",
+            "Device A",
+            local_public,
+            fingerprint_for_public_key(&local_public),
+        );
+        let first_peer_secret = Ed25519IdentityKey::generate();
+        let first_peer_public = first_peer_secret.public_key_bytes();
+        let first_peer = TrustedPeerIdentity::new(
+            "device-b",
+            "Device B",
+            first_peer_public,
+            fingerprint_for_public_key(&first_peer_public),
+            CapabilityFlags::POINTER,
+        );
+        let second_peer_secret = Ed25519IdentityKey::generate();
+        let second_peer_public = second_peer_secret.public_key_bytes();
+        let second_peer = TrustedPeerIdentity::new(
+            "device-b",
+            "Device B",
+            second_peer_public,
+            fingerprint_for_public_key(&second_peer_public),
+            CapabilityFlags::POINTER,
+        );
+
+        assert_ne!(
+            pairing_verification_code(&local_identity, &first_peer),
+            pairing_verification_code(&local_identity, &second_peer)
+        );
     }
 
     #[test]

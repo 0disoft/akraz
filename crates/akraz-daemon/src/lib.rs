@@ -1,6 +1,6 @@
 //! Daemon status builders shared by akraz daemon and diagnostic clients.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{BufRead, BufReader, Write};
@@ -23,16 +23,18 @@ use akraz_discovery::{
 };
 use akraz_identity::{
     Ed25519PublicKey, FileIdentityStore, IdentityPublicKey, IdentitySecretKey, LocalIdentity,
-    TrustedPeer, TrustedPeerIdentity,
+    PairingIdentityDocument, TrustedPeer, TrustedPeerIdentity, pairing_verification_code,
 };
 use akraz_ipc::{
     ControlModeSnapshot, DaemonLogEntry, DaemonLogLevel, DaemonLogsTail, DaemonShutdownResult,
     DaemonStatus, DiagnosticsKeyboardLayout, DiagnosticsScreenTopology, InputReleaseAllResult,
     IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError, JsonRpcError,
-    JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PeerStatus, PermissionIssue, PermissionsProbe,
-    ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult, SessionDisconnectResult,
-    SessionDiscoveryCandidate, SessionDiscoveryCandidatesResult, SessionStatus, parse_request_line,
-    serve_os_local_ipc_once, to_json_line,
+    JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PairingAcceptParams, PairingAcceptResult,
+    PairingRejectParams, PairingRejectResult, PairingStartParams, PairingStartResult, PeerStatus,
+    PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectParams,
+    SessionConnectResult, SessionDisconnectResult, SessionDiscoveryCandidate,
+    SessionDiscoveryCandidatesResult, SessionStatus, parse_request_line, serve_os_local_ipc_once,
+    to_json_line,
 };
 use akraz_platform::{
     DesktopGeometry, InputCaptureConfig, InputCapturePolicy, InputCaptureSession, PlatformAdapter,
@@ -65,6 +67,35 @@ const PRE_TLS_EXPORTER: [u8; TLS_EXPORTER_LEN] = [0; TLS_EXPORTER_LEN];
 
 fn peer_session_capabilities() -> CapabilityFlags {
     CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+}
+
+fn normalize_pairing_document_json(value: &str) -> Result<String, PlatformError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(PlatformError::new("peer identity is required"));
+    }
+
+    Ok(value.to_string())
+}
+
+fn normalize_pairing_peer_id(value: &str) -> Result<String, PlatformError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(PlatformError::new("pairing peer id is required"));
+    }
+
+    Ok(value.to_string())
+}
+
+fn normalize_pairing_verification_code(value: &str) -> Result<String, PlatformError> {
+    let value = value.trim();
+    if value.len() != 6 || !value.chars().all(|character| character.is_ascii_digit()) {
+        return Err(PlatformError::new(
+            "pairing verification code must be exactly 6 digits",
+        ));
+    }
+
+    Ok(value.to_string())
 }
 
 fn generate_peer_session_nonce() -> [u8; HANDSHAKE_NONCE_LEN] {
@@ -704,6 +735,7 @@ impl PeerSessionReconnectBackoff {
 pub struct ManagedPeerSessionTransport {
     active_session: Arc<Mutex<Option<TcpPeerSessionTransport>>>,
     reconnect_backoff: Arc<Mutex<PeerSessionReconnectBackoff>>,
+    pending_pairings: Arc<Mutex<BTreeMap<String, PendingPairing>>>,
     auth_config: Option<ManagedPeerSessionAuthConfig>,
 }
 
@@ -717,6 +749,12 @@ pub struct ManagedPeerSessionAuthConfig {
 struct PeerSessionDiscoveryIdentityContext {
     local_device_id: DeviceId,
     trusted_peers: Vec<TrustedPeerIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPairing {
+    peer: TrustedPeerIdentity,
+    verification_code: String,
 }
 
 impl ManagedPeerSessionTransport {
@@ -733,6 +771,7 @@ impl ManagedPeerSessionTransport {
         Self {
             active_session: Arc::new(Mutex::new(None)),
             reconnect_backoff: Arc::new(Mutex::new(PeerSessionReconnectBackoff::default())),
+            pending_pairings: Arc::new(Mutex::new(BTreeMap::new())),
             auth_config: Some(ManagedPeerSessionAuthConfig {
                 identity_store: identity_store.into(),
                 identity_display_name: identity_display_name.into(),
@@ -824,6 +863,125 @@ impl ManagedPeerSessionTransport {
             peer_session_capabilities(),
             build_version,
         )))
+    }
+
+    /// Start a local confirmation flow for a public peer identity document.
+    pub fn start_pairing(
+        &self,
+        params: &PairingStartParams,
+    ) -> Result<PairingStartResult, PlatformError> {
+        let peer_document_json = normalize_pairing_document_json(&params.peer_document_json)?;
+        let auth_config = self.auth_config_for("pairing.start")?;
+        let store = FileIdentityStore::new(&auth_config.identity_store);
+        let local = store
+            .load_or_create(&auth_config.identity_display_name)
+            .map_err(|error| {
+                PlatformError::new(format!(
+                    "failed to load identity store {}: {error}",
+                    auth_config.identity_store.display()
+                ))
+            })?;
+        let document: PairingIdentityDocument =
+            serde_json::from_str(&peer_document_json).map_err(|error| {
+                PlatformError::new(format!("failed to decode peer identity: {error}"))
+            })?;
+        let peer = document
+            .into_trusted_peer_identity()
+            .map_err(|error| PlatformError::new(format!("invalid peer identity: {error}")))?;
+        if peer.peer_id() == local.identity().device_id() {
+            return Err(PlatformError::new(
+                "pairing peer identity must not be the local identity",
+            ));
+        }
+
+        let verification_code = pairing_verification_code(local.identity(), &peer);
+        let result = PairingStartResult {
+            peer_id: peer.peer_id().to_string(),
+            display_name: peer.display_name().to_string(),
+            fingerprint: peer.fingerprint().to_string(),
+            verification_code: verification_code.clone(),
+            capabilities: peer.capabilities(),
+        };
+
+        self.pending_pairings
+            .lock()
+            .map_err(|_| PlatformError::new("pending pairings are unavailable"))?
+            .insert(
+                peer.peer_id().to_string(),
+                PendingPairing {
+                    peer,
+                    verification_code,
+                },
+            );
+
+        Ok(result)
+    }
+
+    /// Accept a pending pairing only after the user-confirmed code matches.
+    pub fn accept_pairing(
+        &self,
+        params: &PairingAcceptParams,
+    ) -> Result<PairingAcceptResult, PlatformError> {
+        let peer_id = normalize_pairing_peer_id(&params.peer_id)?;
+        let verification_code = normalize_pairing_verification_code(&params.verification_code)?;
+        let pending = self.pending_pairing(&peer_id)?;
+
+        if pending.verification_code != verification_code {
+            return Err(PlatformError::new(
+                "pairing verification code does not match",
+            ));
+        }
+
+        let auth_config = self.auth_config_for("pairing.accept")?;
+        let store = FileIdentityStore::new(&auth_config.identity_store);
+        store
+            .load_or_create(&auth_config.identity_display_name)
+            .map_err(|error| {
+                PlatformError::new(format!(
+                    "failed to load identity store {}: {error}",
+                    auth_config.identity_store.display()
+                ))
+            })?;
+        store.save_trusted_peer(&pending.peer).map_err(|error| {
+            PlatformError::new(format!(
+                "failed to save trusted peer {} to {}: {error}",
+                pending.peer.peer_id(),
+                auth_config.identity_store.display()
+            ))
+        })?;
+        self.remove_pending_pairing_if_code_matches(&peer_id, &verification_code)?;
+
+        Ok(PairingAcceptResult {
+            trusted: true,
+            peer_id: pending.peer.peer_id().to_string(),
+            display_name: pending.peer.display_name().to_string(),
+            fingerprint: pending.peer.fingerprint().to_string(),
+            capabilities: pending.peer.capabilities(),
+        })
+    }
+
+    /// Reject a pending pairing without changing the trust store.
+    pub fn reject_pairing(
+        &self,
+        params: &PairingRejectParams,
+    ) -> Result<PairingRejectResult, PlatformError> {
+        let peer_id = normalize_pairing_peer_id(&params.peer_id)?;
+        let removed = self
+            .pending_pairings
+            .lock()
+            .map_err(|_| PlatformError::new("pending pairings are unavailable"))?
+            .remove(&peer_id);
+
+        if removed.is_none() {
+            return Err(PlatformError::new(format!(
+                "pending pairing not found for peer {peer_id}"
+            )));
+        }
+
+        Ok(PairingRejectResult {
+            rejected: true,
+            peer_id,
+        })
     }
 
     /// Attach an already connected TCP peer session.
@@ -918,6 +1076,47 @@ impl ManagedPeerSessionTransport {
             .lock()
             .map_err(|_| PlatformError::new("managed peer session is unavailable"))
             .map(|session| session.clone())
+    }
+
+    fn auth_config_for(
+        &self,
+        method: &str,
+    ) -> Result<&ManagedPeerSessionAuthConfig, PlatformError> {
+        self.auth_config.as_ref().ok_or_else(|| {
+            PlatformError::new(format!(
+                "managed peer session requires identity store before {method}"
+            ))
+        })
+    }
+
+    fn pending_pairing(&self, peer_id: &str) -> Result<PendingPairing, PlatformError> {
+        self.pending_pairings
+            .lock()
+            .map_err(|_| PlatformError::new("pending pairings are unavailable"))?
+            .get(peer_id)
+            .cloned()
+            .ok_or_else(|| {
+                PlatformError::new(format!("pending pairing not found for peer {peer_id}"))
+            })
+    }
+
+    fn remove_pending_pairing_if_code_matches(
+        &self,
+        peer_id: &str,
+        verification_code: &str,
+    ) -> Result<(), PlatformError> {
+        let mut pending_pairings = self
+            .pending_pairings
+            .lock()
+            .map_err(|_| PlatformError::new("pending pairings are unavailable"))?;
+        if pending_pairings
+            .get(peer_id)
+            .is_some_and(|pending| pending.verification_code == verification_code)
+        {
+            pending_pairings.remove(peer_id);
+        }
+
+        Ok(())
     }
 
     fn ensure_connect_backoff_allows(&self, now: Instant) -> Result<(), PlatformError> {
@@ -3566,6 +3765,66 @@ fn handle_ipc_request(
                 }
             }
         }
+        IpcRequest::PairingStart(request) => match peer_sessions.start_pairing(&request.params) {
+            Ok(result) => {
+                record_daemon_event(
+                    logs,
+                    DaemonLogLevel::Info,
+                    "pairing.start",
+                    "Peer pairing started.",
+                );
+                encode_response(&JsonRpcSuccess::new(request.id, result))
+            }
+            Err(error) => {
+                record_daemon_event(
+                    logs,
+                    DaemonLogLevel::Warn,
+                    "pairing.start.failed",
+                    "Peer pairing start failed.",
+                );
+                encode_platform_error(request.id, "pairing start unavailable", error)
+            }
+        },
+        IpcRequest::PairingAccept(request) => match peer_sessions.accept_pairing(&request.params) {
+            Ok(result) => {
+                record_daemon_event(
+                    logs,
+                    DaemonLogLevel::Info,
+                    "pairing.accept",
+                    "Peer pairing accepted.",
+                );
+                encode_response(&JsonRpcSuccess::new(request.id, result))
+            }
+            Err(error) => {
+                record_daemon_event(
+                    logs,
+                    DaemonLogLevel::Warn,
+                    "pairing.accept.failed",
+                    "Peer pairing accept failed.",
+                );
+                encode_platform_error(request.id, "pairing accept unavailable", error)
+            }
+        },
+        IpcRequest::PairingReject(request) => match peer_sessions.reject_pairing(&request.params) {
+            Ok(result) => {
+                record_daemon_event(
+                    logs,
+                    DaemonLogLevel::Info,
+                    "pairing.reject",
+                    "Peer pairing rejected.",
+                );
+                encode_response(&JsonRpcSuccess::new(request.id, result))
+            }
+            Err(error) => {
+                record_daemon_event(
+                    logs,
+                    DaemonLogLevel::Warn,
+                    "pairing.reject.failed",
+                    "Peer pairing reject failed.",
+                );
+                encode_platform_error(request.id, "pairing reject unavailable", error)
+            }
+        },
         IpcRequest::SessionConnect(request) => {
             match connect_peer_session(&request.params, peer_sessions) {
                 Ok(result) => {
@@ -3913,6 +4172,7 @@ mod tests {
     use akraz_identity::{
         DeviceIdentity, Ed25519IdentityKey, Ed25519PublicKey, FileIdentityStore, LocalIdentity,
         PairingIdentityDocument, TrustedPeer, TrustedPeerIdentity, fingerprint_for_public_key,
+        pairing_verification_code,
     };
     use akraz_ipc::{
         ControlModeSnapshot, DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams,
@@ -3922,8 +4182,10 @@ mod tests {
         IpcPlatformCapabilities, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer,
         METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS,
         METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
-        METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
-        METHOD_SESSION_DISCOVERY_CANDIDATES, OsLocalIpcClient, PeerStatus, PermissionsProbe,
+        METHOD_INPUT_RELEASE_ALL, METHOD_PAIRING_ACCEPT, METHOD_PAIRING_START,
+        METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES,
+        OsLocalIpcClient, PairingAcceptParams, PairingAcceptResult, PairingRejectParams,
+        PairingRejectResult, PairingStartParams, PairingStartResult, PeerStatus, PermissionsProbe,
         PermissionsProbeParams, SessionConnectParams, SessionDisconnectResult,
         SessionDiscoveryCandidatesParams, SessionDiscoveryCandidatesResult, SessionStatus,
         call_json_rpc, to_json_line,
@@ -4310,6 +4572,25 @@ mod tests {
         }
     }
 
+    fn pairing_document_fixture(device_id: &str, display_name: &str) -> (DeviceIdentity, String) {
+        let secret = Ed25519IdentityKey::generate();
+        let public_key = secret.public_key_bytes();
+        let identity = DeviceIdentity::new(
+            device_id,
+            display_name,
+            public_key,
+            fingerprint_for_public_key(&public_key),
+        );
+        let document = PairingIdentityDocument::from_device_identity(
+            &identity,
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+        let document_json =
+            serde_json::to_string(&document).expect("pairing identity document JSON");
+
+        (identity, document_json)
+    }
+
     #[test]
     fn daemon_status_reflects_runtime_state_and_capabilities() {
         let state = RuntimeInputState::new();
@@ -4390,6 +4671,233 @@ mod tests {
                 .expect("TCP peer session server")
                 .is_ok()
         );
+        let _ = std::fs::remove_file(&identity_store_path);
+    }
+
+    #[test]
+    fn pairing_start_accept_saves_trusted_peer_after_code_confirmation() {
+        let identity_store_path = unique_identity_store_path("pairing-accept");
+        let _ = std::fs::remove_file(&identity_store_path);
+        let identity_store = FileIdentityStore::new(&identity_store_path);
+        let local = identity_store
+            .load_or_create("Windows Desktop")
+            .expect("create local identity store");
+        let (peer_identity, peer_document_json) =
+            pairing_document_fixture("linux-laptop", "Linux Laptop");
+        let peer = PairingIdentityDocument::from_device_identity(
+            &peer_identity,
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        )
+        .into_trusted_peer_identity()
+        .expect("trusted peer identity");
+        let expected_code = pairing_verification_code(local.identity(), &peer);
+        let peer_sessions = ManagedPeerSessionTransport::with_identity_store(
+            &identity_store_path,
+            "Windows Desktop",
+        );
+
+        let start = peer_sessions
+            .start_pairing(&PairingStartParams { peer_document_json })
+            .expect("pairing start");
+
+        assert_eq!(
+            start,
+            PairingStartResult {
+                peer_id: "linux-laptop".to_string(),
+                display_name: "Linux Laptop".to_string(),
+                fingerprint: peer_identity.fingerprint().to_string(),
+                verification_code: expected_code.clone(),
+                capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            }
+        );
+        assert!(identity_store.load_trusted_peer("linux-laptop").is_err());
+
+        let accept = peer_sessions
+            .accept_pairing(&PairingAcceptParams {
+                peer_id: " linux-laptop ".to_string(),
+                verification_code: format!(" {expected_code} "),
+            })
+            .expect("pairing accept");
+
+        assert_eq!(
+            accept,
+            PairingAcceptResult {
+                trusted: true,
+                peer_id: "linux-laptop".to_string(),
+                display_name: "Linux Laptop".to_string(),
+                fingerprint: peer_identity.fingerprint().to_string(),
+                capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            }
+        );
+        assert_eq!(
+            identity_store
+                .load_trusted_peer("linux-laptop")
+                .expect("trusted peer saved")
+                .identity()
+                .fingerprint(),
+            peer_identity.fingerprint()
+        );
+        assert!(
+            peer_sessions
+                .accept_pairing(&PairingAcceptParams {
+                    peer_id: "linux-laptop".to_string(),
+                    verification_code: expected_code,
+                })
+                .expect_err("accepted pairing should leave pending state")
+                .to_string()
+                .contains("pending pairing not found")
+        );
+
+        let _ = std::fs::remove_file(&identity_store_path);
+    }
+
+    #[test]
+    fn pairing_accept_rejects_wrong_code_without_saving_peer() {
+        let identity_store_path = unique_identity_store_path("pairing-wrong-code");
+        let _ = std::fs::remove_file(&identity_store_path);
+        let identity_store = FileIdentityStore::new(&identity_store_path);
+        identity_store
+            .load_or_create("Windows Desktop")
+            .expect("create local identity store");
+        let (_, peer_document_json) = pairing_document_fixture("linux-laptop", "Linux Laptop");
+        let peer_sessions = ManagedPeerSessionTransport::with_identity_store(
+            &identity_store_path,
+            "Windows Desktop",
+        );
+        let start = peer_sessions
+            .start_pairing(&PairingStartParams { peer_document_json })
+            .expect("pairing start");
+        let wrong_code = if start.verification_code == "000000" {
+            "111111"
+        } else {
+            "000000"
+        };
+
+        let error = peer_sessions
+            .accept_pairing(&PairingAcceptParams {
+                peer_id: "linux-laptop".to_string(),
+                verification_code: wrong_code.to_string(),
+            })
+            .expect_err("wrong pairing code should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("verification code does not match")
+        );
+        assert!(identity_store.load_trusted_peer("linux-laptop").is_err());
+
+        let _ = std::fs::remove_file(&identity_store_path);
+    }
+
+    #[test]
+    fn pairing_reject_removes_pending_pairing_without_saving_peer() {
+        let identity_store_path = unique_identity_store_path("pairing-reject");
+        let _ = std::fs::remove_file(&identity_store_path);
+        let identity_store = FileIdentityStore::new(&identity_store_path);
+        identity_store
+            .load_or_create("Windows Desktop")
+            .expect("create local identity store");
+        let (_, peer_document_json) = pairing_document_fixture("linux-laptop", "Linux Laptop");
+        let peer_sessions = ManagedPeerSessionTransport::with_identity_store(
+            &identity_store_path,
+            "Windows Desktop",
+        );
+        let start = peer_sessions
+            .start_pairing(&PairingStartParams { peer_document_json })
+            .expect("pairing start");
+
+        let reject = peer_sessions
+            .reject_pairing(&PairingRejectParams {
+                peer_id: "linux-laptop".to_string(),
+            })
+            .expect("pairing reject");
+
+        assert_eq!(
+            reject,
+            PairingRejectResult {
+                rejected: true,
+                peer_id: "linux-laptop".to_string(),
+            }
+        );
+        assert!(identity_store.load_trusted_peer("linux-laptop").is_err());
+        assert!(
+            peer_sessions
+                .accept_pairing(&PairingAcceptParams {
+                    peer_id: "linux-laptop".to_string(),
+                    verification_code: start.verification_code,
+                })
+                .expect_err("rejected pairing should not be acceptable")
+                .to_string()
+                .contains("pending pairing not found")
+        );
+
+        let _ = std::fs::remove_file(&identity_store_path);
+    }
+
+    #[test]
+    fn daemon_ipc_pairing_start_and_accept_save_trusted_peer() {
+        let identity_store_path = unique_identity_store_path("pairing-ipc");
+        let _ = std::fs::remove_file(&identity_store_path);
+        let identity_store = FileIdentityStore::new(&identity_store_path);
+        identity_store
+            .load_or_create("Windows Desktop")
+            .expect("create local identity store");
+        let (peer_identity, peer_document_json) =
+            pairing_document_fixture("linux-laptop", "Linux Laptop");
+        let state = shared_runtime_state(RuntimeInputState::new());
+        let platform = FakePlatformAdapter::default();
+        let dispatcher = Arc::new(LocalPlatformCoreActionDispatcher::new(
+            platform.clone(),
+            NoopCoreActionDispatcher,
+        ));
+        let server = DaemonIpcServer::from_shared_state_dispatcher_and_peer_sessions(
+            state,
+            platform,
+            dispatcher,
+            ManagedPeerSessionTransport::with_identity_store(
+                &identity_store_path,
+                "Windows Desktop",
+            ),
+        );
+        let start_request = JsonRpcRequest::new(
+            "req_start",
+            METHOD_PAIRING_START,
+            PairingStartParams { peer_document_json },
+        );
+        let start_line = to_json_line(&start_request).expect("pairing start request line");
+        let start_response_line = server
+            .handle_request_line(&start_line)
+            .expect("pairing start response line");
+        let start_response: JsonRpcSuccess<PairingStartResult> =
+            serde_json::from_str(&start_response_line).expect("pairing start success JSON");
+        let accept_request = JsonRpcRequest::new(
+            "req_accept",
+            METHOD_PAIRING_ACCEPT,
+            PairingAcceptParams {
+                peer_id: start_response.result.peer_id.clone(),
+                verification_code: start_response.result.verification_code,
+            },
+        );
+        let accept_line = to_json_line(&accept_request).expect("pairing accept request line");
+
+        let accept_response_line = server
+            .handle_request_line(&accept_line)
+            .expect("pairing accept response line");
+        let accept_response: JsonRpcSuccess<PairingAcceptResult> =
+            serde_json::from_str(&accept_response_line).expect("pairing accept success JSON");
+
+        assert_eq!(accept_response.id, "req_accept");
+        assert!(accept_response.result.trusted);
+        assert_eq!(
+            identity_store
+                .load_trusted_peer("linux-laptop")
+                .expect("trusted peer saved over IPC")
+                .identity()
+                .fingerprint(),
+            peer_identity.fingerprint()
+        );
+
         let _ = std::fs::remove_file(&identity_store_path);
     }
 
