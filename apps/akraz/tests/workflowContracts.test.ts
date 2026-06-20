@@ -75,26 +75,26 @@ describe("GitHub Actions workflow contracts", () => {
         expect.objectContaining({
           status: "pass",
           workflowFile: "check.yml",
-          expectedVersion: "v5",
-          actualVersion: "v5",
+          expectedVersion: "v7",
+          actualVersion: "v7",
         }),
         expect.objectContaining({
           status: "pass",
           workflowFile: "windows-mvp-qa.yml",
-          expectedVersion: "v5",
-          actualVersion: "v5",
+          expectedVersion: "v7",
+          actualVersion: "v7",
         }),
         expect.objectContaining({
           status: "pass",
           workflowFile: "windows-mvp-release.yml",
-          expectedVersion: "v5",
-          actualVersion: "v5",
+          expectedVersion: "v7",
+          actualVersion: "v7",
         }),
         expect.objectContaining({
           status: "pass",
           workflowFile: "windows-mvp-soak.yml",
-          expectedVersion: "v5",
-          actualVersion: "v5",
+          expectedVersion: "v7",
+          actualVersion: "v7",
         }),
       ]),
     );
@@ -343,7 +343,7 @@ describe("GitHub Actions workflow contracts", () => {
       const releaseWorkflowWithOldArtifactAction = readFileSync(
         join(".github", "workflows", "windows-mvp-release.yml"),
         "utf8",
-      ).replace("uses: actions/upload-artifact@v5", "uses: actions/upload-artifact@v4");
+      ).replace("uses: actions/upload-artifact@v7", "uses: actions/upload-artifact@v4");
       writeFileSync(
         join(tempDirectory, ".github", "workflows", "windows-mvp-release.yml"),
         releaseWorkflowWithOldArtifactAction,
@@ -359,12 +359,12 @@ describe("GitHub Actions workflow contracts", () => {
         ),
       ).toMatchObject({
         status: "invalid",
-        expectedVersion: "v5",
+        expectedVersion: "v7",
         actualVersion: "v4",
       });
       expect(report.nextActions).toContainEqual({
         id: "upgradeUploadArtifactAction",
-        action: "use actions/upload-artifact@v5",
+        action: "use actions/upload-artifact@v7",
         workflowFile: "windows-mvp-release.yml",
       });
       expect(exitCodeForWorkflowContracts(report)).toBe(1);

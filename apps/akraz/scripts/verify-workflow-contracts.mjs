@@ -21,7 +21,7 @@ export const WORKFLOW_CONTRACTS_SCHEMA_VERSION = "akraz.workflowContracts/v1";
 
 const WORKFLOW_DIRECTORY = ".github/workflows";
 const REQUIRED_CHECKOUT_VERSION = "v6";
-const REQUIRED_UPLOAD_ARTIFACT_VERSION = "v5";
+const REQUIRED_UPLOAD_ARTIFACT_VERSION = "v7";
 const WINDOWS_MVP_QA_WORKFLOW_FILE = "windows-mvp-qa.yml";
 const CHECK_WORKFLOW_FILE = "check.yml";
 const WINDOWS_CI_SIDECAR_DIRECTORY = "apps/akraz/src-tauri/binaries";
