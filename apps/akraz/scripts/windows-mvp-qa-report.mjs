@@ -65,6 +65,7 @@ export function buildWindowsMvpQaReportTemplate(options = {}) {
       result: "blocked",
       reason: "not run yet",
       evidence: [],
+      requiredEvidence: testCase.evidenceRequirements,
     })),
     privacy: {
       includesTypedContent: false,
@@ -662,23 +663,54 @@ function buildWindowsMvpQaNextAction(check) {
 }
 
 function hasEvidence(result) {
-  return Array.isArray(result?.evidence) && result.evidence.some((entry) => hasText(entry));
+  return Array.isArray(result?.evidence) && result.evidence.some(hasEvidenceEntry);
+}
+
+function hasEvidenceEntry(entry) {
+  if (typeof entry === "string") {
+    return hasText(entry);
+  }
+
+  return entry && typeof entry === "object" && !Array.isArray(entry) && hasText(entry.id);
 }
 
 function findMissingPlannedEvidence(result, testCase) {
-  const plannedEvidence = Array.isArray(testCase?.evidence) ? testCase.evidence : [];
+  const plannedEvidence = Array.isArray(testCase?.evidenceRequirements)
+    ? testCase.evidenceRequirements
+    : [];
   if (plannedEvidence.length === 0) {
     return [];
   }
 
-  const evidenceText = Array.isArray(result?.evidence)
-    ? result.evidence.map(normalizeEvidenceText)
-    : [];
+  const evidence = Array.isArray(result?.evidence) ? result.evidence : [];
 
-  return plannedEvidence.filter((requiredEvidence) => {
-    const normalizedRequiredEvidence = normalizeEvidenceText(requiredEvidence);
-    return !evidenceText.some((entry) => entry.includes(normalizedRequiredEvidence));
-  });
+  return plannedEvidence
+    .filter((requiredEvidence) => {
+      return !evidence.some((entry) => evidenceEntryMatchesRequirement(entry, requiredEvidence));
+    })
+    .map((requiredEvidence) => requiredEvidence.id);
+}
+
+function evidenceEntryMatchesRequirement(entry, requiredEvidence) {
+  if (!requiredEvidence?.id) {
+    return false;
+  }
+
+  if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+    return entry.id === requiredEvidence.id;
+  }
+
+  if (typeof entry !== "string") {
+    return false;
+  }
+
+  const normalizedEntry = normalizeEvidenceText(entry);
+  const normalizedId = normalizeEvidenceText(requiredEvidence.id);
+  return (
+    normalizedEntry === normalizedId ||
+    normalizedEntry.startsWith(`${normalizedId}:`) ||
+    normalizedEntry.startsWith(`${normalizedId} `)
+  );
 }
 
 function normalizeEvidenceText(value) {

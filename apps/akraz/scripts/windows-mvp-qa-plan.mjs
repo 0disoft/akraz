@@ -425,7 +425,12 @@ export function parseWindowsMvpQaPlanArgs(args) {
 }
 
 function cloneCase(testCase) {
-  return JSON.parse(JSON.stringify(testCase));
+  const clonedCase = JSON.parse(JSON.stringify(testCase));
+  clonedCase.evidenceRequirements = clonedCase.evidence.map((label, index) => ({
+    id: `${clonedCase.id}-E${index + 1}`,
+    label,
+  }));
+  return clonedCase;
 }
 
 function readValue(args, index, flag) {

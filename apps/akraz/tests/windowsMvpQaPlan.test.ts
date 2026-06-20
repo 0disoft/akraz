@@ -44,10 +44,27 @@ describe("Windows MVP QA plan", () => {
       expect(testCase.steps.length).toBeGreaterThan(0);
       expect(testCase.expected.length).toBeGreaterThan(0);
       expect(testCase.evidence.length).toBeGreaterThan(0);
+      expect(testCase.evidenceRequirements).toHaveLength(testCase.evidence.length);
+      expect(testCase.evidenceRequirements.map((evidence) => evidence.label)).toEqual(
+        testCase.evidence,
+      );
+      expect(testCase.evidenceRequirements.map((evidence) => evidence.id)).toEqual(
+        testCase.evidence.map((_, index) => `${testCase.id}-E${index + 1}`),
+      );
       expect(JSON.stringify(testCase)).not.toContain("안녕");
       expect(JSON.stringify(testCase).toLowerCase()).not.toContain("konnichi");
       expect(JSON.stringify(testCase).toLowerCase()).not.toContain("-----begin");
     }
+  });
+
+  test("uses unique stable evidence requirement ids", () => {
+    const plan = buildWindowsMvpQaPlan();
+    const evidenceIds = plan.cases.flatMap((testCase) =>
+      testCase.evidenceRequirements.map((evidence) => evidence.id),
+    );
+
+    expect(new Set(evidenceIds).size).toBe(evidenceIds.length);
+    expect(evidenceIds.every((id) => /^(WIN|I18N|REL)-\d{3}-E\d+$/.test(id))).toBe(true);
   });
 
   test("filters by case id and rejects unknown case ids", () => {

@@ -91,7 +91,7 @@ function passingQaReport() {
     results: plan.cases.map((testCase) => ({
       caseId: testCase.id,
       result: "pass",
-      evidence: testCase.evidence.map((evidence) => `${evidence} artifact id`),
+      evidence: testCase.evidenceRequirements.map((evidence) => `${evidence.id}: artifact id`),
     })),
     privacy: {
       includesTypedContent: false,

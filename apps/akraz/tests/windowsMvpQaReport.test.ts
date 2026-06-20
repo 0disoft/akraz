@@ -42,7 +42,7 @@ function passingReport() {
     results: plan.cases.map((testCase) => ({
       caseId: testCase.id,
       result: "pass",
-      evidence: testCase.evidence.map((evidence) => `${evidence} artifact id`),
+      evidence: testCase.evidenceRequirements.map((evidence) => `${evidence.id}: artifact id`),
     })),
     privacy: {
       includesTypedContent: false,
@@ -156,7 +156,7 @@ describe("Windows MVP QA report evaluation", () => {
     replaceResult(report, "WIN-006", {
       caseId: "WIN-006",
       result: "pass",
-      evidence: ["Diagnostics support bundle after resume artifact id"],
+      evidence: ["WIN-006-E1: diagnostics support bundle artifact id"],
     });
     const evaluation = evaluateWindowsMvpQaReport(report);
 
@@ -164,14 +164,32 @@ describe("Windows MVP QA report evaluation", () => {
     expect(evaluation.checks.find((check) => check.id === "result:WIN-006")).toMatchObject({
       status: "invalid",
       detail: "passRequiresPlannedEvidence",
-      missingEvidence: ["Windows MVP soak report with stuckInputSuspicions equal to 0"],
+      missingEvidence: ["WIN-006-E2"],
     });
     expect(evaluation.nextActions).toContainEqual({
       id: "addPlannedEvidence",
       action: "add sanitized evidence for every planned QA evidence item",
       caseId: "WIN-006",
-      missingEvidence: ["Windows MVP soak report with stuckInputSuspicions equal to 0"],
+      missingEvidence: ["WIN-006-E2"],
     });
+  });
+
+  test("accepts object evidence entries with planned evidence ids", () => {
+    const report = passingReport();
+    replaceResult(report, "WIN-006", {
+      caseId: "WIN-006",
+      result: "pass",
+      evidence: [
+        { id: "WIN-006-E1", artifactId: "support-bundle-artifact" },
+        { id: "WIN-006-E2", artifactId: "soak-report-artifact" },
+      ],
+    });
+    const evaluation = evaluateWindowsMvpQaReport(report);
+
+    expect(evaluation.checks.find((check) => check.id === "result:WIN-006")).toMatchObject({
+      status: "pass",
+    });
+    expect(evaluation.ready).toBe(true);
   });
 
   test("requires reason for blocked or failed cases and keeps the report not ready", () => {
@@ -308,6 +326,11 @@ describe("Windows MVP QA report evaluation", () => {
     expect(template.results.every((result) => result.result === "blocked")).toBe(true);
     expect(template.results.every((result) => result.reason === "not run yet")).toBe(true);
     expect(template.results.every((result) => result.evidence.length === 0)).toBe(true);
+    expect(
+      template.results.every(
+        (result) => Array.isArray(result.requiredEvidence) && result.requiredEvidence.length > 0,
+      ),
+    ).toBe(true);
     expect(evaluation.ready).toBe(false);
     expect(evaluation.summary).toEqual({
       total: qaCaseCount(),
@@ -425,8 +448,8 @@ describe("Windows MVP QA report evaluation", () => {
       caseId: "WIN-006",
       result: "pass",
       evidence: [
-        "Diagnostics support bundle after resume artifact id",
-        "Windows MVP soak report with stuckInputSuspicions equal to 0 artifact id",
+        "WIN-006-E1: diagnostics support bundle artifact id",
+        "WIN-006-E2: soak report artifact id",
       ],
       executedAt: "2026-06-20T01:02:03.004Z",
       sourceOs: "Windows 11",
@@ -447,8 +470,8 @@ describe("Windows MVP QA report evaluation", () => {
       caseId: "WIN-006",
       result: "pass",
       evidence: [
-        "Diagnostics support bundle after resume artifact id",
-        "Windows MVP soak report with stuckInputSuspicions equal to 0 artifact id",
+        "WIN-006-E1: diagnostics support bundle artifact id",
+        "WIN-006-E2: soak report artifact id",
       ],
     });
     expect(updatedEvaluation.checks.find((check) => check.id === "result:WIN-006")).toMatchObject({
@@ -489,11 +512,9 @@ describe("Windows MVP QA report evaluation", () => {
       updateWindowsMvpQaReportResult(template, {
         caseId: "WIN-006",
         result: "pass",
-        evidence: ["Diagnostics support bundle after resume artifact id"],
+        evidence: ["WIN-006-E1: diagnostics support bundle artifact id"],
       }),
-    ).toThrow(
-      "--result pass requires planned evidence for WIN-006: Windows MVP soak report with stuckInputSuspicions equal to 0",
-    );
+    ).toThrow("--result pass requires planned evidence for WIN-006: WIN-006-E2");
     expect(() =>
       updateWindowsMvpQaReportResult(template, {
         caseId: "WIN-006",
