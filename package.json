@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.4.94",
+  "version": "0.4.95",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -23,6 +23,7 @@
     "release:updater-config-preflight": "bun run --cwd apps/akraz release:updater-config-preflight",
     "release:windows-mvp-bundle": "bun run --cwd apps/akraz release:windows-mvp-bundle",
     "release:windows-mvp-gate": "bun run --cwd apps/akraz release:windows-mvp-gate",
+    "release:windows-mvp-workflow-inputs": "bun run --cwd apps/akraz release:windows-mvp-workflow-inputs",
     "smoke:daemon-lifecycle": "bun run --cwd apps/akraz smoke:daemon-lifecycle",
     "smoke:diagnostics-snapshot": "bun run --cwd apps/akraz smoke:diagnostics-snapshot",
     "smoke:loopback-transport": "bun run --cwd apps/akraz smoke:loopback-transport",

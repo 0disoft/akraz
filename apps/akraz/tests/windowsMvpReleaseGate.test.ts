@@ -40,6 +40,16 @@ import {
   parseWindowsMvpReleaseBundleArgs,
   writeWindowsMvpReleaseBundleOutput,
 } from "../scripts/windows-mvp-release-bundle.mjs";
+import {
+  DEFAULT_QA_REPORT_ARTIFACT,
+  DEFAULT_SOAK_REPORT_ARTIFACT,
+  WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+  WINDOWS_MVP_RELEASE_WORKFLOW_INPUTS_SCHEMA_VERSION,
+  buildWindowsMvpReleaseWorkflowInputsReport,
+  exitCodeForWindowsMvpReleaseWorkflowInputs,
+  parseWindowsMvpReleaseWorkflowInputsArgs,
+  writeWindowsMvpReleaseWorkflowInputsFile,
+} from "../scripts/windows-mvp-release-workflow-inputs.mjs";
 
 function passingQaReport() {
   return {
@@ -427,5 +437,144 @@ describe("Windows MVP release gate", () => {
     expect(() => parseWindowsMvpReleaseBundleArgs(["--unknown"])).toThrow(
       "unknown Windows MVP release bundle argument: --unknown",
     );
+  });
+
+  test("builds release workflow dispatch inputs from one shared evidence run", () => {
+    const report = buildWindowsMvpReleaseWorkflowInputsReport({
+      sourceRunId: "27856073522",
+      dispatchInputsWritten: true,
+    });
+
+    expect(report).toMatchObject({
+      schemaVersion: WINDOWS_MVP_RELEASE_WORKFLOW_INPUTS_SCHEMA_VERSION,
+      ready: true,
+      workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+      dispatchInputsWritten: true,
+      inputs: {
+        source_run_id: "27856073522",
+        qa_source_run_id: "",
+        soak_source_run_id: "",
+        qa_report_artifact: DEFAULT_QA_REPORT_ARTIFACT,
+        soak_report_artifact: DEFAULT_SOAK_REPORT_ARTIFACT,
+      },
+      resolvedRunIds: {
+        qa: "27856073522",
+        soak: "27856073522",
+      },
+      privacy: {
+        includesSecretValues: false,
+        includesFullFilePaths: false,
+        includesArtifactPayloads: false,
+      },
+    });
+    expect(report.checks.find((check) => check.id === "sourceRunIds")).toMatchObject({
+      status: "pass",
+      mode: "shared",
+    });
+    expect(report.nextActions).toEqual([]);
+    expect(exitCodeForWindowsMvpReleaseWorkflowInputs(report)).toBe(0);
+  });
+
+  test("builds release workflow dispatch inputs from separate QA and soak evidence runs", () => {
+    const report = buildWindowsMvpReleaseWorkflowInputsReport({
+      qaSourceRunId: "27855770983",
+      soakSourceRunId: "27855465732",
+      qaReportArtifact: "custom-qa-report",
+      soakReportArtifact: "custom-soak-report",
+    });
+
+    expect(report.ready).toBe(true);
+    expect(report.inputs).toEqual({
+      source_run_id: "",
+      qa_source_run_id: "27855770983",
+      soak_source_run_id: "27855465732",
+      qa_report_artifact: "custom-qa-report",
+      soak_report_artifact: "custom-soak-report",
+    });
+    expect(report.resolvedRunIds).toEqual({
+      qa: "27855770983",
+      soak: "27855465732",
+    });
+    expect(report.checks.find((check) => check.id === "sourceRunIds")).toMatchObject({
+      status: "pass",
+      mode: "dedicated",
+    });
+  });
+
+  test("rejects incomplete or malformed release workflow dispatch inputs", () => {
+    const missingRunIds = buildWindowsMvpReleaseWorkflowInputsReport({
+      qaSourceRunId: "27855770983",
+    });
+    const invalidRunIds = buildWindowsMvpReleaseWorkflowInputsReport({
+      sourceRunId: "run-27856073522",
+    });
+    const invalidArtifact = buildWindowsMvpReleaseWorkflowInputsReport({
+      sourceRunId: "27856073522",
+      qaReportArtifact: "release-evidence/qa.json",
+    });
+
+    expect(missingRunIds.ready).toBe(false);
+    expect(missingRunIds.checks.find((check) => check.id === "sourceRunIds")).toMatchObject({
+      status: "missing",
+      detail: "sourceRunIdsMissing",
+    });
+    expect(missingRunIds.nextActions).toContainEqual({
+      id: "provideSourceRunIds",
+      action: "provide --source-run-id or provide both --qa-source-run-id and --soak-source-run-id",
+    });
+    expect(invalidRunIds.checks.find((check) => check.id === "sourceRunIds")).toMatchObject({
+      status: "invalid",
+      detail: "runIdsMustBePositiveIntegers",
+      invalidInputs: ["source_run_id"],
+    });
+    expect(invalidArtifact.checks.find((check) => check.id === "qaReportArtifact")).toMatchObject({
+      status: "invalid",
+      detail: "artifactNameContainsPathOrControlCharacter",
+    });
+    expect(exitCodeForWindowsMvpReleaseWorkflowInputs(missingRunIds)).toBe(1);
+  });
+
+  test("parses and writes release workflow dispatch inputs", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-workflow-inputs-"));
+    const outputFile = join(tempDir, "nested", "release-workflow-inputs.json");
+
+    try {
+      expect(
+        parseWindowsMvpReleaseWorkflowInputsArgs([
+          "--qa-source-run-id",
+          "27855770983",
+          "--soak-source-run-id",
+          "27855465732",
+          "--qa-report-artifact",
+          "windows-mvp-qa-report",
+          "--soak-report-artifact",
+          "windows-mvp-soak-report",
+          "--out-file",
+          outputFile,
+        ]),
+      ).toEqual({
+        sourceRunId: undefined,
+        qaSourceRunId: "27855770983",
+        soakSourceRunId: "27855465732",
+        qaReportArtifact: "windows-mvp-qa-report",
+        soakReportArtifact: "windows-mvp-soak-report",
+        outFile: outputFile,
+      });
+
+      const inputs = buildWindowsMvpReleaseWorkflowInputsReport({
+        sourceRunId: "27856073522",
+      }).inputs;
+      expect(writeWindowsMvpReleaseWorkflowInputsFile(outputFile, inputs)).toBe(outputFile);
+      expect(JSON.parse(readFileSync(outputFile, "utf8"))).toEqual(inputs);
+      expect(readFileSync(outputFile, "utf8").endsWith("\n")).toBe(true);
+      expect(() =>
+        parseWindowsMvpReleaseWorkflowInputsArgs(["--source-run-id", "27856073522"]),
+      ).toThrow("--out-file is required");
+      expect(() => parseWindowsMvpReleaseWorkflowInputsArgs(["--unknown"])).toThrow(
+        "unknown Windows MVP release workflow input argument: --unknown",
+      );
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
   });
 });
