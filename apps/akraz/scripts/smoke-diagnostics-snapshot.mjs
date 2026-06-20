@@ -170,7 +170,7 @@ function assertDiagnosticsBundle(bundle, snapshot) {
     );
   }
   assertBundleSnapshot(bundle.snapshot, snapshot);
-  const expectedIncludedSections = ["daemon", "permissions"];
+  const expectedIncludedSections = ["runtimeEnvironment", "daemon", "permissions"];
   if (bundle.snapshot.screenTopology) {
     expectedIncludedSections.push("screenTopology");
   }
@@ -403,7 +403,9 @@ function assertRecentLogs(entries) {
 
 function assertStringList(sections, expected, label) {
   if (!Array.isArray(sections) || sections.length !== expected.length) {
-    throw new Error("diagnostics snapshot reported unexpected unavailable sections");
+    throw new Error(
+      `diagnostics snapshot reported unexpected ${label}: got ${JSON.stringify(sections)}, expected ${JSON.stringify(expected)}`,
+    );
   }
   for (const section of expected) {
     if (!sections.includes(section)) {
