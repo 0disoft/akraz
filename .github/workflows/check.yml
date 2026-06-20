@@ -43,6 +43,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run test
       - run: bun run smoke:windows-mvp-release-gate
+      - run: bun run smoke:windows-mvp-release-bundle
       - run: bun run check
       - run: bun run format:check
       - run: bun run lint

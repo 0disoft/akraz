@@ -33,6 +33,11 @@ import {
   exitCodeForWindowsMvpReleaseGateSmoke,
 } from "../scripts/smoke-windows-mvp-release-gate.mjs";
 import {
+  WINDOWS_MVP_RELEASE_BUNDLE_SMOKE_SCHEMA_VERSION,
+  buildWindowsMvpReleaseBundleSmokeReport,
+  exitCodeForWindowsMvpReleaseBundleSmoke,
+} from "../scripts/smoke-windows-mvp-release-bundle.mjs";
+import {
   WINDOWS_MVP_RELEASE_BUNDLE_FILES,
   WINDOWS_MVP_RELEASE_BUNDLE_SCHEMA_VERSION,
   buildWindowsMvpReleaseBundleReport,
@@ -327,6 +332,30 @@ describe("Windows MVP release gate", () => {
       includesEndpointValues: false,
     });
     expect(exitCodeForWindowsMvpReleaseGateSmoke(smokeReport)).toBe(0);
+  });
+
+  test("smoke bundle verifies fail-closed behavior without release evidence", () => {
+    const releaseBundleReport = buildWindowsMvpReleaseBundleReport();
+    const smokeReport = buildWindowsMvpReleaseBundleSmokeReport(releaseBundleReport);
+
+    expect(smokeReport.schemaVersion).toBe(WINDOWS_MVP_RELEASE_BUNDLE_SMOKE_SCHEMA_VERSION);
+    expect(smokeReport.ready).toBe(true);
+    expect(smokeReport.releaseBundleReady).toBe(false);
+    expect(smokeReport.releaseBundleExitCode).toBe(1);
+    expect(smokeReport.checkedArtifactIds).toContain("qaReport");
+    expect(smokeReport.checkedArtifactIds).toContain("soakReport");
+    expect(smokeReport.checkedArtifactIds).toContain("signingPreflight");
+    expect(smokeReport.checkedArtifactIds).toContain("updaterConfigPreflight");
+    expect(smokeReport.checkedArtifactIds).toContain("evidenceSources");
+    expect(smokeReport.checks.every((check) => check.status === "pass")).toBe(true);
+    expect(smokeReport.privacy).toEqual({
+      includesQaReportPayload: false,
+      includesSecretValues: false,
+      includesFullFilePaths: false,
+      includesEndpointValues: false,
+      includesSourceEvidencePaths: false,
+    });
+    expect(exitCodeForWindowsMvpReleaseBundleSmoke(smokeReport)).toBe(0);
   });
 
   test("builds a privacy-safe Windows MVP release bundle manifest and canonical files", () => {
