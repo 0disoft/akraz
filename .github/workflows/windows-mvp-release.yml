@@ -51,6 +51,47 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
+      - name: Validate release evidence sources
+        env:
+          RELEASE_EVIDENCE_DIR: ${{ github.workspace }}/release-evidence
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          QA_SOURCE_RUN_ID: ${{ inputs.qa_source_run_id }}
+          SOAK_SOURCE_RUN_ID: ${{ inputs.soak_source_run_id }}
+          QA_REPORT_ARTIFACT: ${{ inputs.qa_report_artifact }}
+          SOAK_REPORT_ARTIFACT: ${{ inputs.soak_report_artifact }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RELEASE_EVIDENCE_DIR/manifest"
+
+          args=(
+            "run"
+            "release:windows-mvp-evidence-sources"
+            "--"
+            "--out-file"
+            "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json"
+            "--dispatch-inputs-file"
+            "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-workflow-inputs.json"
+          )
+
+          if [ -n "$SOURCE_RUN_ID" ]; then
+            args+=("--source-run-id" "$SOURCE_RUN_ID")
+          fi
+          if [ -n "$QA_SOURCE_RUN_ID" ]; then
+            args+=("--qa-source-run-id" "$QA_SOURCE_RUN_ID")
+          fi
+          if [ -n "$SOAK_SOURCE_RUN_ID" ]; then
+            args+=("--soak-source-run-id" "$SOAK_SOURCE_RUN_ID")
+          fi
+          if [ -n "$QA_REPORT_ARTIFACT" ]; then
+            args+=("--qa-report-artifact" "$QA_REPORT_ARTIFACT")
+          fi
+          if [ -n "$SOAK_REPORT_ARTIFACT" ]; then
+            args+=("--soak-report-artifact" "$SOAK_REPORT_ARTIFACT")
+          fi
+
+          bun "${args[@]}"
+
       - name: Download QA and soak evidence artifacts
         env:
           GH_TOKEN: ${{ github.token }}

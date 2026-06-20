@@ -50,6 +50,15 @@ import {
   parseWindowsMvpReleaseWorkflowInputsArgs,
   writeWindowsMvpReleaseWorkflowInputsFile,
 } from "../scripts/windows-mvp-release-workflow-inputs.mjs";
+import {
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES,
+  buildWindowsMvpReleaseEvidenceSourcesReport,
+  exitCodeForWindowsMvpReleaseEvidenceSources,
+  parseWindowsMvpReleaseEvidenceSourcesArgs,
+  writeWindowsMvpReleaseEvidenceSourcesDispatchInputsFile,
+  writeWindowsMvpReleaseEvidenceSourcesFile,
+} from "../scripts/windows-mvp-release-evidence-sources.mjs";
 
 function passingQaReport() {
   return {
@@ -576,5 +585,152 @@ describe("Windows MVP release gate", () => {
     } finally {
       rmSync(tempDir, { force: true, recursive: true });
     }
+  });
+
+  test("builds a privacy-safe release evidence source manifest from one shared run", () => {
+    const report = buildWindowsMvpReleaseEvidenceSourcesReport({
+      sourceRunId: "27856073522",
+      manifestWritten: true,
+      dispatchInputsWritten: true,
+    });
+
+    expect(report).toMatchObject({
+      schemaVersion: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
+      ready: true,
+      workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+      manifestWritten: true,
+      dispatchInputsWritten: true,
+      sources: [
+        {
+          id: "qaReport",
+          sourceRunId: "27856073522",
+          artifactName: DEFAULT_QA_REPORT_ARTIFACT,
+          expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+        },
+        {
+          id: "soakReport",
+          sourceRunId: "27856073522",
+          artifactName: DEFAULT_SOAK_REPORT_ARTIFACT,
+          expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+        },
+      ],
+      dispatchInputs: {
+        source_run_id: "27856073522",
+        qa_source_run_id: "",
+        soak_source_run_id: "",
+        qa_report_artifact: DEFAULT_QA_REPORT_ARTIFACT,
+        soak_report_artifact: DEFAULT_SOAK_REPORT_ARTIFACT,
+      },
+      privacy: {
+        includesSecretValues: false,
+        includesFullFilePaths: false,
+        includesArtifactPayloads: false,
+      },
+    });
+    expect(report.checks.every((check) => check.status === "pass")).toBe(true);
+    expect(report.nextActions).toEqual([]);
+    expect(exitCodeForWindowsMvpReleaseEvidenceSources(report)).toBe(0);
+  });
+
+  test("writes release evidence sources and dispatch inputs from dedicated runs", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-evidence-sources-"));
+    const manifestFile = join(tempDir, "nested", "release-evidence-sources.json");
+    const dispatchInputsFile = join(tempDir, "nested", "release-workflow-inputs.json");
+
+    try {
+      expect(
+        parseWindowsMvpReleaseEvidenceSourcesArgs([
+          "--qa-source-run-id",
+          "27855770983",
+          "--soak-source-run-id",
+          "27855465732",
+          "--qa-report-artifact",
+          "custom-qa-report",
+          "--soak-report-artifact",
+          "custom-soak-report",
+          "--out-file",
+          manifestFile,
+          "--dispatch-inputs-file",
+          dispatchInputsFile,
+        ]),
+      ).toEqual({
+        sourceRunId: undefined,
+        qaSourceRunId: "27855770983",
+        soakSourceRunId: "27855465732",
+        qaReportArtifact: "custom-qa-report",
+        soakReportArtifact: "custom-soak-report",
+        outFile: manifestFile,
+        dispatchInputsFile,
+      });
+
+      const report = buildWindowsMvpReleaseEvidenceSourcesReport({
+        qaSourceRunId: "27855770983",
+        soakSourceRunId: "27855465732",
+        qaReportArtifact: "custom-qa-report",
+        soakReportArtifact: "custom-soak-report",
+      });
+
+      expect(report.ready).toBe(true);
+      expect(report.sources.map((source) => source.sourceRunId)).toEqual([
+        "27855770983",
+        "27855465732",
+      ]);
+      expect(writeWindowsMvpReleaseEvidenceSourcesFile(manifestFile, report)).toBe(manifestFile);
+      expect(
+        writeWindowsMvpReleaseEvidenceSourcesDispatchInputsFile(
+          dispatchInputsFile,
+          report.dispatchInputs,
+        ),
+      ).toBe(dispatchInputsFile);
+      expect(JSON.parse(readFileSync(manifestFile, "utf8"))).toEqual(report);
+      expect(JSON.parse(readFileSync(dispatchInputsFile, "utf8"))).toEqual(report.dispatchInputs);
+      expect(readFileSync(manifestFile, "utf8").endsWith("\n")).toBe(true);
+      expect(readFileSync(dispatchInputsFile, "utf8").endsWith("\n")).toBe(true);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects malformed release evidence source inputs before writing dispatch inputs", () => {
+    const missingRunIds = buildWindowsMvpReleaseEvidenceSourcesReport({
+      qaSourceRunId: "27855770983",
+    });
+    const invalidArtifact = buildWindowsMvpReleaseEvidenceSourcesReport({
+      sourceRunId: "27856073522",
+      soakReportArtifact: "release-evidence\\soak.json",
+    });
+
+    expect(missingRunIds.ready).toBe(false);
+    expect(missingRunIds.checks.find((check) => check.id === "workflowInputs")).toMatchObject({
+      status: "invalid",
+      detail: "releaseWorkflowInputsNotReady",
+      failingChecks: ["sourceRunIds"],
+    });
+    expect(missingRunIds.checks.find((check) => check.id === "evidenceSources")).toMatchObject({
+      status: "missing",
+      detail: "evidenceSourcesMissing",
+      missingSourceIds: ["soakReport"],
+    });
+    expect(missingRunIds.nextActions).toContainEqual({
+      id: "provideEvidenceSources",
+      action: "provide source run IDs and artifact names for every release evidence source",
+      missingSourceIds: ["soakReport"],
+    });
+    expect(invalidArtifact.ready).toBe(false);
+    expect(invalidArtifact.nextActions).toContainEqual({
+      id: "sanitizeArtifactName",
+      action: "use an artifact name, not a file path",
+      checkId: "soakReportArtifact",
+    });
+    expect(exitCodeForWindowsMvpReleaseEvidenceSources(missingRunIds)).toBe(1);
+    expect(() => parseWindowsMvpReleaseEvidenceSourcesArgs([])).toThrow(
+      "at least one of --out-file or --dispatch-inputs-file is required",
+    );
+    expect(() => parseWindowsMvpReleaseEvidenceSourcesArgs(["--source-run-id"])).toThrow(
+      "--source-run-id requires a non-empty value",
+    );
+    expect(() => parseWindowsMvpReleaseEvidenceSourcesArgs(["--unknown"])).toThrow(
+      "unknown Windows MVP release evidence sources argument: --unknown",
+    );
   });
 });

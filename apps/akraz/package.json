@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.4.95",
+  "version": "0.4.96",
   "private": true,
   "type": "module",
   "scripts": {
@@ -17,6 +17,7 @@
     "release:signing-preflight": "bun scripts/smoke-signing-preflight.mjs",
     "release:updater-config-preflight": "bun scripts/smoke-updater-config-preflight.mjs",
     "release:windows-mvp-bundle": "bun scripts/windows-mvp-release-bundle.mjs",
+    "release:windows-mvp-evidence-sources": "bun scripts/windows-mvp-release-evidence-sources.mjs",
     "release:windows-mvp-gate": "bun scripts/windows-mvp-release-gate.mjs",
     "release:windows-mvp-workflow-inputs": "bun scripts/windows-mvp-release-workflow-inputs.mjs",
     "smoke:daemon-lifecycle": "bun scripts/smoke-daemon-lifecycle.mjs",
