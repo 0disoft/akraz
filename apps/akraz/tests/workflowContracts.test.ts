@@ -127,6 +127,18 @@ describe("GitHub Actions workflow contracts", () => {
         "manifestFileNameActualValue",
       ],
     });
+    expect(
+      report.checks.find((check) => check.id === "releaseResolvedEvidenceSourceContract"),
+    ).toMatchObject({
+      status: "pass",
+      scriptPath: "apps/akraz/scripts/windows-mvp-release-resolved-evidence.mjs",
+      guardedFields: [
+        "canonicalBundleMappingImport",
+        "sourceBundleRead",
+        "canonicalBundleOutput",
+        "bundleMappingDriftDetail",
+      ],
+    });
     expect(report.checks.every((check) => check.status === "pass")).toBe(true);
     expect(report.privacy).toEqual({
       includesSecretValues: false,
@@ -694,6 +706,52 @@ describe("GitHub Actions workflow contracts", () => {
     }
   });
 
+  test("rejects resolved evidence source contract drift when bundle mapping is not checked", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-resolved-evidence-source-contracts-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory);
+      copyCurrentWorkflows(tempDirectory);
+
+      const resolvedEvidenceScriptPath = join(
+        tempDirectory,
+        "apps",
+        "akraz",
+        "scripts",
+        "windows-mvp-release-resolved-evidence.mjs",
+      );
+      writeFileSync(
+        resolvedEvidenceScriptPath,
+        readFileSync(resolvedEvidenceScriptPath, "utf8").replaceAll(
+          "bundleMappingDrift",
+          "bundleMappingMismatch",
+        ),
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(
+        report.checks.find((check) => check.id === "releaseResolvedEvidenceSourceContract"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "releaseResolvedEvidenceSourceContractDrifted",
+        scriptPath: "apps/akraz/scripts/windows-mvp-release-resolved-evidence.mjs",
+        missingSnippets: ["bundleMappingDriftDetail"],
+      });
+      expect(report.nextActions).toContainEqual({
+        id: "syncReleaseResolvedEvidenceSourceContract",
+        action: "restore resolved release evidence source filename and bundle mapping drift checks",
+        scriptPath: "apps/akraz/scripts/windows-mvp-release-resolved-evidence.mjs",
+        missingSnippets: ["bundleMappingDriftDetail"],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
   test("rejects smoke workflow drift when required runtime smoke scripts are removed", () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-smoke-workflow-contracts-"));
 
@@ -905,6 +963,14 @@ function writeCurrentAppPackageFixture(
   writeFileSync(
     join(tempDirectory, "apps", "akraz", "scripts", "smoke-windows-mvp-release-bundle.mjs"),
     readFileSync(join("apps", "akraz", "scripts", "smoke-windows-mvp-release-bundle.mjs"), "utf8"),
+    "utf8",
+  );
+  writeFileSync(
+    join(tempDirectory, "apps", "akraz", "scripts", "windows-mvp-release-resolved-evidence.mjs"),
+    readFileSync(
+      join("apps", "akraz", "scripts", "windows-mvp-release-resolved-evidence.mjs"),
+      "utf8",
+    ),
     "utf8",
   );
   mkdirSync(join(tempDirectory, "apps", "akraz", "src-tauri"), { recursive: true });

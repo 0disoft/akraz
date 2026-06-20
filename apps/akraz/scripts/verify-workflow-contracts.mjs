@@ -34,10 +34,30 @@ const RELEASE_BUNDLE_ARTIFACT_NAME = "windows-mvp-release-bundle";
 const RELEASE_BUNDLE_DIRECTORY = "release-bundle";
 const RELEASE_BUNDLE_UPLOAD_PATH = `${RELEASE_BUNDLE_DIRECTORY}/*.json`;
 const RELEASE_BUNDLE_SMOKE_SCRIPT_PATH = "apps/akraz/scripts/smoke-windows-mvp-release-bundle.mjs";
+const RELEASE_RESOLVED_EVIDENCE_SCRIPT_PATH =
+  "apps/akraz/scripts/windows-mvp-release-resolved-evidence.mjs";
 const RELEASE_BUNDLE_EVIDENCE_SOURCES_SNIPPET = [
   "bun run release:windows-mvp-bundle -- \\",
   `            --evidence-sources-file "${RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH}" \\`,
 ].join("\n");
+const RELEASE_RESOLVED_EVIDENCE_SOURCE_SNIPPETS = [
+  {
+    id: "canonicalBundleMappingImport",
+    snippet: "WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_BUNDLE_MAPPINGS",
+  },
+  {
+    id: "sourceBundleRead",
+    snippet: "readEvidenceSourceBundle",
+  },
+  {
+    id: "canonicalBundleOutput",
+    snippet: "canonicalBundle",
+  },
+  {
+    id: "bundleMappingDriftDetail",
+    snippet: "bundleMappingDrift",
+  },
+];
 const RELEASE_BUNDLE_ARTIFACT_INTEGRITY_SMOKE_SNIPPETS = [
   {
     id: "manifestArtifactFileMap",
@@ -225,6 +245,7 @@ export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoo
     evaluateReleaseArtifactContract(workflows),
     evaluateReleaseEvidenceSourcesWiring(workflows),
     evaluateReleaseBundleOutputWiring(workflows),
+    evaluateReleaseResolvedEvidenceSourceContract(workspaceRoot),
     evaluateReleaseBundleArtifactIntegritySmokeContract(workspaceRoot),
     evaluateSmokeWorkflowCoverage(workflows),
   ];
@@ -815,6 +836,40 @@ function evaluateReleaseBundleArtifactIntegritySmokeContract(workspaceRoot) {
   };
 }
 
+function evaluateReleaseResolvedEvidenceSourceContract(workspaceRoot) {
+  const scriptPath = join(workspaceRoot, ...RELEASE_RESOLVED_EVIDENCE_SCRIPT_PATH.split("/"));
+  if (!existsSync(scriptPath)) {
+    return {
+      id: "releaseResolvedEvidenceSourceContract",
+      status: "missing",
+      detail: "releaseResolvedEvidenceSourceContractMissing",
+      scriptPath: RELEASE_RESOLVED_EVIDENCE_SCRIPT_PATH,
+    };
+  }
+
+  const scriptSource = readFileSync(scriptPath, "utf8");
+  const missingSnippets = RELEASE_RESOLVED_EVIDENCE_SOURCE_SNIPPETS.filter(
+    (requirement) => !scriptSource.includes(requirement.snippet),
+  ).map((requirement) => requirement.id);
+
+  if (missingSnippets.length === 0) {
+    return {
+      id: "releaseResolvedEvidenceSourceContract",
+      status: "pass",
+      scriptPath: RELEASE_RESOLVED_EVIDENCE_SCRIPT_PATH,
+      guardedFields: RELEASE_RESOLVED_EVIDENCE_SOURCE_SNIPPETS.map((requirement) => requirement.id),
+    };
+  }
+
+  return {
+    id: "releaseResolvedEvidenceSourceContract",
+    status: "invalid",
+    detail: "releaseResolvedEvidenceSourceContractDrifted",
+    scriptPath: RELEASE_RESOLVED_EVIDENCE_SCRIPT_PATH,
+    missingSnippets,
+  };
+}
+
 function evaluateSmokeWorkflowCoverage(workflows) {
   const checkWorkflow = workflows.find((workflow) => workflow.name === "check.yml");
   if (!checkWorkflow) {
@@ -1023,6 +1078,17 @@ function buildNextActions(checks) {
           {
             id: "syncReleaseBundleArtifactIntegritySmoke",
             action: "restore release bundle artifact integrity smoke manifest file-name checks",
+            scriptPath: check.scriptPath,
+            missingSnippets: check.missingSnippets ?? [],
+          },
+        ];
+      case "releaseResolvedEvidenceSourceContractMissing":
+      case "releaseResolvedEvidenceSourceContractDrifted":
+        return [
+          {
+            id: "syncReleaseResolvedEvidenceSourceContract",
+            action:
+              "restore resolved release evidence source filename and bundle mapping drift checks",
             scriptPath: check.scriptPath,
             missingSnippets: check.missingSnippets ?? [],
           },
