@@ -81,7 +81,7 @@ jobs:
             --out-file "$QA_EVALUATION_FILE"
 
       - name: Upload Windows MVP QA report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: windows-mvp-qa-report
           path: release-evidence/qa/windows-mvp-qa-report.json
@@ -90,7 +90,7 @@ jobs:
 
       - name: Upload Windows MVP QA evaluation
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: windows-mvp-qa-evaluation
           path: release-evidence/qa-evaluation/windows-mvp-qa-report-evaluation.json

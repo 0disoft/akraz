@@ -70,6 +70,34 @@ describe("GitHub Actions workflow contracts", () => {
       windowsCiSidecarDestination:
         "apps/akraz/src-tauri/binaries/akraz-daemon-x86_64-pc-windows-msvc.exe",
     });
+    expect(report.checks.filter((check) => check.id.startsWith("uploadArtifactVersion:"))).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: "pass",
+          workflowFile: "check.yml",
+          expectedVersion: "v5",
+          actualVersion: "v5",
+        }),
+        expect.objectContaining({
+          status: "pass",
+          workflowFile: "windows-mvp-qa.yml",
+          expectedVersion: "v5",
+          actualVersion: "v5",
+        }),
+        expect.objectContaining({
+          status: "pass",
+          workflowFile: "windows-mvp-release.yml",
+          expectedVersion: "v5",
+          actualVersion: "v5",
+        }),
+        expect.objectContaining({
+          status: "pass",
+          workflowFile: "windows-mvp-soak.yml",
+          expectedVersion: "v5",
+          actualVersion: "v5",
+        }),
+      ]),
+    );
     expect(report.checks.find((check) => check.id === "smokeWorkflowCoverage")).toMatchObject({
       status: "pass",
       workflowFile: "check.yml",
@@ -298,6 +326,46 @@ describe("GitHub Actions workflow contracts", () => {
         action: "wire the release evidence source manifest generation into the bundle command",
         workflowFile: "windows-mvp-release.yml",
         missingSnippets: ["releaseBundleEvidenceSourcesCommand"],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects upload-artifact action version drift before artifact jobs run", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-artifact-action-contracts-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory);
+      copyCurrentWorkflows(tempDirectory);
+
+      const releaseWorkflowWithOldArtifactAction = readFileSync(
+        join(".github", "workflows", "windows-mvp-release.yml"),
+        "utf8",
+      ).replace("uses: actions/upload-artifact@v5", "uses: actions/upload-artifact@v4");
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "windows-mvp-release.yml"),
+        releaseWorkflowWithOldArtifactAction,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(
+        report.checks.find((check) =>
+          check.id.startsWith("uploadArtifactVersion:windows-mvp-release.yml"),
+        ),
+      ).toMatchObject({
+        status: "invalid",
+        expectedVersion: "v5",
+        actualVersion: "v4",
+      });
+      expect(report.nextActions).toContainEqual({
+        id: "upgradeUploadArtifactAction",
+        action: "use actions/upload-artifact@v5",
+        workflowFile: "windows-mvp-release.yml",
       });
       expect(exitCodeForWorkflowContracts(report)).toBe(1);
     } finally {

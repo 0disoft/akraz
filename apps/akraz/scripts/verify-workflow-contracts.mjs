@@ -21,6 +21,7 @@ export const WORKFLOW_CONTRACTS_SCHEMA_VERSION = "akraz.workflowContracts/v1";
 
 const WORKFLOW_DIRECTORY = ".github/workflows";
 const REQUIRED_CHECKOUT_VERSION = "v6";
+const REQUIRED_UPLOAD_ARTIFACT_VERSION = "v5";
 const WINDOWS_MVP_QA_WORKFLOW_FILE = "windows-mvp-qa.yml";
 const CHECK_WORKFLOW_FILE = "check.yml";
 const WINDOWS_CI_SIDECAR_DIRECTORY = "apps/akraz/src-tauri/binaries";
@@ -260,6 +261,7 @@ export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoo
     ...evaluateWorkspaceAppScriptDelegation(rootPackage.scripts ?? {}, appPackage.scripts ?? {}),
     ...evaluateAppPackageScripts(appPackage.scripts ?? {}),
     ...evaluateCheckoutVersions(workflows),
+    ...evaluateUploadArtifactVersions(workflows),
     ...evaluateBunVersions(workflows, expectedBunVersion),
     ...evaluateWorkflowScripts(workflowScripts, rootPackage.scripts ?? {}),
     evaluateTauriSidecarContract(workflows, tauriConfig),
@@ -334,6 +336,27 @@ function evaluateCheckoutVersions(workflows) {
         status: actualVersion === REQUIRED_CHECKOUT_VERSION ? "pass" : "invalid",
         workflowFile: workflow.name,
         expectedVersion: REQUIRED_CHECKOUT_VERSION,
+        actualVersion,
+      };
+    });
+  });
+}
+
+function evaluateUploadArtifactVersions(workflows) {
+  return workflows.flatMap((workflow) => {
+    const workflowSource = activeSource(workflow.source);
+    const matches = [...workflowSource.matchAll(/uses:\s+actions\/upload-artifact@([^\s#]+)/g)];
+
+    return matches.map((match) => {
+      const actualVersion = match[1];
+      return {
+        id: `uploadArtifactVersion:${workflow.name}:${lineNumberForOffset(
+          workflowSource,
+          match.index,
+        )}`,
+        status: actualVersion === REQUIRED_UPLOAD_ARTIFACT_VERSION ? "pass" : "invalid",
+        workflowFile: workflow.name,
+        expectedVersion: REQUIRED_UPLOAD_ARTIFACT_VERSION,
         actualVersion,
       };
     });
@@ -1144,6 +1167,15 @@ function buildNextActions(checks) {
             {
               id: "upgradeCheckoutAction",
               action: `use actions/checkout@${REQUIRED_CHECKOUT_VERSION}`,
+              workflowFile: check.workflowFile,
+            },
+          ];
+        }
+        if (check.id?.startsWith("uploadArtifactVersion:")) {
+          return [
+            {
+              id: "upgradeUploadArtifactAction",
+              action: `use actions/upload-artifact@${REQUIRED_UPLOAD_ARTIFACT_VERSION}`,
               workflowFile: check.workflowFile,
             },
           ];
