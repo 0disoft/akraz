@@ -6985,6 +6985,107 @@ mod tests {
     }
 
     #[test]
+    fn monitored_daemon_input_capture_worker_recovers_after_screen_layout_change() {
+        let platform = FakePlatformAdapter::default()
+            .with_desktop_geometry(desktop_geometry_at_right_edge())
+            .with_open_input_capture();
+        let updated_geometry = DesktopGeometry {
+            pointer_position: LogicalPoint { x: 2559, y: 720 },
+            virtual_screen_bounds: LogicalRect {
+                origin: LogicalPoint { x: 0, y: 0 },
+                size: LogicalSize {
+                    width: 2560,
+                    height: 1440,
+                },
+            },
+            monitors: vec![DesktopMonitor {
+                id: "primary".to_string(),
+                bounds: LogicalRect {
+                    origin: LogicalPoint { x: 0, y: 0 },
+                    size: LogicalSize {
+                        width: 2560,
+                        height: 1440,
+                    },
+                },
+                scale_factor_percent: Some(100),
+                is_primary: true,
+            }],
+        };
+        let mut initial_state = RuntimeInputState::new();
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            })
+            .expect("remote entry request");
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-layout"),
+            })
+            .expect("remote entry confirmed");
+        let state = shared_runtime_state(initial_state);
+        let dispatcher = RecordingCoreActionDispatcher::default();
+        let logs = shared_daemon_log_buffer(8);
+        let expected_actions = vec![
+            CoreAction::ReleaseLocalInputs,
+            CoreAction::ReleaseAllInputs,
+            CoreAction::StopRemoteSession {
+                session_id: Some(SessionId::new("session-layout")),
+            },
+        ];
+
+        let worker = start_monitored_daemon_input_capture_with_edge_bindings_dispatcher_and_logs(
+            state.clone(),
+            &platform,
+            DaemonInputCaptureConfig {
+                input_capture: InputCaptureConfig {
+                    event_buffer_capacity: 8,
+                },
+                drain_batch_size: 8,
+                idle_poll_interval: std::time::Duration::from_millis(10),
+            },
+            vec![ScreenEdgeBinding {
+                local_edge: ScreenEdge::Right,
+                peer_id: PeerId::new("right-peer"),
+                remote_edge: ScreenEdge::Left,
+            }],
+            dispatcher.clone(),
+            logs.clone(),
+        )
+        .expect("monitored daemon capture worker");
+
+        platform
+            .set_desktop_geometry(updated_geometry)
+            .expect("update fake desktop geometry");
+
+        for _ in 0..100 {
+            let actions = dispatcher.snapshot();
+            if actions
+                .windows(expected_actions.len())
+                .any(|recorded| recorded == expected_actions.as_slice())
+            {
+                worker.stop().expect("stop capture worker");
+                assert_eq!(
+                    state.lock().expect("shared state lock").mode(),
+                    ControlMode::Local
+                );
+                let entries = logs.lock().expect("daemon logs lock").tail(8);
+                assert!(
+                    entries.iter().any(|entry| {
+                        entry.level == DaemonLogLevel::Warn
+                            && entry.event == "input.capture.layoutChanged"
+                    }),
+                    "expected layout recovery log entry, got {entries:?}"
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        worker.stop().expect("stop capture worker");
+        panic!("expected monitored capture worker to recover after screen layout change");
+    }
+
+    #[test]
     fn daemon_input_capture_worker_dispatches_remote_forward_action() {
         let platform = FakePlatformAdapter::default().with_captured_events(vec![
             CapturedInputEvent::PointerMoved {

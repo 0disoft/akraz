@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use std::ptr::{null, null_mut};
 #[cfg(windows)]
 use std::cell::RefCell;
 #[cfg(windows)]
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::mpsc::TrySendError;
 #[cfg(windows)]
 use std::thread;
 #[cfg(windows)]
@@ -239,22 +239,6 @@ impl InputCaptureSession {
             shutdown: Some(shutdown),
             policy,
         }
-    }
-
-    fn from_preloaded_events_with_policy(
-        events: impl IntoIterator<Item = CapturedInputEvent>,
-        config: InputCaptureConfig,
-        policy: SharedInputCapturePolicy,
-    ) -> Self {
-        let (sender, receiver) = sync_channel(config.bounded_capacity());
-        for event in events {
-            if sender.try_send(event).is_err() {
-                break;
-            }
-        }
-        drop(sender);
-
-        Self::new(receiver, InputCaptureShutdown::Noop, policy)
     }
 
     /// Return the local input handling policy used by this capture session.
@@ -1431,10 +1415,12 @@ impl PlatformAdapter for UnsupportedPlatformAdapter {
 #[derive(Debug, Clone)]
 pub struct FakePlatformAdapter {
     capabilities: PlatformCapabilities,
-    desktop_geometry: DesktopGeometry,
+    desktop_geometry: Arc<Mutex<DesktopGeometry>>,
     keyboard_layout: KeyboardLayoutSnapshot,
     captured_events: Vec<CapturedInputEvent>,
     capture_policy: SharedInputCapturePolicy,
+    keep_capture_session_open: bool,
+    open_capture_senders: Arc<Mutex<Vec<SyncSender<CapturedInputEvent>>>>,
     injected_events: Arc<Mutex<Vec<InjectedInputEvent>>>,
     release_all_count: Arc<Mutex<u64>>,
 }
@@ -1444,10 +1430,12 @@ impl FakePlatformAdapter {
     pub fn new(capabilities: PlatformCapabilities) -> Self {
         Self {
             capabilities,
-            desktop_geometry: fake_desktop_geometry(),
+            desktop_geometry: Arc::new(Mutex::new(fake_desktop_geometry())),
             keyboard_layout: fake_keyboard_layout(),
             captured_events: Vec::new(),
             capture_policy: SharedInputCapturePolicy::default(),
+            keep_capture_session_open: false,
+            open_capture_senders: Arc::new(Mutex::new(Vec::new())),
             injected_events: Arc::new(Mutex::new(Vec::new())),
             release_all_count: Arc::new(Mutex::new(0)),
         }
@@ -1455,8 +1443,22 @@ impl FakePlatformAdapter {
 
     /// Return a fake adapter that reports the supplied desktop geometry.
     pub fn with_desktop_geometry(mut self, desktop_geometry: DesktopGeometry) -> Self {
-        self.desktop_geometry = desktop_geometry;
+        self.desktop_geometry = Arc::new(Mutex::new(desktop_geometry));
         self
+    }
+
+    /// Replace the desktop geometry reported by this fake adapter.
+    pub fn set_desktop_geometry(
+        &self,
+        desktop_geometry: DesktopGeometry,
+    ) -> Result<(), PlatformError> {
+        let mut current = self
+            .desktop_geometry
+            .lock()
+            .map_err(|_| PlatformError::new("fake platform desktop geometry lock was poisoned"))?;
+        *current = desktop_geometry;
+
+        Ok(())
     }
 
     /// Return a fake adapter that reports the supplied keyboard layout.
@@ -1471,6 +1473,12 @@ impl FakePlatformAdapter {
         events: impl IntoIterator<Item = CapturedInputEvent>,
     ) -> Self {
         self.captured_events = events.into_iter().collect();
+        self
+    }
+
+    /// Return a fake adapter whose capture session stays connected without new events.
+    pub fn with_open_input_capture(mut self) -> Self {
+        self.keep_capture_session_open = true;
         self
     }
 
@@ -1514,7 +1522,10 @@ impl PlatformAdapter for FakePlatformAdapter {
     }
 
     fn read_desktop_geometry(&self) -> Result<DesktopGeometry, PlatformError> {
-        Ok(self.desktop_geometry.clone())
+        self.desktop_geometry
+            .lock()
+            .map_err(|_| PlatformError::new("fake platform desktop geometry lock was poisoned"))
+            .map(|geometry| geometry.clone())
     }
 
     fn read_keyboard_layout(&self) -> Result<KeyboardLayoutSnapshot, PlatformError> {
@@ -1525,9 +1536,25 @@ impl PlatformAdapter for FakePlatformAdapter {
         &self,
         config: InputCaptureConfig,
     ) -> Result<InputCaptureSession, PlatformError> {
-        Ok(InputCaptureSession::from_preloaded_events_with_policy(
-            self.captured_events.clone(),
-            config,
+        let (sender, receiver) = sync_channel(config.bounded_capacity());
+        for event in self.captured_events.clone() {
+            if sender.try_send(event).is_err() {
+                break;
+            }
+        }
+
+        if self.keep_capture_session_open {
+            self.open_capture_senders
+                .lock()
+                .map_err(|_| PlatformError::new("fake platform capture sender lock was poisoned"))?
+                .push(sender);
+        } else {
+            drop(sender);
+        }
+
+        Ok(InputCaptureSession::new(
+            receiver,
+            InputCaptureShutdown::Noop,
             self.capture_policy.clone(),
         ))
     }
@@ -1588,7 +1615,8 @@ fn fake_keyboard_layout() -> KeyboardLayoutSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::TryRecvError;
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    use std::time::Duration;
 
     #[cfg(windows)]
     use akraz_core::MouseButton;
@@ -1700,6 +1728,63 @@ mod tests {
     }
 
     #[test]
+    fn fake_adapter_updates_desktop_geometry_between_reads() {
+        let initial_geometry = DesktopGeometry {
+            pointer_position: LogicalPoint { x: 0, y: 0 },
+            virtual_screen_bounds: LogicalRect {
+                origin: LogicalPoint { x: 0, y: 0 },
+                size: LogicalSize {
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            monitors: vec![DesktopMonitor {
+                id: "primary".to_string(),
+                bounds: LogicalRect {
+                    origin: LogicalPoint { x: 0, y: 0 },
+                    size: LogicalSize {
+                        width: 1920,
+                        height: 1080,
+                    },
+                },
+                scale_factor_percent: Some(100),
+                is_primary: true,
+            }],
+        };
+        let updated_geometry = DesktopGeometry {
+            pointer_position: LogicalPoint { x: 2559, y: 720 },
+            virtual_screen_bounds: LogicalRect {
+                origin: LogicalPoint { x: 0, y: 0 },
+                size: LogicalSize {
+                    width: 2560,
+                    height: 1440,
+                },
+            },
+            monitors: vec![DesktopMonitor {
+                id: "primary".to_string(),
+                bounds: LogicalRect {
+                    origin: LogicalPoint { x: 0, y: 0 },
+                    size: LogicalSize {
+                        width: 2560,
+                        height: 1440,
+                    },
+                },
+                scale_factor_percent: Some(100),
+                is_primary: true,
+            }],
+        };
+        let adapter =
+            FakePlatformAdapter::default().with_desktop_geometry(initial_geometry.clone());
+
+        assert_eq!(adapter.read_desktop_geometry(), Ok(initial_geometry));
+        assert_eq!(
+            adapter.set_desktop_geometry(updated_geometry.clone()),
+            Ok(())
+        );
+        assert_eq!(adapter.read_desktop_geometry(), Ok(updated_geometry));
+    }
+
+    #[test]
     fn fake_adapter_reports_configured_keyboard_layout() {
         let keyboard_layout = KeyboardLayoutSnapshot {
             source: "test".to_string(),
@@ -1760,6 +1845,21 @@ mod tests {
             adapter.input_capture_policy(),
             InputCapturePolicy::ConsumeCapturedInput
         );
+    }
+
+    #[test]
+    fn fake_adapter_can_keep_capture_session_open_without_events() {
+        let adapter = FakePlatformAdapter::default().with_open_input_capture();
+        let session = adapter
+            .start_input_capture(InputCaptureConfig::default())
+            .expect("fake capture session");
+
+        assert_eq!(
+            session.recv_timeout(Duration::from_millis(1)),
+            Err(RecvTimeoutError::Timeout)
+        );
+
+        session.stop().expect("stop fake capture session");
     }
 
     #[test]
