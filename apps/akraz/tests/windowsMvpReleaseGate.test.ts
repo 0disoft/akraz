@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -171,6 +172,14 @@ function passingUpdaterConfigPreflight() {
 function writeJson(path, payload) {
   writeFileSync(path, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   return path;
+}
+
+function runAppPackageScript(scriptName, args) {
+  return spawnSync(process.execPath, ["run", scriptName, "--", ...args], {
+    cwd: join(import.meta.dir, ".."),
+    encoding: "utf8",
+    windowsHide: true,
+  });
 }
 
 describe("Windows MVP release gate", () => {
@@ -941,6 +950,58 @@ describe("Windows MVP release gate", () => {
       expect(() => parseWindowsMvpReleaseWorkflowInputsArgs(["--unknown"])).toThrow(
         "unknown Windows MVP release workflow input argument: --unknown",
       );
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("writes release workflow dispatch inputs through the app package script", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-workflow-inputs-cli-"));
+    const outputFile = join(tempDir, "nested", "release-workflow-inputs.json");
+
+    try {
+      const result = runAppPackageScript("release:windows-mvp-workflow-inputs", [
+        "--qa-source-run-id",
+        "27855770983",
+        "--soak-source-run-id",
+        "27855465732",
+        "--qa-report-artifact",
+        "windows-mvp-qa-report",
+        "--soak-report-artifact",
+        "windows-mvp-soak-report",
+        "--out-file",
+        outputFile,
+      ]);
+
+      expect(result.status).toBe(0);
+
+      const report = JSON.parse(result.stdout);
+      const writtenInputs = JSON.parse(readFileSync(outputFile, "utf8"));
+
+      expect(report).toMatchObject({
+        schemaVersion: WINDOWS_MVP_RELEASE_WORKFLOW_INPUTS_SCHEMA_VERSION,
+        ready: true,
+        workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+        dispatchInputsWritten: true,
+        resolvedRunIds: {
+          qa: "27855770983",
+          soak: "27855465732",
+        },
+        privacy: {
+          includesSecretValues: false,
+          includesFullFilePaths: false,
+          includesArtifactPayloads: false,
+        },
+      });
+      expect(report.inputs).toEqual({
+        source_run_id: "",
+        qa_source_run_id: "27855770983",
+        soak_source_run_id: "27855465732",
+        qa_report_artifact: "windows-mvp-qa-report",
+        soak_report_artifact: "windows-mvp-soak-report",
+      });
+      expect(writtenInputs).toEqual(report.inputs);
+      expect(readFileSync(outputFile, "utf8").endsWith("\n")).toBe(true);
     } finally {
       rmSync(tempDir, { force: true, recursive: true });
     }
