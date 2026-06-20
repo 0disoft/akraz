@@ -125,12 +125,22 @@ function buildEvidenceSources(workflowInputsReport) {
       sourceRunId: workflowInputsReport.resolvedRunIds.qa,
       artifactName: inputs.qa_report_artifact,
       expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+      bundle: {
+        artifactId: "qaReport",
+        releaseGateCheckId: "qaReport",
+        fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+      },
     },
     {
       id: "soakReport",
       sourceRunId: workflowInputsReport.resolvedRunIds.soak,
       artifactName: inputs.soak_report_artifact,
       expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+      bundle: {
+        artifactId: "soakReport",
+        releaseGateCheckId: "soakReport",
+        fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+      },
     },
   ];
 }

@@ -816,12 +816,22 @@ describe("Windows MVP release gate", () => {
           sourceRunId: "27856073522",
           artifactName: DEFAULT_QA_REPORT_ARTIFACT,
           expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+          bundle: {
+            artifactId: "qaReport",
+            releaseGateCheckId: "qaReport",
+            fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+          },
         },
         {
           id: "soakReport",
           sourceRunId: "27856073522",
           artifactName: DEFAULT_SOAK_REPORT_ARTIFACT,
           expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+          bundle: {
+            artifactId: "soakReport",
+            releaseGateCheckId: "soakReport",
+            fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+          },
         },
       ],
       dispatchInputs: {
