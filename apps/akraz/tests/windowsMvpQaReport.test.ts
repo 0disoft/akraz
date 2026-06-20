@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -62,6 +63,14 @@ function replaceResult(report, caseId, result) {
     throw new Error(`missing QA result fixture for ${caseId}`);
   }
   report.results[index] = result;
+}
+
+function runAppPackageScript(scriptName, args) {
+  return spawnSync(process.execPath, ["run", scriptName, "--", ...args], {
+    cwd: join(import.meta.dir, ".."),
+    encoding: "utf8",
+    windowsHide: true,
+  });
 }
 
 describe("Windows MVP QA report evaluation", () => {
@@ -498,6 +507,59 @@ describe("Windows MVP QA report evaluation", () => {
     ).toMatchObject({
       status: "pass",
     });
+  });
+
+  test("updates one QA result through the app package script", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-qa-report-cli-"));
+    const templateFile = join(tempDirectory, "template.json");
+    const updatedFile = join(tempDirectory, "updated.json");
+
+    try {
+      const template = buildWindowsMvpQaReportTemplate();
+      writeWindowsMvpQaReportOutputFile(templateFile, template);
+
+      const result = runAppPackageScript("qa:windows-mvp-report-update", [
+        "--report-file",
+        templateFile,
+        "--case-id",
+        "WIN-006",
+        "--result",
+        "pass",
+        "--evidence-id",
+        "WIN-006-E1",
+        "--evidence-note",
+        "diagnostics support bundle artifact id",
+        "--evidence-id",
+        "WIN-006-E2",
+        "--evidence-note",
+        "soak report artifact id",
+        "--executed-at",
+        "2026-06-20T01:02:03.004Z",
+        "--source-os",
+        "Windows 11",
+        "--target-os",
+        "Windows 11",
+        "--hardware",
+        "two physical Windows endpoints",
+        "--out-file",
+        updatedFile,
+      ]);
+
+      expect(result.status).toBe(0);
+
+      const updatedReport = JSON.parse(readFileSync(updatedFile, "utf8"));
+      expect(updatedReport.results.find((candidate) => candidate.caseId === "WIN-006")).toEqual({
+        caseId: "WIN-006",
+        result: "pass",
+        evidence: [
+          { id: "WIN-006-E1", note: "diagnostics support bundle artifact id" },
+          { id: "WIN-006-E2", note: "soak report artifact id" },
+        ],
+      });
+      expect(JSON.parse(result.stdout)).toEqual(updatedReport);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
   });
 
   test("rejects unsafe or incomplete QA result updates", () => {
