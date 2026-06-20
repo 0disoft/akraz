@@ -658,6 +658,44 @@ describe("Windows MVP release gate", () => {
     }
   });
 
+  test("rejects release evidence source bundle mapping drift before copying it", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-bundle-sources-drift-"));
+    const evidenceSourcesFile = join(tempDir, "evidence-sources.json");
+
+    try {
+      const evidenceSources = buildWindowsMvpReleaseEvidenceSourcesReport({
+        sourceRunId: "27856073522",
+        manifestWritten: true,
+        dispatchInputsWritten: true,
+      });
+      const driftedEvidenceSources = structuredClone(evidenceSources);
+      const qaSource = driftedEvidenceSources.sources.find((source) => source.id === "qaReport");
+      if (qaSource) {
+        qaSource.bundle.fileName = "wrong-qa-report.json";
+      }
+      const report = buildWindowsMvpReleaseBundleReport({
+        evidenceSourcesFile: writeJson(evidenceSourcesFile, driftedEvidenceSources),
+      });
+      const formatted = JSON.stringify(report);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "optionalEvidenceFiles")).toMatchObject({
+        status: "invalid",
+        detail: "optionalEvidenceFilesNotReady",
+        invalidArtifactIds: ["evidenceSources"],
+      });
+      expect(report.artifacts.find((artifact) => artifact.id === "evidenceSources")).toMatchObject({
+        status: "invalid",
+        detail: "evidenceSourceBundleMappingDrift",
+        invalidSourceIds: ["qaReport"],
+        included: false,
+      });
+      expect(formatted).not.toContain(evidenceSourcesFile);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
   test("builds release workflow dispatch inputs from one shared evidence run", () => {
     const report = buildWindowsMvpReleaseWorkflowInputsReport({
       sourceRunId: "27856073522",

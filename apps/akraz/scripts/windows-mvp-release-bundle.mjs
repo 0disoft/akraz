@@ -17,7 +17,10 @@ import {
   buildWindowsMvpReleaseGateReport,
   exitCodeForWindowsMvpReleaseGate,
 } from "./windows-mvp-release-gate.mjs";
-import { WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION } from "./windows-mvp-release-evidence-sources.mjs";
+import {
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
+  WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES,
+} from "./windows-mvp-release-evidence-sources.mjs";
 
 export const WINDOWS_MVP_RELEASE_BUNDLE_SCHEMA_VERSION = "akraz.windowsMvpReleaseBundle/v1";
 
@@ -65,6 +68,20 @@ const OPTIONAL_EVIDENCE_OPTIONS = [
     source: "evidenceSourcesFile",
     fileName: WINDOWS_MVP_RELEASE_BUNDLE_FILES.evidenceSources,
     expectedSchemaVersion: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
+    expectedSourceBundleMappings: [
+      {
+        id: "qaReport",
+        artifactId: "qaReport",
+        releaseGateCheckId: "qaReport",
+        fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+      },
+      {
+        id: "soakReport",
+        artifactId: "soakReport",
+        releaseGateCheckId: "soakReport",
+        fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+      },
+    ],
   },
 ];
 
@@ -218,6 +235,7 @@ function buildOptionalEvidenceArtifact(definition, options) {
   }
 
   const fileRead = readJsonEvidence(options[definition.optionKey]);
+  const sourceBundleMapping = evaluateOptionalEvidenceSourceBundleMapping(fileRead, definition);
   const valid =
     fileRead.ok &&
     fileRead.payload?.schemaVersion === definition.expectedSchemaVersion &&
@@ -226,19 +244,23 @@ function buildOptionalEvidenceArtifact(definition, options) {
       "includesSecretValues",
       "includesFullFilePaths",
       "includesArtifactPayloads",
-    ]);
+    ]) &&
+    sourceBundleMapping.status === "pass";
 
   return {
     id: definition.id,
     source: definition.source,
     fileName: definition.fileName,
     status: valid ? "pass" : "invalid",
-    detail: valid ? undefined : optionalEvidenceDetail(fileRead, definition),
+    detail: valid ? undefined : optionalEvidenceDetail(fileRead, definition, sourceBundleMapping),
     schemaVersion: fileRead.payload?.schemaVersion,
     expectedSchemaVersion: definition.expectedSchemaVersion,
     fileProvided,
     included: valid,
     required: false,
+    ...(sourceBundleMapping.invalidSourceIds
+      ? { invalidSourceIds: sourceBundleMapping.invalidSourceIds }
+      : {}),
   };
 }
 
@@ -408,7 +430,41 @@ function buildBundleNextActions(checks, releaseGateNextActions) {
   return [...bundleActions, ...releaseGateNextActions];
 }
 
-function optionalEvidenceDetail(fileRead, definition) {
+function evaluateOptionalEvidenceSourceBundleMapping(fileRead, definition) {
+  if (!definition.expectedSourceBundleMappings || !fileRead.ok) {
+    return {
+      status: "pass",
+    };
+  }
+
+  const sources = Array.isArray(fileRead.payload?.sources) ? fileRead.payload.sources : [];
+  const invalidSourceIds = definition.expectedSourceBundleMappings
+    .filter((expected) => {
+      const source = sources.find((candidate) => candidate?.id === expected.id);
+      return (
+        !source ||
+        source.expectedFileName !== expected.fileName ||
+        source.bundle?.artifactId !== expected.artifactId ||
+        source.bundle?.releaseGateCheckId !== expected.releaseGateCheckId ||
+        source.bundle?.fileName !== expected.fileName
+      );
+    })
+    .map((expected) => expected.id);
+
+  if (invalidSourceIds.length === 0) {
+    return {
+      status: "pass",
+    };
+  }
+
+  return {
+    status: "invalid",
+    detail: "evidenceSourceBundleMappingDrift",
+    invalidSourceIds,
+  };
+}
+
+function optionalEvidenceDetail(fileRead, definition, sourceBundleMapping) {
   if (!fileRead.ok) {
     return fileRead.detail;
   }
@@ -419,6 +475,10 @@ function optionalEvidenceDetail(fileRead, definition) {
 
   if (fileRead.payload?.ready !== true) {
     return "evidenceSourcesNotReady";
+  }
+
+  if (sourceBundleMapping.status !== "pass") {
+    return sourceBundleMapping.detail;
   }
 
   return "privacyFlagsNotReady";
