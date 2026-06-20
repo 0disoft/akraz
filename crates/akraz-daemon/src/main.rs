@@ -25,7 +25,7 @@ use akraz_daemon::{
     execute_paired_tcp_peer_transport_session_until_closed_with_timeout, serve_daemon_ipc,
     serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
     serve_tcp_peer_transport_session_and_execute, shared_runtime_state,
-    start_daemon_input_capture_with_edge_bindings_dispatcher_and_logs,
+    start_monitored_daemon_input_capture_with_edge_bindings_dispatcher_and_logs,
 };
 use akraz_identity::FileIdentityStore;
 use akraz_ipc::{
@@ -368,13 +368,13 @@ fn start_configured_input_capture<P>(
     dispatcher: SharedCoreActionDispatcher,
 ) -> Result<Option<DaemonInputCaptureWorker>, PlatformError>
 where
-    P: PlatformAdapter,
+    P: PlatformAdapter + Clone + Send + 'static,
 {
     if !options.capture_input {
         return Ok(None);
     }
 
-    let worker = start_daemon_input_capture_with_edge_bindings_dispatcher_and_logs(
+    let worker = start_monitored_daemon_input_capture_with_edge_bindings_dispatcher_and_logs(
         server.shared_state(),
         platform,
         DaemonInputCaptureConfig::default(),

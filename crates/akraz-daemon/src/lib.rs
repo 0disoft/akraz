@@ -31,7 +31,7 @@ use akraz_ipc::{
 };
 use akraz_platform::{
     DesktopGeometry, InputCaptureConfig, InputCapturePolicy, InputCaptureSession, PlatformAdapter,
-    PlatformError,
+    PlatformCapabilities, PlatformError,
 };
 use akraz_protocol::{
     AuthProof, AuthTranscript, CapabilityFlags, HANDSHAKE_NONCE_LEN, PeerRole, ProtocolVersion,
@@ -50,6 +50,7 @@ const DEFAULT_DAEMON_LOGS_TAIL_LIMIT: usize = 25;
 const DEFAULT_CAPTURE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_CAPTURE_WATCHDOG_IDLE_POLLS: u32 = 80;
 const DEFAULT_POWER_RESUME_POLL_GAP: Duration = Duration::from_secs(5);
+const DEFAULT_RUNTIME_ENVIRONMENT_POLL_GAP: Duration = Duration::from_millis(250);
 const DEFAULT_PEER_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_PEER_SESSION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_PEER_SESSION_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
@@ -2402,6 +2403,32 @@ where
     )
 }
 
+/// Start daemon input capture with runtime environment monitoring and diagnostics logs.
+pub fn start_monitored_daemon_input_capture_with_edge_bindings_dispatcher_and_logs<P, D>(
+    state: SharedRuntimeInputState,
+    platform: &P,
+    config: DaemonInputCaptureConfig,
+    edge_bindings: Vec<ScreenEdgeBinding>,
+    dispatcher: D,
+    logs: SharedDaemonLogBuffer,
+) -> Result<DaemonInputCaptureWorker, PlatformError>
+where
+    P: PlatformAdapter + Clone + Send + 'static,
+    D: CoreActionDispatcher,
+{
+    let geometry = platform.read_desktop_geometry()?;
+
+    start_daemon_input_capture_with_routing_dispatcher_logs_and_environment_inspector(
+        state,
+        platform,
+        config,
+        DaemonInputRoutingConfig::from_desktop_geometry(geometry, edge_bindings),
+        dispatcher,
+        Some(logs),
+        PlatformRuntimeEnvironmentInspector::new(platform.clone(), Instant::now()),
+    )
+}
+
 /// Start daemon input capture with explicit pointer routing configuration.
 pub fn start_daemon_input_capture_with_routing(
     state: SharedRuntimeInputState,
@@ -2445,6 +2472,30 @@ fn start_daemon_input_capture_with_routing_dispatcher_and_logs<D>(
 where
     D: CoreActionDispatcher,
 {
+    start_daemon_input_capture_with_routing_dispatcher_logs_and_environment_inspector(
+        state,
+        platform,
+        config,
+        routing,
+        dispatcher,
+        logs,
+        NoRuntimeEnvironmentInspector,
+    )
+}
+
+fn start_daemon_input_capture_with_routing_dispatcher_logs_and_environment_inspector<D, E>(
+    state: SharedRuntimeInputState,
+    platform: &impl PlatformAdapter,
+    config: DaemonInputCaptureConfig,
+    routing: DaemonInputRoutingConfig,
+    dispatcher: D,
+    logs: Option<SharedDaemonLogBuffer>,
+    environment_inspector: E,
+) -> Result<DaemonInputCaptureWorker, PlatformError>
+where
+    D: CoreActionDispatcher,
+    E: RuntimeEnvironmentInspector + Send + 'static,
+{
     let capture = platform.start_input_capture(config.input_capture)?;
     sync_capture_policy_with_state(&capture, &state)?;
     let running = Arc::new(AtomicBool::new(true));
@@ -2460,6 +2511,7 @@ where
                 routing,
                 dispatcher,
                 logs,
+                environment_inspector,
             )
         })
         .map_err(|error| {
@@ -2471,7 +2523,7 @@ where
     Ok(DaemonInputCaptureWorker::new(running, thread))
 }
 
-fn run_daemon_input_capture_worker<D>(
+fn run_daemon_input_capture_worker<D, E>(
     state: SharedRuntimeInputState,
     capture: InputCaptureSession,
     running: Arc<AtomicBool>,
@@ -2479,9 +2531,11 @@ fn run_daemon_input_capture_worker<D>(
     routing: DaemonInputRoutingConfig,
     dispatcher: D,
     logs: Option<SharedDaemonLogBuffer>,
+    mut environment_inspector: E,
 ) -> Result<(), PlatformError>
 where
     D: CoreActionDispatcher,
+    E: RuntimeEnvironmentInspector,
 {
     let idle_poll_interval = config.bounded_idle_poll_interval();
     let mut idle_watchdog =
@@ -2502,6 +2556,13 @@ where
                         logs.as_ref(),
                     )?;
                 }
+                environment_inspector.inspect(
+                    &state,
+                    &dispatcher,
+                    &mut router,
+                    logs.as_ref(),
+                    now,
+                )?;
                 idle_watchdog.record_progress(now);
                 dispatch_core_action_batch(
                     &dispatcher,
@@ -2531,6 +2592,13 @@ where
                     idle_watchdog.record_progress(now);
                     continue;
                 }
+                environment_inspector.inspect(
+                    &state,
+                    &dispatcher,
+                    &mut router,
+                    logs.as_ref(),
+                    now,
+                )?;
                 if let Some(action) = idle_watchdog.record_idle_poll(now) {
                     dispatch_input_capture_idle_watchdog_action(
                         &dispatcher,
@@ -2568,6 +2636,104 @@ impl PowerResumeWatchdog {
 }
 
 #[derive(Debug, Clone)]
+struct RuntimeEnvironmentWatchdog {
+    poll_interval: Duration,
+    last_poll_at: Instant,
+    permissions_available: bool,
+}
+
+impl RuntimeEnvironmentWatchdog {
+    fn new(poll_interval: Duration, now: Instant) -> Self {
+        Self {
+            poll_interval,
+            last_poll_at: now,
+            permissions_available: true,
+        }
+    }
+
+    fn record_poll(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.last_poll_at) < self.poll_interval {
+            return false;
+        }
+
+        self.last_poll_at = now;
+        true
+    }
+
+    fn record_permissions_available(&mut self, available: bool) -> bool {
+        let permission_lost = self.permissions_available && !available;
+        self.permissions_available = available;
+        permission_lost
+    }
+}
+
+trait RuntimeEnvironmentInspector {
+    fn inspect(
+        &mut self,
+        state: &SharedRuntimeInputState,
+        dispatcher: &impl CoreActionDispatcher,
+        router: &mut CapturedInputRouter,
+        logs: Option<&SharedDaemonLogBuffer>,
+        now: Instant,
+    ) -> Result<(), PlatformError>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NoRuntimeEnvironmentInspector;
+
+impl RuntimeEnvironmentInspector for NoRuntimeEnvironmentInspector {
+    fn inspect(
+        &mut self,
+        _state: &SharedRuntimeInputState,
+        _dispatcher: &impl CoreActionDispatcher,
+        _router: &mut CapturedInputRouter,
+        _logs: Option<&SharedDaemonLogBuffer>,
+        _now: Instant,
+    ) -> Result<(), PlatformError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PlatformRuntimeEnvironmentInspector<P> {
+    platform: P,
+    watchdog: RuntimeEnvironmentWatchdog,
+}
+
+impl<P> PlatformRuntimeEnvironmentInspector<P> {
+    fn new(platform: P, now: Instant) -> Self {
+        Self {
+            platform,
+            watchdog: RuntimeEnvironmentWatchdog::new(DEFAULT_RUNTIME_ENVIRONMENT_POLL_GAP, now),
+        }
+    }
+}
+
+impl<P> RuntimeEnvironmentInspector for PlatformRuntimeEnvironmentInspector<P>
+where
+    P: PlatformAdapter,
+{
+    fn inspect(
+        &mut self,
+        state: &SharedRuntimeInputState,
+        dispatcher: &impl CoreActionDispatcher,
+        router: &mut CapturedInputRouter,
+        logs: Option<&SharedDaemonLogBuffer>,
+        now: Instant,
+    ) -> Result<(), PlatformError> {
+        inspect_runtime_environment_and_recover(
+            state,
+            &self.platform,
+            dispatcher,
+            router,
+            &mut self.watchdog,
+            logs,
+            now,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
 struct InputCaptureIdleWatchdog {
     idle_timeout: Duration,
     last_progress_at: Instant,
@@ -2598,30 +2764,48 @@ impl InputCaptureIdleWatchdog {
     }
 }
 
-fn recover_runtime_after_system_resume(
-    state: &SharedRuntimeInputState,
-) -> Result<Vec<CoreAction>, PlatformError> {
-    let mut state = state
-        .lock()
-        .map_err(|_| PlatformError::new("daemon runtime state is unavailable"))?;
-
-    state
-        .apply_event(RuntimeEvent::SystemResumed)
-        .map_err(resume_transition_error)
-}
-
 fn recover_runtime_after_system_resume_and_dispatch(
     state: &SharedRuntimeInputState,
     dispatcher: &impl CoreActionDispatcher,
     logs: Option<&SharedDaemonLogBuffer>,
 ) -> Result<(), PlatformError> {
-    match recover_runtime_after_system_resume(state) {
+    recover_runtime_after_interrupt_and_dispatch(
+        state,
+        dispatcher,
+        logs,
+        RuntimeRecoveryInterrupt::SystemResumed,
+    )
+}
+
+fn recover_runtime_after_interrupt_and_dispatch(
+    state: &SharedRuntimeInputState,
+    dispatcher: &impl CoreActionDispatcher,
+    logs: Option<&SharedDaemonLogBuffer>,
+    interrupt: RuntimeRecoveryInterrupt,
+) -> Result<(), PlatformError> {
+    let mut state = state
+        .lock()
+        .map_err(|_| PlatformError::new("daemon runtime state is unavailable"))?;
+
+    recover_runtime_state_after_interrupt_and_dispatch(&mut state, dispatcher, logs, interrupt)
+}
+
+fn recover_runtime_state_after_interrupt_and_dispatch(
+    state: &mut RuntimeInputState,
+    dispatcher: &impl CoreActionDispatcher,
+    logs: Option<&SharedDaemonLogBuffer>,
+    interrupt: RuntimeRecoveryInterrupt,
+) -> Result<(), PlatformError> {
+    match state
+        .apply_event(interrupt.runtime_event())
+        .map_err(|error| recovery_interrupt_transition_error(interrupt, error))
+    {
         Ok(actions) => {
             record_daemon_event(
                 logs,
                 DaemonLogLevel::Warn,
-                "input.capture.resume",
-                "Input capture recovered after a system resume or long poll gap.",
+                interrupt.success_log_event(),
+                interrupt.success_log_message(),
             );
             dispatch_core_action_batch(dispatcher, actions)
         }
@@ -2629,8 +2813,8 @@ fn recover_runtime_after_system_resume_and_dispatch(
             record_daemon_event(
                 logs,
                 DaemonLogLevel::Error,
-                "input.capture.resume.failed",
-                "Input capture recovery failed after a system resume or long poll gap.",
+                interrupt.failure_log_event(),
+                interrupt.failure_log_message(),
             );
             Err(error)
         }
@@ -2651,8 +2835,146 @@ fn dispatch_input_capture_idle_watchdog_action(
     dispatch_core_action_batch(dispatcher, vec![action])
 }
 
-fn resume_transition_error(error: CoreTransitionError) -> PlatformError {
-    PlatformError::new(format!("failed to recover after system resume: {error}"))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeRecoveryInterrupt {
+    ScreenLayoutChanged,
+    PermissionLost,
+    SystemResumed,
+}
+
+impl RuntimeRecoveryInterrupt {
+    fn runtime_event(self) -> RuntimeEvent {
+        match self {
+            Self::ScreenLayoutChanged => RuntimeEvent::ScreenLayoutChanged,
+            Self::PermissionLost => RuntimeEvent::PermissionLost,
+            Self::SystemResumed => RuntimeEvent::SystemResumed,
+        }
+    }
+
+    fn success_log_event(self) -> &'static str {
+        match self {
+            Self::ScreenLayoutChanged => "input.capture.layoutChanged",
+            Self::PermissionLost => "input.capture.permissionLost",
+            Self::SystemResumed => "input.capture.resume",
+        }
+    }
+
+    fn success_log_message(self) -> &'static str {
+        match self {
+            Self::ScreenLayoutChanged => "Input capture recovered after the screen layout changed.",
+            Self::PermissionLost => "Input capture recovered after platform input permission loss.",
+            Self::SystemResumed => {
+                "Input capture recovered after a system resume or long poll gap."
+            }
+        }
+    }
+
+    fn failure_log_event(self) -> &'static str {
+        match self {
+            Self::ScreenLayoutChanged => "input.capture.layoutChanged.failed",
+            Self::PermissionLost => "input.capture.permissionLost.failed",
+            Self::SystemResumed => "input.capture.resume.failed",
+        }
+    }
+
+    fn failure_log_message(self) -> &'static str {
+        match self {
+            Self::ScreenLayoutChanged => {
+                "Input capture recovery failed after a screen layout change."
+            }
+            Self::PermissionLost => {
+                "Input capture recovery failed after platform input permission loss."
+            }
+            Self::SystemResumed => {
+                "Input capture recovery failed after a system resume or long poll gap."
+            }
+        }
+    }
+
+    fn error_context(self) -> &'static str {
+        match self {
+            Self::ScreenLayoutChanged => "screen layout change",
+            Self::PermissionLost => "platform input permission loss",
+            Self::SystemResumed => "system resume",
+        }
+    }
+}
+
+fn inspect_runtime_environment_and_recover(
+    state: &SharedRuntimeInputState,
+    platform: &impl PlatformAdapter,
+    dispatcher: &impl CoreActionDispatcher,
+    router: &mut CapturedInputRouter,
+    watchdog: &mut RuntimeEnvironmentWatchdog,
+    logs: Option<&SharedDaemonLogBuffer>,
+    now: Instant,
+) -> Result<(), PlatformError> {
+    if !watchdog.record_poll(now) {
+        return Ok(());
+    }
+
+    match platform.read_desktop_geometry() {
+        Ok(geometry) => {
+            if geometry.virtual_screen_bounds != router.screen_layout.local_bounds {
+                recover_runtime_after_interrupt_and_dispatch(
+                    state,
+                    dispatcher,
+                    logs,
+                    RuntimeRecoveryInterrupt::ScreenLayoutChanged,
+                )?;
+                router.current_pointer = geometry.pointer_position;
+                router.screen_layout = ScreenLayout::new(
+                    geometry.virtual_screen_bounds,
+                    router.screen_layout.edge_bindings.clone(),
+                );
+            }
+        }
+        Err(_) => record_daemon_event(
+            logs,
+            DaemonLogLevel::Warn,
+            "input.capture.layoutProbe.failed",
+            "Input capture screen layout probe failed.",
+        ),
+    }
+
+    match platform.probe_capabilities() {
+        Ok(capabilities) => {
+            let available = required_input_capabilities_available(&capabilities);
+            if watchdog.record_permissions_available(available) {
+                recover_runtime_after_interrupt_and_dispatch(
+                    state,
+                    dispatcher,
+                    logs,
+                    RuntimeRecoveryInterrupt::PermissionLost,
+                )?;
+            }
+        }
+        Err(_) => record_daemon_event(
+            logs,
+            DaemonLogLevel::Warn,
+            "input.capture.permissionProbe.failed",
+            "Input capture permission probe failed.",
+        ),
+    }
+
+    Ok(())
+}
+
+fn required_input_capabilities_available(capabilities: &PlatformCapabilities) -> bool {
+    capabilities.can_capture_pointer
+        && capabilities.can_capture_keyboard
+        && capabilities.can_inject_pointer
+        && capabilities.can_inject_keyboard
+}
+
+fn recovery_interrupt_transition_error(
+    interrupt: RuntimeRecoveryInterrupt,
+    error: CoreTransitionError,
+) -> PlatformError {
+    PlatformError::new(format!(
+        "failed to recover after {}: {error}",
+        interrupt.error_context()
+    ))
 }
 
 fn sync_capture_policy_with_state(
@@ -2888,6 +3210,20 @@ fn handle_ipc_request(
         }
         IpcRequest::PermissionsProbe(request) => match build_permissions_probe(platform) {
             Ok(probe) => {
+                if !probe.issues.is_empty() {
+                    if let Err(error) = recover_runtime_state_after_interrupt_and_dispatch(
+                        state,
+                        dispatcher,
+                        logs,
+                        RuntimeRecoveryInterrupt::PermissionLost,
+                    ) {
+                        return encode_platform_error(
+                            request.id,
+                            "permission recovery unavailable",
+                            error,
+                        );
+                    }
+                }
                 record_daemon_event(
                     logs,
                     DaemonLogLevel::Info,
@@ -3336,7 +3672,8 @@ mod tests {
         IpcPlatformCapabilities, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer,
         METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS,
         METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
-        METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, OsLocalIpcClient, PeerStatus,
+        METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
+        OsLocalIpcClient, PeerStatus, PermissionsProbe, PermissionsProbeParams,
         SessionConnectParams, SessionDisconnectResult, SessionStatus, call_json_rpc, to_json_line,
     };
     use akraz_platform::{
@@ -3358,7 +3695,7 @@ mod tests {
         ManagedPeerSessionTransport, NoopCoreActionDispatcher, PeerSessionReconnectBackoff,
         PeerTransportCommandExecution, PeerTransportCommandPayload, PeerTransportInputEvent,
         PeerTransportMessage, PeerTransportProtocolVersion, PeerTransportSessionFrame,
-        PowerResumeWatchdog, TcpPeerSessionTransport, TcpPeerTransport,
+        PowerResumeWatchdog, RuntimeEnvironmentWatchdog, TcpPeerSessionTransport, TcpPeerTransport,
         TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
         build_daemon_status_with_peer_sessions, build_diagnostics_keyboard_layout,
         build_diagnostics_screen_topology, build_permissions_probe, connect_peer_session,
@@ -3367,8 +3704,9 @@ mod tests {
         execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
         execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
         handle_ipc_request_line, input_capture_policy_for_control_mode,
-        recover_local_control_and_release_inputs, recover_runtime_after_system_resume_and_dispatch,
-        serve_daemon_ipc, serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
+        inspect_runtime_environment_and_recover, recover_local_control_and_release_inputs,
+        recover_runtime_after_system_resume_and_dispatch, serve_daemon_ipc,
+        serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
         serve_tcp_peer_transport_session_and_execute,
         serve_tcp_peer_transport_session_and_execute_until_closed,
         serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout,
@@ -3796,6 +4134,66 @@ mod tests {
     }
 
     #[test]
+    fn permissions_probe_recovers_remote_control_when_capability_is_missing() {
+        let mut state = RuntimeInputState::new();
+        state
+            .apply_event(RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            })
+            .expect("remote entry request");
+        state
+            .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-permission"),
+            })
+            .expect("remote entry confirmed");
+        let platform = FakePlatformAdapter::new(PlatformCapabilities {
+            can_capture_pointer: true,
+            can_capture_keyboard: false,
+            can_inject_pointer: true,
+            can_inject_keyboard: true,
+        });
+        let dispatcher = RecordingCoreActionDispatcher::default();
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_PERMISSIONS_PROBE,
+            PermissionsProbeParams::default(),
+        );
+        let request_line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        let response_line =
+            match handle_ipc_request_line(&mut state, &platform, &dispatcher, &request_line) {
+                Ok(line) => line,
+                Err(error) => panic!("expected permissions probe response: {error}"),
+            };
+        let response: JsonRpcSuccess<PermissionsProbe> = match serde_json::from_str(&response_line)
+        {
+            Ok(response) => response,
+            Err(error) => panic!("expected permissions probe response JSON: {error}"),
+        };
+
+        assert_eq!(response.id, "req_1");
+        assert_eq!(response.result.issues.len(), 1);
+        assert_eq!(
+            response.result.issues[0].code,
+            "capture_keyboard_unavailable"
+        );
+        assert_eq!(state.mode(), ControlMode::Local);
+        assert_eq!(
+            dispatcher.snapshot(),
+            vec![
+                CoreAction::ReleaseLocalInputs,
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-permission")),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn diagnostics_screen_topology_reflects_desktop_geometry() {
         let platform = FakePlatformAdapter::default().with_desktop_geometry(DesktopGeometry {
             pointer_position: LogicalPoint { x: 1919, y: 540 },
@@ -4128,6 +4526,86 @@ mod tests {
         );
         assert!(!encoded.contains("secret-peer-id"));
         assert!(!encoded.contains("secret-session-id"));
+    }
+
+    #[test]
+    fn runtime_environment_watchdog_recovers_after_screen_layout_change() {
+        let mut initial_state = RuntimeInputState::new();
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("right-peer"),
+            })
+            .expect("remote entry request");
+        initial_state
+            .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-layout"),
+            })
+            .expect("remote entry confirmed");
+        let state = shared_runtime_state(initial_state);
+        let platform = FakePlatformAdapter::default().with_desktop_geometry(DesktopGeometry {
+            pointer_position: LogicalPoint { x: 2559, y: 720 },
+            virtual_screen_bounds: LogicalRect {
+                origin: LogicalPoint { x: 0, y: 0 },
+                size: LogicalSize {
+                    width: 2560,
+                    height: 1440,
+                },
+            },
+            monitors: vec![DesktopMonitor {
+                id: "primary".to_string(),
+                bounds: LogicalRect {
+                    origin: LogicalPoint { x: 0, y: 0 },
+                    size: LogicalSize {
+                        width: 2560,
+                        height: 1440,
+                    },
+                },
+                scale_factor_percent: Some(100),
+                is_primary: true,
+            }],
+        });
+        let dispatcher = RecordingCoreActionDispatcher::default();
+        let logs = shared_daemon_log_buffer(8);
+        let now = Instant::now();
+        let mut watchdog = RuntimeEnvironmentWatchdog::new(Duration::from_millis(1), now);
+        let mut router = CapturedInputRouter::new(DaemonInputRoutingConfig {
+            screen_layout: right_edge_layout(),
+            initial_pointer: LogicalPoint { x: 1919, y: 540 },
+        });
+
+        inspect_runtime_environment_and_recover(
+            &state,
+            &platform,
+            &dispatcher,
+            &mut router,
+            &mut watchdog,
+            Some(&logs),
+            now + Duration::from_millis(1),
+        )
+        .expect("runtime environment inspection");
+
+        assert_eq!(
+            state.lock().expect("runtime state lock").mode(),
+            ControlMode::Local
+        );
+        assert_eq!(
+            dispatcher.snapshot(),
+            vec![
+                CoreAction::ReleaseLocalInputs,
+                CoreAction::ReleaseAllInputs,
+                CoreAction::StopRemoteSession {
+                    session_id: Some(SessionId::new("session-layout")),
+                },
+            ]
+        );
+        assert_eq!(router.current_pointer, LogicalPoint { x: 2559, y: 720 });
+        assert_eq!(router.screen_layout.local_bounds.size.width, 2560);
+        assert_eq!(router.screen_layout.local_bounds.size.height, 1440);
+
+        let entries = logs.lock().expect("daemon logs lock").tail(8);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].level, DaemonLogLevel::Warn);
+        assert_eq!(entries[0].event, "input.capture.layoutChanged");
     }
 
     #[test]
