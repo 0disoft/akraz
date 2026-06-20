@@ -30,6 +30,10 @@
     firstLayoutDaemonStartBlockingIssue,
     isUsableScreenTopology,
   } from './lib/layout/layoutMismatch';
+  import {
+    buildManualConnectionCandidates,
+    type ManualConnectionCandidate,
+  } from './lib/session/manualConnectionCandidates';
   import { selectTrustedPeerSessionDraft } from './lib/session/sessionDraft';
   import type {
     ControlMode,
@@ -417,6 +421,41 @@
     sessionPeerId = draft.peerId;
     sessionLocalDeviceId = draft.localDeviceId;
     sessionAddress = draft.address;
+  }
+
+  function manualConnectionCandidates() {
+    return buildManualConnectionCandidates({
+      trustedPeers: identityState.trustedPeers,
+      manualPeerAddresses: settingsState.settings.manualPeerAddresses,
+      peerStatuses: daemonState.status?.peers ?? [],
+      localDeviceId: identityState.local?.deviceId ?? null,
+      draftLocalDeviceId: sessionLocalDeviceId,
+    });
+  }
+
+  function selectManualConnectionCandidate(candidate: ManualConnectionCandidate) {
+    if (!candidate.ready) {
+      return;
+    }
+
+    selectSessionTrustedPeer(candidate.peerId);
+  }
+
+  function manualConnectionCandidateStatus(candidate: ManualConnectionCandidate) {
+    if (candidate.connected) {
+      return '연결됨';
+    }
+    if (candidate.ready) {
+      return '준비됨';
+    }
+    if (candidate.address.length === 0) {
+      return '주소 필요';
+    }
+    if (candidate.localDeviceId.length === 0) {
+      return '내 기기 ID 필요';
+    }
+
+    return '확인 필요';
   }
 
   function updateSessionAddress(address: string) {
@@ -1305,6 +1344,42 @@
           />
         </label>
       </div>
+
+      {#if manualConnectionCandidates().length > 0}
+        <div class="connection-candidate-panel">
+          <h3>바로 연결</h3>
+          <ul class="connection-candidate-list" aria-label="바로 연결">
+            {#each manualConnectionCandidates() as candidate (candidate.peerId)}
+              <li>
+                <button
+                  type="button"
+                  class="connection-candidate-button"
+                  disabled={daemonState.isBusy || hasConnectedPeer() || !candidate.ready}
+                  onclick={() => selectManualConnectionCandidate(candidate)}
+                >
+                  <span class="connection-candidate-main">
+                    <strong>{candidate.displayName}</strong>
+                    <span class="connection-candidate-meta">
+                      <code>{candidate.peerId}</code>
+                      {#if candidate.address.length > 0}
+                        <code>{candidate.address}</code>
+                      {:else}
+                        <span>주소 없음</span>
+                      {/if}
+                    </span>
+                  </span>
+                  <strong
+                    class:ok={candidate.ready || candidate.connected}
+                    class="connection-candidate-status"
+                  >
+                    {manualConnectionCandidateStatus(candidate)}
+                  </strong>
+                </button>
+              </li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
 
       <div class="settings-actions">
         <button type="button" class="control-button" disabled={!canConnectSession()} onclick={connectSession}>

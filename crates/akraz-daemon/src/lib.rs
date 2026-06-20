@@ -4097,7 +4097,7 @@ mod tests {
                 version: 1,
                 device_id: device_id.to_string(),
                 capabilities,
-                build_version: "0.5.4".to_string(),
+                build_version: "0.5.5".to_string(),
             },
         }
     }
@@ -4218,7 +4218,7 @@ mod tests {
                 fingerprint: Some("AKRZ-TRUSTED".to_string()),
                 trusted: true,
                 address: "127.0.0.1:4455".parse().expect("candidate address"),
-                build_version: "0.5.4".to_string(),
+                build_version: "0.5.5".to_string(),
                 capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
             }]
         );
