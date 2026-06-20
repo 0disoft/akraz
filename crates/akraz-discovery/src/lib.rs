@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::net::{IpAddr, SocketAddr};
 
+use akraz_identity::TrustedPeerIdentity;
 use akraz_protocol::CapabilityFlags;
 
 /// DNS-SD service type used by Akraz mDNS discovery.
@@ -36,8 +38,19 @@ pub struct DiscoveryTxtRecord {
 pub struct DiscoveredPeer {
     pub instance_name: String,
     pub host_name: String,
+    pub addresses: Vec<IpAddr>,
     pub port: u16,
     pub txt: DiscoveryTxtRecord,
+}
+
+impl DiscoveredPeer {
+    /// Return the endpoint used by `session.connect`, preserving resolver address priority.
+    pub fn primary_socket_addr(&self) -> Option<SocketAddr> {
+        self.addresses
+            .first()
+            .copied()
+            .map(|address| SocketAddr::new(address, self.port))
+    }
 }
 
 /// Filtering policy applied before a discovered peer is shown as pairable.
@@ -56,6 +69,18 @@ impl Default for DiscoveryPeerFilter {
             blocked_device_ids: BTreeSet::new(),
         }
     }
+}
+
+/// Peer candidate that is ready to flow into the daemon session-connect surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverySessionCandidate {
+    pub peer_id: String,
+    pub display_name: String,
+    pub fingerprint: Option<String>,
+    pub trusted: bool,
+    pub address: SocketAddr,
+    pub build_version: String,
+    pub capabilities: CapabilityFlags,
 }
 
 impl DiscoveryPeerFilter {
@@ -86,7 +111,7 @@ impl DiscoveryPeerFilter {
             });
         }
 
-        if peer.host_name.trim().is_empty() || peer.port == 0 {
+        if peer.host_name.trim().is_empty() || peer.port == 0 || peer.addresses.is_empty() {
             return Err(DiscoveryPeerRejectReason::InvalidEndpoint);
         }
 
@@ -103,6 +128,60 @@ pub fn filter_discovered_peers<'a>(
         .into_iter()
         .filter(|peer| filter.accept(peer).is_ok())
         .collect()
+}
+
+/// Build daemon session candidates from discovery results and the local trust store.
+pub fn build_discovery_session_candidates<'a>(
+    peers: impl IntoIterator<Item = &'a DiscoveredPeer>,
+    filter: &DiscoveryPeerFilter,
+    trusted_peers: impl IntoIterator<Item = &'a TrustedPeerIdentity>,
+) -> Vec<DiscoverySessionCandidate> {
+    let trusted_peers = trusted_peers
+        .into_iter()
+        .map(|peer| (peer.peer_id(), peer))
+        .collect::<BTreeMap<_, _>>();
+
+    peers
+        .into_iter()
+        .filter(|peer| filter.accept(peer).is_ok())
+        .filter_map(|peer| discovery_session_candidate(peer, &trusted_peers))
+        .collect()
+}
+
+fn discovery_session_candidate(
+    peer: &DiscoveredPeer,
+    trusted_peers: &BTreeMap<&str, &TrustedPeerIdentity>,
+) -> Option<DiscoverySessionCandidate> {
+    let peer_id = peer.txt.device_id.clone();
+    let trusted_peer = trusted_peers.get(peer_id.as_str()).copied();
+    let address = peer.primary_socket_addr()?;
+
+    Some(DiscoverySessionCandidate {
+        peer_id,
+        display_name: trusted_peer
+            .map(|trusted| trusted.display_name().to_string())
+            .unwrap_or_else(|| discovery_instance_label(&peer.instance_name)),
+        fingerprint: trusted_peer.map(|trusted| trusted.fingerprint().to_string()),
+        trusted: trusted_peer.is_some(),
+        address,
+        build_version: peer.txt.build_version.clone(),
+        capabilities: peer.txt.capabilities,
+    })
+}
+
+fn discovery_instance_label(instance_name: &str) -> String {
+    let label = instance_name
+        .trim()
+        .trim_end_matches('.')
+        .strip_suffix(AKRAZ_DISCOVERY_SERVICE_TYPE.trim_end_matches('.'))
+        .unwrap_or_else(|| instance_name.trim().trim_end_matches('.'))
+        .trim_end_matches('.');
+
+    if label.is_empty() {
+        "Akraz Peer".to_string()
+    } else {
+        label.to_string()
+    }
 }
 
 /// Parse DNS-SD TXT entries such as `v=1` and `caps=pointer,keyboard`.
@@ -384,7 +463,8 @@ mod tests {
 
     use super::{
         AKRAZ_DISCOVERY_SERVICE_TYPE, AKRAZ_DISCOVERY_TXT_VERSION, DiscoveredPeer,
-        DiscoveryPeerFilter, DiscoveryPeerRejectReason, DiscoveryTxtError, DiscoveryTxtRecord,
+        DiscoveryPeerFilter, DiscoveryPeerRejectReason, DiscoverySessionCandidate,
+        DiscoveryTxtError, DiscoveryTxtRecord, build_discovery_session_candidates,
         build_discovery_txt_record, filter_discovered_peers, parse_discovery_txt_record,
     };
 
@@ -395,7 +475,7 @@ mod tests {
             capabilities: CapabilityFlags::POINTER
                 | CapabilityFlags::KEYBOARD
                 | CapabilityFlags::SCREEN_LAYOUT,
-            build_version: "0.5.2".to_string(),
+            build_version: "0.5.3".to_string(),
         }
     }
 
@@ -403,6 +483,7 @@ mod tests {
         DiscoveredPeer {
             instance_name: format!("{device_id}.{AKRAZ_DISCOVERY_SERVICE_TYPE}"),
             host_name: format!("{device_id}.local."),
+            addresses: vec!["127.0.0.1".parse().expect("loopback address")],
             port: 4455,
             txt: DiscoveryTxtRecord {
                 device_id: device_id.to_string(),
@@ -418,7 +499,7 @@ mod tests {
             "v=1",
             "device_id=linux-laptop",
             "caps=pointer,keyboard,screen-layout",
-            "build=0.5.2",
+            "build=0.5.3",
         ])
         .expect("parse TXT record");
 
@@ -433,7 +514,7 @@ mod tests {
                 "v=1",
                 "device_id=linux-laptop",
                 "caps=pointer,keyboard,screen-layout",
-                "build=0.5.2",
+                "build=0.5.3",
             ]
         );
     }
@@ -441,7 +522,7 @@ mod tests {
     #[test]
     fn rejects_missing_duplicate_unsupported_and_unknown_txt_fields() {
         assert_eq!(
-            parse_discovery_txt_record(["v=1", "device_id=linux-laptop", "build=0.5.2"]),
+            parse_discovery_txt_record(["v=1", "device_id=linux-laptop", "build=0.5.3"]),
             Err(DiscoveryTxtError::MissingField { key: "caps" })
         );
         assert_eq!(
@@ -450,7 +531,7 @@ mod tests {
                 "V=1",
                 "device_id=linux-laptop",
                 "caps=pointer",
-                "build=0.5.2",
+                "build=0.5.3",
             ]),
             Err(DiscoveryTxtError::DuplicateField {
                 key: "v".to_string(),
@@ -461,7 +542,7 @@ mod tests {
                 "v=2",
                 "device_id=linux-laptop",
                 "caps=pointer",
-                "build=0.5.2",
+                "build=0.5.3",
             ]),
             Err(DiscoveryTxtError::UnsupportedVersion { version: 2 })
         );
@@ -470,7 +551,7 @@ mod tests {
                 "v=1",
                 "device_id=linux-laptop",
                 "caps=pointer,text",
-                "build=0.5.2",
+                "build=0.5.3",
             ]),
             Err(DiscoveryTxtError::InvalidCapability {
                 value: "text".to_string(),
@@ -485,7 +566,7 @@ mod tests {
                 "v=1",
                 "device_id=linux laptop",
                 "caps=pointer",
-                "build=0.5.2",
+                "build=0.5.3",
             ]),
             Err(DiscoveryTxtError::InvalidDeviceId {
                 value: "linux laptop".to_string(),
@@ -497,7 +578,7 @@ mod tests {
                 "v=1",
                 "device_id=linux:laptop",
                 "caps=pointer",
-                "build=0.5.2",
+                "build=0.5.3",
             ]),
             Err(DiscoveryTxtError::InvalidDeviceId {
                 value: "linux:laptop".to_string(),
@@ -544,7 +625,7 @@ mod tests {
             "linux-laptop",
             CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
         );
-        invalid_endpoint.port = 0;
+        invalid_endpoint.addresses.clear();
         assert_eq!(
             filter.accept(&invalid_endpoint),
             Err(DiscoveryPeerRejectReason::InvalidEndpoint)
@@ -572,5 +653,66 @@ mod tests {
         let accepted_peers = filter_discovered_peers(&peers, &filter);
 
         assert_eq!(accepted_peers, vec![&peers[1]]);
+    }
+
+    #[test]
+    fn builds_session_candidates_with_trusted_peer_metadata() {
+        let trusted = akraz_identity::TrustedPeerIdentity::new(
+            "linux-laptop",
+            "Linux Laptop",
+            b"public-key".to_vec(),
+            "AKRZ-TRUSTED",
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+        let discovered = peer(
+            "linux-laptop",
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+        let filter = DiscoveryPeerFilter {
+            required_capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            ..DiscoveryPeerFilter::default()
+        };
+
+        let candidates = build_discovery_session_candidates([&discovered], &filter, [&trusted]);
+
+        assert_eq!(
+            candidates,
+            vec![DiscoverySessionCandidate {
+                peer_id: "linux-laptop".to_string(),
+                display_name: "Linux Laptop".to_string(),
+                fingerprint: Some("AKRZ-TRUSTED".to_string()),
+                trusted: true,
+                address: "127.0.0.1:4455".parse().expect("candidate address"),
+                build_version: "0.5.3".to_string(),
+                capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            }]
+        );
+    }
+
+    #[test]
+    fn keeps_unpaired_discovery_candidates_explicitly_untrusted() {
+        let discovered = peer(
+            "new-laptop",
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+
+        let candidates = build_discovery_session_candidates(
+            [&discovered],
+            &DiscoveryPeerFilter::default(),
+            Vec::<&akraz_identity::TrustedPeerIdentity>::new(),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![DiscoverySessionCandidate {
+                peer_id: "new-laptop".to_string(),
+                display_name: "new-laptop".to_string(),
+                fingerprint: None,
+                trusted: false,
+                address: "127.0.0.1:4455".parse().expect("candidate address"),
+                build_version: "0.5.3".to_string(),
+                capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            }]
+        );
     }
 }

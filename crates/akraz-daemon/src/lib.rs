@@ -1,6 +1,6 @@
 //! Daemon status builders shared by akraz daemon and diagnostic clients.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{BufRead, BufReader, Write};
@@ -17,9 +17,13 @@ use akraz_core::{
     InjectedInputEvent, LogicalPoint, MouseButton, PeerId, PhysicalKey, PressState, RuntimeEvent,
     RuntimeInputState, ScreenEdge, ScreenEdgeBinding, ScreenLayout, SessionId,
 };
+use akraz_discovery::{
+    DiscoveredPeer, DiscoveryPeerFilter, DiscoverySessionCandidate,
+    build_discovery_session_candidates,
+};
 use akraz_identity::{
     Ed25519PublicKey, FileIdentityStore, IdentityPublicKey, IdentitySecretKey, LocalIdentity,
-    TrustedPeer,
+    TrustedPeer, TrustedPeerIdentity,
 };
 use akraz_ipc::{
     ControlModeSnapshot, DaemonLogEntry, DaemonLogLevel, DaemonLogsTail, DaemonShutdownResult,
@@ -3168,6 +3172,21 @@ pub fn build_diagnostics_keyboard_layout(
     platform.read_keyboard_layout().map(Into::into)
 }
 
+/// Convert resolved discovery results into candidates that may be used for `session.connect`.
+pub fn build_peer_session_discovery_candidates(
+    local_device_id: &DeviceId,
+    discovered_peers: &[DiscoveredPeer],
+    trusted_peers: &[TrustedPeerIdentity],
+) -> Vec<DiscoverySessionCandidate> {
+    let filter = DiscoveryPeerFilter {
+        local_device_id: Some(local_device_id.as_str().to_string()),
+        required_capabilities: peer_session_capabilities(),
+        blocked_device_ids: BTreeSet::new(),
+    };
+
+    build_discovery_session_candidates(discovered_peers, &filter, trusted_peers)
+}
+
 /// Handle one local IPC JSON-RPC request line.
 pub fn handle_ipc_request_line(
     state: &mut RuntimeInputState,
@@ -3686,6 +3705,7 @@ mod tests {
         PeerId, PhysicalKey, PressState, RuntimeEvent, RuntimeInputState, ScreenEdge,
         ScreenEdgeBinding, ScreenLayout, SessionId,
     };
+    use akraz_discovery::{DiscoveredPeer, DiscoverySessionCandidate, DiscoveryTxtRecord};
     use akraz_identity::{
         DeviceIdentity, Ed25519IdentityKey, Ed25519PublicKey, FileIdentityStore, LocalIdentity,
         TrustedPeer, TrustedPeerIdentity, fingerprint_for_public_key,
@@ -3725,8 +3745,9 @@ mod tests {
         TcpPeerSessionStreamState, TcpPeerSessionTransport, TcpPeerTransport,
         TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
         build_daemon_status_with_peer_sessions, build_diagnostics_keyboard_layout,
-        build_diagnostics_screen_topology, build_permissions_probe, connect_peer_session,
-        disconnect_peer_session, dispatch_input_capture_idle_watchdog_action, drain_capture_events,
+        build_diagnostics_screen_topology, build_peer_session_discovery_candidates,
+        build_permissions_probe, connect_peer_session, disconnect_peer_session,
+        dispatch_input_capture_idle_watchdog_action, drain_capture_events,
         execute_authenticated_peer_transport_session_stream_until_closed,
         execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
         execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
@@ -4064,6 +4085,21 @@ mod tests {
         }
     }
 
+    fn discovered_peer(device_id: &str, capabilities: CapabilityFlags) -> DiscoveredPeer {
+        DiscoveredPeer {
+            instance_name: format!("{device_id}._akraz._tcp.local."),
+            host_name: format!("{device_id}.local."),
+            addresses: vec!["127.0.0.1".parse().expect("loopback discovery address")],
+            port: 4455,
+            txt: DiscoveryTxtRecord {
+                version: 1,
+                device_id: device_id.to_string(),
+                capabilities,
+                build_version: "0.5.3".to_string(),
+            },
+        }
+    }
+
     #[test]
     fn daemon_status_reflects_runtime_state_and_capabilities() {
         let state = RuntimeInputState::new();
@@ -4143,6 +4179,45 @@ mod tests {
                 .is_ok()
         );
         let _ = std::fs::remove_file(&identity_store_path);
+    }
+
+    #[test]
+    fn peer_session_discovery_candidates_apply_daemon_session_policy() {
+        let trusted = TrustedPeerIdentity::new(
+            "linux-laptop",
+            "Linux Laptop",
+            b"public-key".to_vec(),
+            "AKRZ-TRUSTED",
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+        let local = discovered_peer(
+            "windows-desktop",
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+        let accepted = discovered_peer(
+            "linux-laptop",
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+        let missing_pointer = discovered_peer("keyboard-only", CapabilityFlags::KEYBOARD);
+
+        let candidates = build_peer_session_discovery_candidates(
+            &DeviceId::new("windows-desktop"),
+            &[local, accepted, missing_pointer],
+            &[trusted],
+        );
+
+        assert_eq!(
+            candidates,
+            vec![DiscoverySessionCandidate {
+                peer_id: "linux-laptop".to_string(),
+                display_name: "Linux Laptop".to_string(),
+                fingerprint: Some("AKRZ-TRUSTED".to_string()),
+                trusted: true,
+                address: "127.0.0.1:4455".parse().expect("candidate address"),
+                build_version: "0.5.3".to_string(),
+                capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            }]
+        );
     }
 
     #[test]
