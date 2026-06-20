@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -32,6 +32,14 @@ import {
   buildWindowsMvpReleaseGateSmokeReport,
   exitCodeForWindowsMvpReleaseGateSmoke,
 } from "../scripts/smoke-windows-mvp-release-gate.mjs";
+import {
+  WINDOWS_MVP_RELEASE_BUNDLE_FILES,
+  WINDOWS_MVP_RELEASE_BUNDLE_SCHEMA_VERSION,
+  buildWindowsMvpReleaseBundleReport,
+  exitCodeForWindowsMvpReleaseBundle,
+  parseWindowsMvpReleaseBundleArgs,
+  writeWindowsMvpReleaseBundleOutput,
+} from "../scripts/windows-mvp-release-bundle.mjs";
 
 function passingQaReport() {
   return {
@@ -300,5 +308,124 @@ describe("Windows MVP release gate", () => {
       includesEndpointValues: false,
     });
     expect(exitCodeForWindowsMvpReleaseGateSmoke(smokeReport)).toBe(0);
+  });
+
+  test("builds a privacy-safe Windows MVP release bundle manifest and canonical files", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-bundle-"));
+    const outDir = join(tempDir, "bundle");
+    const qaReportFile = join(tempDir, "qa-report.json");
+    const soakReportFile = join(tempDir, "soak-report.json");
+    const signingFile = join(tempDir, "signing.json");
+    const updaterFile = join(tempDir, "updater.json");
+    const options = {
+      qaReportFile: writeJson(qaReportFile, passingQaReport()),
+      signingPreflightFile: writeJson(signingFile, passingSigningPreflight()),
+      soakReportFile: writeJson(soakReportFile, passingSoakReport()),
+      updaterConfigPreflightFile: writeJson(updaterFile, passingUpdaterConfigPreflight()),
+    };
+
+    try {
+      const gateReport = buildWindowsMvpReleaseGateReport(options);
+      const bundleReport = buildWindowsMvpReleaseBundleReport(options);
+      const formatted = JSON.stringify(bundleReport);
+      const written = writeWindowsMvpReleaseBundleOutput(outDir, options, bundleReport, gateReport);
+      const manifestPath = join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.manifest);
+      const gatePath = join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.releaseGate);
+
+      expect(bundleReport.schemaVersion).toBe(WINDOWS_MVP_RELEASE_BUNDLE_SCHEMA_VERSION);
+      expect(bundleReport.ready).toBe(true);
+      expect(bundleReport.releaseGateReady).toBe(true);
+      expect(bundleReport.artifacts.every((artifact) => artifact.included)).toBe(true);
+      expect(bundleReport.privacy).toEqual({
+        includesQaReportPayload: false,
+        includesSecretValues: false,
+        includesFullFilePaths: false,
+        includesEndpointValues: false,
+        includesSourceEvidencePaths: false,
+      });
+      expect(formatted).not.toContain(tempDir);
+      expect(formatted).not.toContain("super-secret");
+      expect(formatted).not.toContain("updates.example.com");
+      expect(written.files.length).toBe(6);
+      expect(JSON.parse(readFileSync(manifestPath, "utf8"))).toEqual(bundleReport);
+      expect(JSON.parse(readFileSync(gatePath, "utf8"))).toEqual(gateReport);
+      expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.qaReport))).toBe(true);
+      expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.soakReport))).toBe(true);
+      expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.signingPreflight))).toBe(
+        true,
+      );
+      expect(
+        existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.updaterConfigPreflight)),
+      ).toBe(true);
+      expect(exitCodeForWindowsMvpReleaseBundle(bundleReport)).toBe(0);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects incomplete release bundle inputs without copying missing evidence", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-bundle-missing-"));
+    const outDir = join(tempDir, "bundle");
+
+    try {
+      const report = buildWindowsMvpReleaseBundleReport();
+      const formatted = JSON.stringify(report);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "bundleEvidenceFiles")).toMatchObject({
+        status: "invalid",
+        detail: "bundleEvidenceFilesNotReady",
+        missingArtifactIds: [
+          "qaReport",
+          "soakReport",
+          "signingPreflight",
+          "updaterConfigPreflight",
+        ],
+      });
+      expect(report.nextActions).toContainEqual({
+        gate: "releaseBundle",
+        artifactId: "qaReport",
+        action: "provide qaReport evidence file before bundling",
+      });
+      expect(formatted).not.toContain(tempDir);
+      expect(exitCodeForWindowsMvpReleaseBundle(report)).toBe(1);
+      expect(() => writeWindowsMvpReleaseBundleOutput(undefined, {}, report, {})).toThrow(
+        "--out-dir is required",
+      );
+      writeWindowsMvpReleaseBundleOutput(outDir, {}, report, buildWindowsMvpReleaseGateReport());
+      expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.manifest))).toBe(true);
+      expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.qaReport))).toBe(false);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("parses release bundle arguments", () => {
+    expect(
+      parseWindowsMvpReleaseBundleArgs([
+        "--qa-report-file",
+        "qa.json",
+        "--soak-report-file",
+        "soak.json",
+        "--signing-preflight-file",
+        "signing.json",
+        "--updater-config-preflight-file",
+        "updater.json",
+        "--out-dir",
+        "bundle",
+      ]),
+    ).toEqual({
+      outDir: "bundle",
+      qaReportFile: "qa.json",
+      signingPreflightFile: "signing.json",
+      soakReportFile: "soak.json",
+      updaterConfigPreflightFile: "updater.json",
+    });
+    expect(() => parseWindowsMvpReleaseBundleArgs(["--out-dir"])).toThrow(
+      "--out-dir requires a non-empty value",
+    );
+    expect(() => parseWindowsMvpReleaseBundleArgs(["--unknown"])).toThrow(
+      "unknown Windows MVP release bundle argument: --unknown",
+    );
   });
 });
