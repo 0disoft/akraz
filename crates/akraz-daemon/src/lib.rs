@@ -829,7 +829,7 @@ impl ManagedPeerSessionTransport {
             &trusted_peer,
         ) {
             Ok(session) => session,
-            Err(error) => return Err(self.record_connect_failure(Instant::now(), error)),
+            Err(error) => return Err(self.record_session_failure(Instant::now(), error)),
         };
 
         self.attach_session(session)?;
@@ -870,7 +870,7 @@ impl ManagedPeerSessionTransport {
         Ok(())
     }
 
-    fn record_connect_failure(&self, now: Instant, error: PlatformError) -> PlatformError {
+    fn record_session_failure(&self, now: Instant, error: PlatformError) -> PlatformError {
         let Ok(mut backoff) = self.reconnect_backoff.lock() else {
             return PlatformError::new(format!(
                 "{error}; managed peer session reconnect backoff is unavailable"
@@ -904,6 +904,8 @@ impl DaemonPeerTransport for ManagedPeerSessionTransport {
             return Ok(());
         };
         let dispatch_result = transport.dispatch_transport_command(command);
+        let dispatch_result =
+            dispatch_result.map_err(|error| self.record_session_failure(Instant::now(), error));
         if should_disconnect || dispatch_result.is_err() {
             match self.disconnect_session() {
                 Ok(_) => {}
@@ -3659,7 +3661,9 @@ fn push_missing_capability_issue(
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpStream;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use akraz_core::{
@@ -3703,7 +3707,8 @@ mod tests {
         ManagedPeerSessionTransport, NoopCoreActionDispatcher, PeerSessionReconnectBackoff,
         PeerTransportCommandExecution, PeerTransportCommandPayload, PeerTransportInputEvent,
         PeerTransportMessage, PeerTransportProtocolVersion, PeerTransportSessionFrame,
-        PowerResumeWatchdog, RuntimeEnvironmentWatchdog, TcpPeerSessionTransport, TcpPeerTransport,
+        PowerResumeWatchdog, RuntimeEnvironmentWatchdog, TcpPeerSessionHeartbeatWorker,
+        TcpPeerSessionStreamState, TcpPeerSessionTransport, TcpPeerTransport,
         TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
         build_daemon_status_with_peer_sessions, build_diagnostics_keyboard_layout,
         build_diagnostics_screen_topology, build_permissions_probe, connect_peer_session,
@@ -5308,6 +5313,59 @@ mod tests {
         assert_eq!(managed.active_session(), Ok(None));
 
         let _ = std::fs::remove_file(&identity_store_path);
+    }
+
+    #[test]
+    fn managed_peer_session_transport_delays_immediate_connect_retry_after_dispatch_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let client = TcpStream::connect(address).expect("connect loopback client");
+        let (_server, _) = listener.accept().expect("accept loopback client");
+        client
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shutdown loopback client");
+        let managed = ManagedPeerSessionTransport::new();
+        let broken_session = TcpPeerSessionTransport {
+            peer_id: PeerId::new("right-peer"),
+            local_device_id: DeviceId::new("windows-desktop"),
+            address,
+            stream: Arc::new(Mutex::new(TcpPeerSessionStreamState::new(client))),
+            _heartbeat_worker: TcpPeerSessionHeartbeatWorker::start(
+                PeerId::new("right-peer"),
+                address,
+                Arc::new(Mutex::new(TcpPeerSessionStreamState::new(
+                    TcpStream::connect(address).expect("connect heartbeat loopback client"),
+                ))),
+                Duration::from_secs(60),
+            ),
+        };
+        let (_heartbeat_server, _) = listener.accept().expect("accept heartbeat loopback client");
+
+        managed
+            .attach_session(broken_session)
+            .expect("attach broken active session");
+        let dispatch_error = managed
+            .dispatch_transport_command(DaemonTransportCommand::ReleaseAllInputs)
+            .expect_err("closed active session dispatch should fail");
+        let retry_error = managed
+            .connect_session(
+                PeerId::new("right-peer"),
+                DeviceId::new("windows-desktop"),
+                address,
+            )
+            .expect_err("immediate retry after dispatch failure should be delayed");
+
+        assert!(
+            dispatch_error
+                .to_string()
+                .contains("retry peer session connect after 250ms")
+        );
+        assert!(
+            retry_error
+                .to_string()
+                .starts_with("peer session reconnect backoff active for ")
+        );
+        assert_eq!(managed.active_session(), Ok(None));
     }
 
     #[test]
