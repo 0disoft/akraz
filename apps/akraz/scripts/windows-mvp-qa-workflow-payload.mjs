@@ -19,6 +19,7 @@ import {
 
 export const WINDOWS_MVP_QA_WORKFLOW_PAYLOAD_SCHEMA_VERSION =
   "akraz.windowsMvpQaWorkflowPayload/v1";
+export const WINDOWS_MVP_QA_WORKFLOW_INPUT_NAME = "qa_report_base64";
 
 export function buildWindowsMvpQaWorkflowPayload(report) {
   return Buffer.from(JSON.stringify(report), "utf8").toString("base64");
@@ -32,7 +33,7 @@ export function buildWindowsMvpQaWorkflowPayloadReport(report, options = {}) {
   return {
     schemaVersion: WINDOWS_MVP_QA_WORKFLOW_PAYLOAD_SCHEMA_VERSION,
     ready,
-    inputName: "qa_report_base64",
+    inputName: WINDOWS_MVP_QA_WORKFLOW_INPUT_NAME,
     payloadEncoding: "base64",
     payloadWritten: Boolean(options.payloadWritten),
     dispatchInputsWritten: Boolean(options.dispatchInputsWritten),
@@ -101,7 +102,7 @@ export function writeWindowsMvpQaWorkflowDispatchInputsFile(outFile, payload) {
 
   return writeTextFileAtomic(
     outFile,
-    `${JSON.stringify({ qa_report_base64: payload }, null, 2)}\n`,
+    `${JSON.stringify({ [WINDOWS_MVP_QA_WORKFLOW_INPUT_NAME]: payload }, null, 2)}\n`,
   );
 }
 

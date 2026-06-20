@@ -6,12 +6,15 @@ import {
   DEFAULT_QA_REPORT_ARTIFACT,
   DEFAULT_SOAK_REPORT_ARTIFACT,
   WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+  WINDOWS_MVP_RELEASE_WORKFLOW_INPUT_NAMES,
 } from "./windows-mvp-release-workflow-inputs.mjs";
+import { WINDOWS_MVP_QA_WORKFLOW_INPUT_NAME } from "./windows-mvp-qa-workflow-payload.mjs";
 
 export const WORKFLOW_CONTRACTS_SCHEMA_VERSION = "akraz.workflowContracts/v1";
 
 const WORKFLOW_DIRECTORY = ".github/workflows";
 const REQUIRED_CHECKOUT_VERSION = "v6";
+const WINDOWS_MVP_QA_WORKFLOW_FILE = "windows-mvp-qa.yml";
 const RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH =
   "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json";
 const RELEASE_WORKFLOW_INPUTS_MANIFEST_PATH =
@@ -38,6 +41,45 @@ const REQUIRED_SMOKE_WORKFLOW_SCRIPTS = [
   "smoke:windows-mvp-soak",
 ];
 const SMOKE_SOAK_REPORT_PATH = "apps/akraz/reports/windows-mvp-soak-smoke.json";
+const QA_WORKFLOW_INPUT_ENVIRONMENT = [
+  {
+    inputName: "qa_report_json",
+    envName: "QA_REPORT_JSON",
+    minReferences: 1,
+  },
+  {
+    inputName: WINDOWS_MVP_QA_WORKFLOW_INPUT_NAME,
+    envName: "QA_REPORT_BASE64",
+    minReferences: 1,
+  },
+];
+const RELEASE_WORKFLOW_INPUT_ENVIRONMENT = [
+  {
+    inputName: "source_run_id",
+    envName: "SOURCE_RUN_ID",
+    minReferences: 2,
+  },
+  {
+    inputName: "qa_source_run_id",
+    envName: "QA_SOURCE_RUN_ID",
+    minReferences: 2,
+  },
+  {
+    inputName: "soak_source_run_id",
+    envName: "SOAK_SOURCE_RUN_ID",
+    minReferences: 2,
+  },
+  {
+    inputName: "qa_report_artifact",
+    envName: "QA_REPORT_ARTIFACT",
+    minReferences: 2,
+  },
+  {
+    inputName: "soak_report_artifact",
+    envName: "SOAK_REPORT_ARTIFACT",
+    minReferences: 2,
+  },
+];
 const WORKSPACE_DELEGATED_APP_SCRIPTS = [
   "build",
   "qa:windows-mvp-plan",
@@ -116,7 +158,9 @@ export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoo
     ...evaluateCheckoutVersions(workflows),
     ...evaluateBunVersions(workflows, expectedBunVersion),
     ...evaluateWorkflowScripts(workflowScripts, rootPackage.scripts ?? {}),
+    evaluateQaWorkflowInputWiring(workflows),
     evaluateReleaseWorkflowFile(workflows),
+    evaluateReleaseWorkflowInputWiring(workflows),
     evaluateReleaseArtifactContract(workflows),
     evaluateReleaseEvidenceSourcesWiring(workflows),
     evaluateSmokeWorkflowCoverage(workflows),
@@ -307,6 +351,90 @@ function evaluateReleaseWorkflowFile(workflows) {
     status: "missing",
     detail: "releaseWorkflowFileMissing",
     workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+  };
+}
+
+function evaluateQaWorkflowInputWiring(workflows) {
+  const workflow = workflows.find((candidate) => candidate.name === WINDOWS_MVP_QA_WORKFLOW_FILE);
+  if (!workflow) {
+    return {
+      id: "qaWorkflowInputWiring",
+      status: "missing",
+      detail: "qaWorkflowFileMissing",
+      workflowFile: WINDOWS_MVP_QA_WORKFLOW_FILE,
+    };
+  }
+
+  return evaluateWorkflowInputWiring({
+    checkId: "qaWorkflowInputWiring",
+    workflow,
+    expectedInputNames: QA_WORKFLOW_INPUT_ENVIRONMENT.map((entry) => entry.inputName),
+    expectedEnvMappings: QA_WORKFLOW_INPUT_ENVIRONMENT,
+    detail: "qaWorkflowInputWiringDrifted",
+  });
+}
+
+function evaluateReleaseWorkflowInputWiring(workflows) {
+  const workflow = workflows.find(
+    (candidate) => candidate.name === WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+  );
+  if (!workflow) {
+    return {
+      id: "releaseWorkflowInputWiring",
+      status: "missing",
+      detail: "releaseWorkflowFileMissing",
+      workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+    };
+  }
+
+  return evaluateWorkflowInputWiring({
+    checkId: "releaseWorkflowInputWiring",
+    workflow,
+    expectedInputNames: WINDOWS_MVP_RELEASE_WORKFLOW_INPUT_NAMES,
+    expectedEnvMappings: RELEASE_WORKFLOW_INPUT_ENVIRONMENT,
+    detail: "releaseWorkflowInputWiringDrifted",
+  });
+}
+
+function evaluateWorkflowInputWiring({
+  checkId,
+  workflow,
+  expectedInputNames,
+  expectedEnvMappings,
+  detail,
+}) {
+  const missingInputDefinitions = expectedInputNames.filter(
+    (inputName) => !workflowInputDefinitionExists(workflow.source, inputName),
+  );
+  const missingEnvMappings = expectedEnvMappings
+    .filter(
+      (mapping) =>
+        countWorkflowInputEnvMappings(workflow.source, mapping.inputName, mapping.envName) <
+        mapping.minReferences,
+    )
+    .map((mapping) => ({
+      inputName: mapping.inputName,
+      envName: mapping.envName,
+      minReferences: mapping.minReferences,
+    }));
+
+  if (missingInputDefinitions.length === 0 && missingEnvMappings.length === 0) {
+    return {
+      id: checkId,
+      status: "pass",
+      workflowFile: workflow.name,
+      inputNames: expectedInputNames,
+    };
+  }
+
+  return {
+    id: checkId,
+    status: "invalid",
+    detail,
+    workflowFile: workflow.name,
+    missingInputDefinitions,
+    missingEnvMappings,
+    expectedInputNames,
   };
 }
 
@@ -584,6 +712,35 @@ function buildNextActions(checks) {
             workflowFile: check.workflowFile,
           },
         ];
+      case "qaWorkflowFileMissing":
+        return [
+          {
+            id: "restoreQaWorkflow",
+            action: "restore the Windows MVP QA workflow",
+            workflowFile: check.workflowFile,
+          },
+        ];
+      case "qaWorkflowInputWiringDrifted":
+        return [
+          {
+            id: "syncQaWorkflowInputs",
+            action: "sync the Windows MVP QA workflow dispatch inputs and environment mappings",
+            workflowFile: check.workflowFile,
+            missingInputDefinitions: check.missingInputDefinitions,
+            missingEnvMappings: check.missingEnvMappings,
+          },
+        ];
+      case "releaseWorkflowInputWiringDrifted":
+        return [
+          {
+            id: "syncReleaseWorkflowInputs",
+            action:
+              "sync the Windows MVP release workflow dispatch inputs and environment mappings",
+            workflowFile: check.workflowFile,
+            missingInputDefinitions: check.missingInputDefinitions,
+            missingEnvMappings: check.missingEnvMappings,
+          },
+        ];
       case "releaseArtifactNamesDrifted":
         return [
           {
@@ -681,6 +838,15 @@ function uploadArtifactName(source) {
   return match ? unquote(match[1].trim()) : null;
 }
 
+function workflowInputDefinitionExists(source, inputName) {
+  return new RegExp(`\\n\\s{6}${escapeRegExp(inputName)}:\\s*\\n`).test(source);
+}
+
+function countWorkflowInputEnvMappings(source, inputName, envName) {
+  const expectedMapping = `${envName}: \${{ inputs.${inputName} }}`;
+  return source.split(expectedMapping).length - 1;
+}
+
 function readWorkflowFiles(workspaceRoot) {
   const workflowDirectory = join(workspaceRoot, WORKFLOW_DIRECTORY);
   return readdirSync(workflowDirectory, { withFileTypes: true })
@@ -716,6 +882,10 @@ function unquote(value) {
     return trimmed.slice(1, -1);
   }
   return trimmed;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function lineNumberForOffset(source, offset) {

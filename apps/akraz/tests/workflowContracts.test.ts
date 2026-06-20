@@ -59,6 +59,23 @@ describe("GitHub Actions workflow contracts", () => {
       workflowInputsManifestPath:
         "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-workflow-inputs.json",
     });
+    expect(report.checks.find((check) => check.id === "qaWorkflowInputWiring")).toMatchObject({
+      status: "pass",
+      workflowFile: "windows-mvp-qa.yml",
+      inputNames: ["qa_report_json", "qa_report_base64"],
+    });
+    expect(report.checks.find((check) => check.id === "releaseWorkflowInputWiring"))
+      .toMatchObject({
+        status: "pass",
+        workflowFile: "windows-mvp-release.yml",
+        inputNames: [
+          "source_run_id",
+          "qa_source_run_id",
+          "soak_source_run_id",
+          "qa_report_artifact",
+          "soak_report_artifact",
+        ],
+      });
     expect(report.checks.every((check) => check.status === "pass")).toBe(true);
     expect(report.privacy).toEqual({
       includesSecretValues: false,
@@ -212,6 +229,112 @@ describe("GitHub Actions workflow contracts", () => {
         action: "wire the release evidence source manifest generation into the bundle command",
         workflowFile: "windows-mvp-release.yml",
         missingSnippets: ["releaseBundleEvidenceSourcesCommand"],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects QA workflow drift when generated payload input is not wired", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-qa-workflow-input-contracts-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory);
+      copyCurrentWorkflows(tempDirectory);
+
+      const qaWorkflowWithoutPayloadMapping = readFileSync(
+        join(".github", "workflows", "windows-mvp-qa.yml"),
+        "utf8",
+      ).replace(
+        "          QA_REPORT_BASE64: ${{ inputs.qa_report_base64 }}",
+        "          QA_REPORT_BASE64: ${{ inputs.qa_payload_base64 }}",
+      );
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "windows-mvp-qa.yml"),
+        qaWorkflowWithoutPayloadMapping,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "qaWorkflowInputWiring")).toMatchObject({
+        status: "invalid",
+        detail: "qaWorkflowInputWiringDrifted",
+        missingInputDefinitions: [],
+        missingEnvMappings: [
+          {
+            inputName: "qa_report_base64",
+            envName: "QA_REPORT_BASE64",
+            minReferences: 1,
+          },
+        ],
+      });
+      expect(report.nextActions).toContainEqual({
+        id: "syncQaWorkflowInputs",
+        action: "sync the Windows MVP QA workflow dispatch inputs and environment mappings",
+        workflowFile: "windows-mvp-qa.yml",
+        missingInputDefinitions: [],
+        missingEnvMappings: [
+          {
+            inputName: "qa_report_base64",
+            envName: "QA_REPORT_BASE64",
+            minReferences: 1,
+          },
+        ],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects release workflow drift when dispatch inputs are not wired into both release steps", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-input-contracts-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory);
+      copyCurrentWorkflows(tempDirectory);
+
+      const releaseWorkflowWithMissingSourceMapping = readFileSync(
+        join(".github", "workflows", "windows-mvp-release.yml"),
+        "utf8",
+      ).replace("          QA_SOURCE_RUN_ID: ${{ inputs.qa_source_run_id }}\n", "");
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "windows-mvp-release.yml"),
+        releaseWorkflowWithMissingSourceMapping,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "releaseWorkflowInputWiring"))
+        .toMatchObject({
+          status: "invalid",
+          detail: "releaseWorkflowInputWiringDrifted",
+          missingInputDefinitions: [],
+          missingEnvMappings: [
+            {
+              inputName: "qa_source_run_id",
+              envName: "QA_SOURCE_RUN_ID",
+              minReferences: 2,
+            },
+          ],
+        });
+      expect(report.nextActions).toContainEqual({
+        id: "syncReleaseWorkflowInputs",
+        action: "sync the Windows MVP release workflow dispatch inputs and environment mappings",
+        workflowFile: "windows-mvp-release.yml",
+        missingInputDefinitions: [],
+        missingEnvMappings: [
+          {
+            inputName: "qa_source_run_id",
+            envName: "QA_SOURCE_RUN_ID",
+            minReferences: 2,
+          },
+        ],
       });
       expect(exitCodeForWorkflowContracts(report)).toBe(1);
     } finally {

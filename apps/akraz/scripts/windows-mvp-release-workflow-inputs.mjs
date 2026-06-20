@@ -16,6 +16,13 @@ export const WINDOWS_MVP_RELEASE_WORKFLOW_INPUTS_SCHEMA_VERSION =
 export const WINDOWS_MVP_RELEASE_WORKFLOW_FILE = "windows-mvp-release.yml";
 export const DEFAULT_QA_REPORT_ARTIFACT = "windows-mvp-qa-report";
 export const DEFAULT_SOAK_REPORT_ARTIFACT = "windows-mvp-soak-report";
+export const WINDOWS_MVP_RELEASE_WORKFLOW_INPUT_NAMES = [
+  "source_run_id",
+  "qa_source_run_id",
+  "soak_source_run_id",
+  "qa_report_artifact",
+  "soak_report_artifact",
+];
 
 export function buildWindowsMvpReleaseWorkflowInputsReport(options = {}) {
   const inputs = buildWorkflowInputs(options);
