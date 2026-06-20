@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.4.98",
+  "version": "0.4.99",
   "private": true,
   "type": "module",
   "scripts": {
@@ -34,7 +34,8 @@
     "smoke:tcp-transport": "bun scripts/smoke-tcp-transport.mjs",
     "smoke:windows-mvp-soak": "bun scripts/smoke-windows-mvp-soak.mjs",
     "tauri": "tauri",
-    "verify:release-metadata": "bun scripts/verify-release-metadata.mjs"
+    "verify:release-metadata": "bun scripts/verify-release-metadata.mjs",
+    "verify:workflow-contracts": "bun scripts/verify-workflow-contracts.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0"
