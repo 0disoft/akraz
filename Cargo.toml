@@ -5,6 +5,7 @@ members = [
   "crates/akraz-core",
   "crates/akraz-identity",
   "crates/akraz-protocol",
+  "crates/akraz-discovery",
   "crates/akraz-platform",
   "crates/akraz-ipc",
   "crates/akraz-daemon",
@@ -12,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
