@@ -527,6 +527,29 @@ describe("Windows MVP release gate", () => {
     expect(exitCodeForWindowsMvpReleaseGateSmoke(smokeReport)).toBe(0);
   });
 
+  test("smoke gate verifies fail-closed behavior through the app package script", () => {
+    const result = runAppPackageScript("smoke:windows-mvp-release-gate", []);
+
+    expect(result.status).toBe(0);
+
+    const smokeReport = JSON.parse(result.stdout);
+
+    expect(smokeReport.schemaVersion).toBe(WINDOWS_MVP_RELEASE_GATE_SMOKE_SCHEMA_VERSION);
+    expect(smokeReport.ready).toBe(true);
+    expect(smokeReport.releaseGateReady).toBe(false);
+    expect(smokeReport.releaseGateExitCode).toBe(1);
+    expect(smokeReport.checkedGateIds).toContain("qaReport");
+    expect(smokeReport.checkedGateIds).toContain("soakReport");
+    expect(smokeReport.checks.every((check) => check.status === "pass")).toBe(true);
+    expect(smokeReport.privacy).toEqual({
+      includesQaReportPayload: false,
+      includesSecretValues: false,
+      includesFullFilePaths: false,
+      includesEndpointValues: false,
+    });
+    expect(result.stdout.endsWith("\n")).toBe(true);
+  });
+
   test("smoke bundle verifies fail-closed behavior without release evidence", () => {
     const releaseBundleReport = buildWindowsMvpReleaseBundleReport();
     const smokeReport = buildWindowsMvpReleaseBundleSmokeReport(releaseBundleReport);
@@ -549,6 +572,33 @@ describe("Windows MVP release gate", () => {
       includesSourceEvidencePaths: false,
     });
     expect(exitCodeForWindowsMvpReleaseBundleSmoke(smokeReport)).toBe(0);
+  });
+
+  test("smoke bundle verifies fail-closed behavior through the app package script", () => {
+    const result = runAppPackageScript("smoke:windows-mvp-release-bundle", []);
+
+    expect(result.status).toBe(0);
+
+    const smokeReport = JSON.parse(result.stdout);
+
+    expect(smokeReport.schemaVersion).toBe(WINDOWS_MVP_RELEASE_BUNDLE_SMOKE_SCHEMA_VERSION);
+    expect(smokeReport.ready).toBe(true);
+    expect(smokeReport.releaseBundleReady).toBe(false);
+    expect(smokeReport.releaseBundleExitCode).toBe(1);
+    expect(smokeReport.checkedArtifactIds).toContain("qaReport");
+    expect(smokeReport.checkedArtifactIds).toContain("soakReport");
+    expect(smokeReport.checkedArtifactIds).toContain("signingPreflight");
+    expect(smokeReport.checkedArtifactIds).toContain("updaterConfigPreflight");
+    expect(smokeReport.checkedArtifactIds).toContain("evidenceSources");
+    expect(smokeReport.checks.every((check) => check.status === "pass")).toBe(true);
+    expect(smokeReport.privacy).toEqual({
+      includesQaReportPayload: false,
+      includesSecretValues: false,
+      includesFullFilePaths: false,
+      includesEndpointValues: false,
+      includesSourceEvidencePaths: false,
+    });
+    expect(result.stdout.endsWith("\n")).toBe(true);
   });
 
   test("builds a privacy-safe Windows MVP release bundle manifest and canonical files", () => {
@@ -747,6 +797,84 @@ describe("Windows MVP release gate", () => {
       expect(result.stdout.endsWith("\n")).toBe(true);
       expect(readFileSync(manifestPath, "utf8").endsWith("\n")).toBe(true);
       expect(readFileSync(gatePath, "utf8").endsWith("\n")).toBe(true);
+      expect(formatted).not.toContain(tempDir);
+      expect(formatted).not.toContain("super-secret");
+      expect(formatted).not.toContain("updates.example.com");
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("smoke bundle verifies generated bundle artifacts through the app package script", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-bundle-smoke-cli-"));
+    const outDir = join(tempDir, "bundle");
+    const qaReportFile = join(tempDir, "qa-report.json");
+    const soakReportFile = join(tempDir, "soak-report.json");
+    const signingFile = join(tempDir, "signing.json");
+    const updaterFile = join(tempDir, "updater.json");
+    const evidenceSourcesFile = join(tempDir, "evidence-sources.json");
+    const options = {
+      evidenceSourcesFile: writeJson(
+        evidenceSourcesFile,
+        buildWindowsMvpReleaseEvidenceSourcesReport({
+          sourceRunId: "27856073522",
+          manifestWritten: true,
+          dispatchInputsWritten: true,
+        }),
+      ),
+      qaReportFile: writeJson(qaReportFile, passingQaReport()),
+      signingPreflightFile: writeJson(signingFile, passingSigningPreflight()),
+      soakReportFile: writeJson(soakReportFile, passingSoakReport()),
+      updaterConfigPreflightFile: writeJson(updaterFile, passingUpdaterConfigPreflight()),
+    };
+
+    try {
+      const gateReport = buildWindowsMvpReleaseGateReport(options);
+      const bundleReport = buildWindowsMvpReleaseBundleReport(options);
+      writeWindowsMvpReleaseBundleOutput(outDir, options, bundleReport, gateReport);
+
+      const result = runAppPackageScript("smoke:windows-mvp-release-bundle", [
+        "--bundle-dir",
+        outDir,
+      ]);
+
+      expect(result.status).toBe(0);
+
+      const integrityReport = JSON.parse(result.stdout);
+      const formatted = JSON.stringify(integrityReport);
+
+      expect(integrityReport).toMatchObject({
+        schemaVersion: WINDOWS_MVP_RELEASE_BUNDLE_ARTIFACT_INTEGRITY_SCHEMA_VERSION,
+        ready: true,
+        bundleDirectoryProvided: true,
+        expectedFiles: [
+          "windows-mvp-qa-report.json",
+          "windows-mvp-release-bundle.json",
+          "windows-mvp-release-evidence-sources.json",
+          "windows-mvp-release-gate.json",
+          "windows-mvp-signing-preflight.json",
+          "windows-mvp-soak-report.json",
+          "windows-mvp-updater-config-preflight.json",
+        ],
+        foundFiles: [
+          "windows-mvp-qa-report.json",
+          "windows-mvp-release-bundle.json",
+          "windows-mvp-release-evidence-sources.json",
+          "windows-mvp-release-gate.json",
+          "windows-mvp-signing-preflight.json",
+          "windows-mvp-soak-report.json",
+          "windows-mvp-updater-config-preflight.json",
+        ],
+      });
+      expect(integrityReport.checks.every((check) => check.status === "pass")).toBe(true);
+      expect(integrityReport.privacy).toEqual({
+        includesQaReportPayload: false,
+        includesSecretValues: false,
+        includesFullFilePaths: false,
+        includesEndpointValues: false,
+        includesSourceEvidencePaths: false,
+      });
+      expect(result.stdout.endsWith("\n")).toBe(true);
       expect(formatted).not.toContain(tempDir);
       expect(formatted).not.toContain("super-secret");
       expect(formatted).not.toContain("updates.example.com");
