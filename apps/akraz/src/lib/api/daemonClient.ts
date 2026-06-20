@@ -8,6 +8,7 @@ import type {
   DiagnosticsSupportBundle,
   PermissionsProbe,
   SessionConnectParams,
+  SessionDiscoveryCandidatesResult,
 } from "./types";
 
 export const daemonClient = {
@@ -45,6 +46,10 @@ export const daemonClient = {
 
   connectSession(params: SessionConnectParams): Promise<DaemonLifecycleSnapshot> {
     return invoke<DaemonLifecycleSnapshot>("session_connect", { params });
+  },
+
+  sessionDiscoveryCandidates(): Promise<SessionDiscoveryCandidatesResult> {
+    return invoke<SessionDiscoveryCandidatesResult>("session_discovery_candidates");
   },
 
   disconnectSession(): Promise<DaemonLifecycleSnapshot> {

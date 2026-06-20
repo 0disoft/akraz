@@ -225,6 +225,20 @@ export interface SessionConnectResult {
   session: SessionStatus;
 }
 
+export interface SessionDiscoveryCandidate {
+  peerId: string;
+  displayName: string;
+  fingerprint?: string;
+  trusted: boolean;
+  address: string;
+  buildVersion: string;
+  capabilities: number;
+}
+
+export interface SessionDiscoveryCandidatesResult {
+  candidates: SessionDiscoveryCandidate[];
+}
+
 export interface SessionDisconnectResult {
   disconnected: boolean;
   session: SessionStatus | null;

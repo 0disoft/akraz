@@ -83,6 +83,9 @@ pub const METHOD_INPUT_RELEASE_ALL: &str = "input.releaseAll";
 /// JSON-RPC method for connecting the active peer session transport.
 pub const METHOD_SESSION_CONNECT: &str = "session.connect";
 
+/// JSON-RPC method for listing discovered peer-session candidates.
+pub const METHOD_SESSION_DISCOVERY_CANDIDATES: &str = "session.discoveryCandidates";
+
 /// JSON-RPC method for disconnecting the active peer session transport.
 pub const METHOD_SESSION_DISCONNECT: &str = "session.disconnect";
 
@@ -782,6 +785,7 @@ pub enum IpcRequest {
     DiagnosticsKeyboardLayout(JsonRpcRequest<DiagnosticsKeyboardLayoutParams>),
     InputReleaseAll(JsonRpcRequest<InputReleaseAllParams>),
     SessionConnect(JsonRpcRequest<SessionConnectParams>),
+    SessionDiscoveryCandidates(JsonRpcRequest<SessionDiscoveryCandidatesParams>),
     SessionDisconnect(JsonRpcRequest<SessionDisconnectParams>),
 }
 
@@ -797,6 +801,7 @@ impl IpcRequest {
             Self::DiagnosticsKeyboardLayout(request) => &request.id,
             Self::InputReleaseAll(request) => &request.id,
             Self::SessionConnect(request) => &request.id,
+            Self::SessionDiscoveryCandidates(request) => &request.id,
             Self::SessionDisconnect(request) => &request.id,
         }
     }
@@ -812,6 +817,7 @@ impl IpcRequest {
             Self::DiagnosticsKeyboardLayout(request) => &request.method,
             Self::InputReleaseAll(request) => &request.method,
             Self::SessionConnect(request) => &request.method,
+            Self::SessionDiscoveryCandidates(request) => &request.method,
             Self::SessionDisconnect(request) => &request.method,
         }
     }
@@ -935,6 +941,11 @@ pub struct SessionConnectParams {
     pub local_device_id: String,
     pub address: String,
 }
+
+/// Empty params for `session.discoveryCandidates`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDiscoveryCandidatesParams {}
 
 /// Empty params for `session.disconnect`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1310,6 +1321,27 @@ pub struct SessionConnectResult {
     pub session: SessionStatus,
 }
 
+/// Wire-safe peer-session candidate discovered near the local device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDiscoveryCandidate {
+    pub peer_id: String,
+    pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    pub trusted: bool,
+    pub address: String,
+    pub build_version: String,
+    pub capabilities: akraz_protocol::CapabilityFlags,
+}
+
+/// `session.discoveryCandidates` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDiscoveryCandidatesResult {
+    pub candidates: Vec<SessionDiscoveryCandidate>,
+}
+
 /// `session.disconnect` result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1659,6 +1691,9 @@ pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
         }
         METHOD_INPUT_RELEASE_ALL => parse_typed_request(raw).map(IpcRequest::InputReleaseAll),
         METHOD_SESSION_CONNECT => parse_typed_request(raw).map(IpcRequest::SessionConnect),
+        METHOD_SESSION_DISCOVERY_CANDIDATES => {
+            parse_typed_request(raw).map(IpcRequest::SessionDiscoveryCandidates)
+        }
         METHOD_SESSION_DISCONNECT => parse_typed_request(raw).map(IpcRequest::SessionDisconnect),
         _ => Err(JsonRpcFailure::new(
             Some(raw.id),
@@ -1717,14 +1752,16 @@ mod tests {
         METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS,
         METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
         METHOD_INPUT_RELEASE_ALL, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
-        OsLocalIpcClient, PeerStatus, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
-        SessionConnectParams, SessionConnectResult, SessionDisconnectParams,
-        SessionDisconnectResult, SessionStatus, build_diagnostics_latency_histogram,
-        build_diagnostics_snapshot, build_diagnostics_support_bundle,
-        build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
-        diagnostics_session_type_from_values, parse_request_line, resolve_default_endpoint,
-        serve_os_local_ipc_once, to_json_line,
+        METHOD_SESSION_DISCOVERY_CANDIDATES, OsLocalIpcClient, PeerStatus, PermissionIssue,
+        PermissionsProbe, ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult,
+        SessionDisconnectParams, SessionDisconnectResult, SessionDiscoveryCandidate,
+        SessionDiscoveryCandidatesParams, SessionDiscoveryCandidatesResult, SessionStatus,
+        build_diagnostics_latency_histogram, build_diagnostics_snapshot,
+        build_diagnostics_support_bundle, build_diagnostics_support_bundle_with_previous_crash,
+        call_json_rpc, diagnostics_session_type_from_values, parse_request_line,
+        resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
     };
+    use akraz_protocol::CapabilityFlags;
     use serde_json::json;
 
     const CURRENT_TEST_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2451,6 +2488,70 @@ mod tests {
     }
 
     #[test]
+    fn session_discovery_candidates_request_uses_camel_case_contract() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_SESSION_DISCOVERY_CANDIDATES,
+            SessionDiscoveryCandidatesParams::default(),
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "method": "session.discoveryCandidates",
+                "params": {}
+            })
+        );
+    }
+
+    #[test]
+    fn session_discovery_candidates_response_uses_camel_case_contract() {
+        let response = JsonRpcSuccess::new(
+            "req_1",
+            SessionDiscoveryCandidatesResult {
+                candidates: vec![SessionDiscoveryCandidate {
+                    peer_id: "linux-laptop".to_string(),
+                    display_name: "Linux Laptop".to_string(),
+                    fingerprint: Some("AKRZ-TRUSTED".to_string()),
+                    trusted: true,
+                    address: "127.0.0.1:24888".to_string(),
+                    build_version: CURRENT_TEST_VERSION.to_string(),
+                    capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+                }],
+            },
+        );
+        let line = match to_json_line(&response) {
+            Ok(line) => line,
+            Err(error) => panic!("expected response serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "result": {
+                    "candidates": [{
+                        "peerId": "linux-laptop",
+                        "displayName": "Linux Laptop",
+                        "fingerprint": "AKRZ-TRUSTED",
+                        "trusted": true,
+                        "address": "127.0.0.1:24888",
+                        "buildVersion": CURRENT_TEST_VERSION,
+                        "capabilities": 3
+                    }]
+                }
+            })
+        );
+    }
+
+    #[test]
     fn daemon_logs_tail_response_uses_camel_case_contract() {
         let response = JsonRpcSuccess::new(
             "req_1",
@@ -2732,6 +2833,24 @@ mod tests {
         assert_eq!(
             parse_request_line(&line),
             Ok(IpcRequest::SessionConnect(request))
+        );
+    }
+
+    #[test]
+    fn parses_session_discovery_candidates_request_line() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_SESSION_DISCOVERY_CANDIDATES,
+            SessionDiscoveryCandidatesParams::default(),
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(IpcRequest::SessionDiscoveryCandidates(request))
         );
     }
 

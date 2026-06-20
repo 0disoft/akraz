@@ -31,7 +31,8 @@ use akraz_ipc::{
     IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError, JsonRpcError,
     JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PeerStatus, PermissionIssue, PermissionsProbe,
     ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult, SessionDisconnectResult,
-    SessionStatus, parse_request_line, serve_os_local_ipc_once, to_json_line,
+    SessionDiscoveryCandidate, SessionDiscoveryCandidatesResult, SessionStatus, parse_request_line,
+    serve_os_local_ipc_once, to_json_line,
 };
 use akraz_platform::{
     DesktopGeometry, InputCaptureConfig, InputCapturePolicy, InputCaptureSession, PlatformAdapter,
@@ -3187,6 +3188,26 @@ pub fn build_peer_session_discovery_candidates(
     build_discovery_session_candidates(discovered_peers, &filter, trusted_peers)
 }
 
+/// Convert discovery candidates into the local IPC result contract.
+pub fn build_session_discovery_candidates_result(
+    candidates: &[DiscoverySessionCandidate],
+) -> SessionDiscoveryCandidatesResult {
+    SessionDiscoveryCandidatesResult {
+        candidates: candidates
+            .iter()
+            .map(|candidate| SessionDiscoveryCandidate {
+                peer_id: candidate.peer_id.clone(),
+                display_name: candidate.display_name.clone(),
+                fingerprint: candidate.fingerprint.clone(),
+                trusted: candidate.trusted,
+                address: candidate.address.to_string(),
+                build_version: candidate.build_version.clone(),
+                capabilities: candidate.capabilities,
+            })
+            .collect(),
+    }
+}
+
 /// Handle one local IPC JSON-RPC request line.
 pub fn handle_ipc_request_line(
     state: &mut RuntimeInputState,
@@ -3418,6 +3439,18 @@ fn handle_ipc_request(
                     encode_platform_error(request.id, "session connect unavailable", error)
                 }
             }
+        }
+        IpcRequest::SessionDiscoveryCandidates(request) => {
+            record_daemon_event(
+                logs,
+                DaemonLogLevel::Info,
+                "session.discoveryCandidates",
+                "Peer session discovery candidates requested.",
+            );
+            encode_response(&JsonRpcSuccess::new(
+                request.id,
+                build_session_discovery_candidates_result(&[]),
+            ))
         }
         IpcRequest::SessionDisconnect(request) => {
             match disconnect_peer_session(state, dispatcher, peer_sessions) {
@@ -3721,8 +3754,10 @@ mod tests {
         METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS,
         METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
         METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
-        OsLocalIpcClient, PeerStatus, PermissionsProbe, PermissionsProbeParams,
-        SessionConnectParams, SessionDisconnectResult, SessionStatus, call_json_rpc, to_json_line,
+        METHOD_SESSION_DISCOVERY_CANDIDATES, OsLocalIpcClient, PeerStatus, PermissionsProbe,
+        PermissionsProbeParams, SessionConnectParams, SessionDisconnectResult,
+        SessionDiscoveryCandidatesParams, SessionDiscoveryCandidatesResult, SessionStatus,
+        call_json_rpc, to_json_line,
     };
     use akraz_platform::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
@@ -3748,8 +3783,8 @@ mod tests {
         TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
         build_daemon_status_with_peer_sessions, build_diagnostics_keyboard_layout,
         build_diagnostics_screen_topology, build_peer_session_discovery_candidates,
-        build_permissions_probe, connect_peer_session, disconnect_peer_session,
-        dispatch_input_capture_idle_watchdog_action, drain_capture_events,
+        build_permissions_probe, build_session_discovery_candidates_result, connect_peer_session,
+        disconnect_peer_session, dispatch_input_capture_idle_watchdog_action, drain_capture_events,
         execute_authenticated_peer_transport_session_stream_until_closed,
         execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
         execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
@@ -4097,7 +4132,7 @@ mod tests {
                 version: 1,
                 device_id: device_id.to_string(),
                 capabilities,
-                build_version: "0.5.5".to_string(),
+                build_version: "0.5.6".to_string(),
             },
         }
     }
@@ -4218,9 +4253,70 @@ mod tests {
                 fingerprint: Some("AKRZ-TRUSTED".to_string()),
                 trusted: true,
                 address: "127.0.0.1:4455".parse().expect("candidate address"),
-                build_version: "0.5.5".to_string(),
+                build_version: "0.5.6".to_string(),
                 capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
             }]
+        );
+    }
+
+    #[test]
+    fn session_discovery_candidates_result_uses_ipc_wire_shape() {
+        let candidate = DiscoverySessionCandidate {
+            peer_id: "linux-laptop".to_string(),
+            display_name: "Linux Laptop".to_string(),
+            fingerprint: Some("AKRZ-TRUSTED".to_string()),
+            trusted: true,
+            address: "127.0.0.1:4455".parse().expect("candidate address"),
+            build_version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        };
+
+        let result = build_session_discovery_candidates_result(&[candidate]);
+
+        assert_eq!(
+            serde_json::to_value(result).expect("session discovery JSON"),
+            json!({
+                "candidates": [{
+                    "peerId": "linux-laptop",
+                    "displayName": "Linux Laptop",
+                    "fingerprint": "AKRZ-TRUSTED",
+                    "trusted": true,
+                    "address": "127.0.0.1:4455",
+                    "buildVersion": env!("CARGO_PKG_VERSION"),
+                    "capabilities": 3
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_ipc_session_discovery_candidates_returns_empty_without_resolver() {
+        let mut state = RuntimeInputState::new();
+        let platform = FakePlatformAdapter::default();
+        let dispatcher = NoopCoreActionDispatcher;
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_SESSION_DISCOVERY_CANDIDATES,
+            SessionDiscoveryCandidatesParams::default(),
+        );
+        let request_line = to_json_line(&request).expect("session discovery request line");
+
+        let response_line =
+            match handle_ipc_request_line(&mut state, &platform, &dispatcher, &request_line) {
+                Ok(line) => line,
+                Err(error) => panic!("expected session discovery response: {error}"),
+            };
+        let response: JsonRpcSuccess<SessionDiscoveryCandidatesResult> =
+            match serde_json::from_str(&response_line) {
+                Ok(response) => response,
+                Err(error) => panic!("expected session discovery success JSON: {error}"),
+            };
+
+        assert_eq!(
+            response.result,
+            SessionDiscoveryCandidatesResult {
+                candidates: Vec::new()
+            }
         );
     }
 

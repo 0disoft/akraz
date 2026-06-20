@@ -18,11 +18,13 @@ use akraz_ipc::{
     JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcClient, METHOD_DAEMON_LOGS_TAIL,
     METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
     METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
-    METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, OsLocalIpcClient, PermissionsProbe,
-    PermissionsProbeParams, SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
-    build_diagnostics_latency_histogram, build_diagnostics_runtime_environment,
-    build_diagnostics_snapshot, build_diagnostics_support_bundle_with_previous_crash,
-    call_json_rpc, resolve_current_default_endpoint,
+    METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES,
+    OsLocalIpcClient, PermissionsProbe, PermissionsProbeParams, SessionConnectResult,
+    SessionDisconnectParams, SessionDisconnectResult, SessionDiscoveryCandidatesParams,
+    SessionDiscoveryCandidatesResult, build_diagnostics_latency_histogram,
+    build_diagnostics_runtime_environment, build_diagnostics_snapshot,
+    build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
+    resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 use serde::{Deserialize, Serialize};
@@ -91,6 +93,7 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
             daemon_start,
             daemon_stop,
             session_connect,
+            session_discovery_candidates,
             session_disconnect,
             input_release_all,
             identity_show,
@@ -406,6 +409,13 @@ async fn session_connect(params: SessionConnectOptions) -> Result<DaemonLifecycl
     tauri::async_runtime::spawn_blocking(move || connect_daemon_session(params))
         .await
         .map_err(|error| format!("session connect task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn session_discovery_candidates() -> Result<SessionDiscoveryCandidatesResult, String> {
+    tauri::async_runtime::spawn_blocking(call_daemon_session_discovery_candidates)
+        .await
+        .map_err(|error| format!("session discovery candidates task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1338,6 +1348,19 @@ fn call_daemon_session_connect(params: SessionConnectOptions) -> Result<(), Stri
     parse_json_rpc_response::<SessionConnectResult>(&response_line, "session connect").map(|_| ())
 }
 
+fn call_daemon_session_discovery_candidates() -> Result<SessionDiscoveryCandidatesResult, String> {
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    call_daemon_json_rpc::<SessionDiscoveryCandidatesResult, _>(
+        &client,
+        &JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_SESSION_DISCOVERY_CANDIDATES,
+            SessionDiscoveryCandidatesParams::default(),
+        ),
+        "session discovery candidates",
+    )
+}
+
 fn disconnect_daemon_session() -> Result<DaemonLifecycleSnapshot, String> {
     call_daemon_session_disconnect()?;
     call_daemon_status_result()
@@ -2138,18 +2161,19 @@ mod tests {
         DiagnosticsScreenTopology, InputReleaseAllResult, IpcEndpoint, IpcPlatformCapabilities,
         IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LogicalPointSnapshot,
         LogicalRectSnapshot, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
-        SessionConnectResult, SessionStatus, to_json_line,
+        SessionConnectResult, SessionDiscoveryCandidate, SessionDiscoveryCandidatesResult,
+        SessionStatus, to_json_line,
     };
 
     use super::{
-        AppDiagnosticsSupportBundle, AppSettings, DAEMON_CAPTURE_INPUT_ARG, DAEMON_CRASH_DIR_NAME,
-        DAEMON_CRASH_MARKER_ARG, DAEMON_CRASH_MARKER_FILE_NAME, DAEMON_EDGE_BINDING_ARG,
-        DAEMON_IDENTITY_DISPLAY_NAME, DAEMON_IDENTITY_DISPLAY_NAME_ARG, DAEMON_IDENTITY_STORE_ARG,
-        DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_PEER_LISTEN_ARG, DAEMON_SERVE_ARG,
-        DAEMON_SETTINGS_START_SMOKE_FLAG, DAEMON_SIDECAR_NAME, DaemonEdgeBindingOption,
-        DaemonLifecyclePhase, DaemonLifecycleSmokeReport, DaemonLifecycleSnapshot,
-        DaemonScreenEdgeOption, DaemonStartOptions, DaemonStopMethod, DaemonStopOutcome,
-        IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME, LayoutSettings,
+        AppDiagnosticsSupportBundle, AppSettings, CapabilityFlags, DAEMON_CAPTURE_INPUT_ARG,
+        DAEMON_CRASH_DIR_NAME, DAEMON_CRASH_MARKER_ARG, DAEMON_CRASH_MARKER_FILE_NAME,
+        DAEMON_EDGE_BINDING_ARG, DAEMON_IDENTITY_DISPLAY_NAME, DAEMON_IDENTITY_DISPLAY_NAME_ARG,
+        DAEMON_IDENTITY_STORE_ARG, DAEMON_LIFECYCLE_SMOKE_FLAG, DAEMON_PEER_LISTEN_ARG,
+        DAEMON_SERVE_ARG, DAEMON_SETTINGS_START_SMOKE_FLAG, DAEMON_SIDECAR_NAME,
+        DaemonEdgeBindingOption, DaemonLifecyclePhase, DaemonLifecycleSmokeReport,
+        DaemonLifecycleSnapshot, DaemonScreenEdgeOption, DaemonStartOptions, DaemonStopMethod,
+        DaemonStopOutcome, IDENTITY_STORE_DIR_NAME, IDENTITY_STORE_FILE_NAME, LayoutSettings,
         ManualPeerAddressSetting, PREVIOUS_DAEMON_CRASH_START_BLOCKED_DETAIL,
         acknowledge_previous_daemon_crash_from_path, build_identity_show_result_from_path,
         classify_daemon_call_error, daemon_capture_input_enabled_from,
@@ -3030,6 +3054,33 @@ mod tests {
 
         assert_eq!(
             parse_json_rpc_response::<SessionConnectResult>(&line, "session connect"),
+            Ok(result)
+        );
+    }
+
+    #[test]
+    fn parses_session_discovery_candidates_success_response() {
+        let result = SessionDiscoveryCandidatesResult {
+            candidates: vec![SessionDiscoveryCandidate {
+                peer_id: "linux-laptop".to_string(),
+                display_name: "Linux Laptop".to_string(),
+                fingerprint: Some("AKRZ-TRUSTED".to_string()),
+                trusted: true,
+                address: "127.0.0.1:4455".to_string(),
+                build_version: env!("CARGO_PKG_VERSION").to_string(),
+                capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            }],
+        };
+        let line = match to_json_line(&JsonRpcSuccess::new("tauri", result.clone())) {
+            Ok(line) => line,
+            Err(error) => panic!("expected session discovery JSON: {error}"),
+        };
+
+        assert_eq!(
+            parse_json_rpc_response::<SessionDiscoveryCandidatesResult>(
+                &line,
+                "session discovery candidates"
+            ),
             Ok(result)
         );
     }
