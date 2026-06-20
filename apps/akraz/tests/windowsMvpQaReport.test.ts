@@ -16,6 +16,14 @@ import {
   updateWindowsMvpQaReportResult,
   writeWindowsMvpQaReportOutputFile,
 } from "../scripts/windows-mvp-qa-report.mjs";
+import {
+  WINDOWS_MVP_QA_WORKFLOW_PAYLOAD_SCHEMA_VERSION,
+  buildWindowsMvpQaWorkflowPayload,
+  buildWindowsMvpQaWorkflowPayloadReport,
+  exitCodeForWindowsMvpQaWorkflowPayload,
+  parseWindowsMvpQaWorkflowPayloadArgs,
+  writeWindowsMvpQaWorkflowPayloadOutputFile,
+} from "../scripts/windows-mvp-qa-workflow-payload.mjs";
 
 function passingReport() {
   return {
@@ -523,6 +531,84 @@ describe("Windows MVP QA report evaluation", () => {
       const evaluation = evaluateWindowsMvpQaReport(passingReport());
       expect(writeWindowsMvpQaReportOutputFile(evaluationFile, evaluation)).toBe(evaluationFile);
       expect(JSON.parse(readFileSync(evaluationFile, "utf8"))).toEqual(evaluation);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+});
+
+describe("Windows MVP QA workflow payload", () => {
+  test("encodes only a complete QA report for workflow dispatch input", () => {
+    const report = passingReport();
+    const payload = buildWindowsMvpQaWorkflowPayload(report);
+    const payloadReport = buildWindowsMvpQaWorkflowPayloadReport(report, { payloadWritten: true });
+
+    expect(JSON.parse(Buffer.from(payload, "base64").toString("utf8"))).toEqual(report);
+    expect(payloadReport).toMatchObject({
+      schemaVersion: WINDOWS_MVP_QA_WORKFLOW_PAYLOAD_SCHEMA_VERSION,
+      ready: true,
+      inputName: "qa_report_base64",
+      payloadEncoding: "base64",
+      payloadWritten: true,
+      payloadLength: payload.length,
+      nextActions: [],
+      privacy: {
+        includesReportPayload: false,
+        includesSecretValues: false,
+        includesFullFilePaths: false,
+      },
+    });
+    expect(JSON.stringify(payloadReport)).not.toContain(payload);
+    expect(payloadReport.evaluation.ready).toBe(true);
+    expect(exitCodeForWindowsMvpQaWorkflowPayload(payloadReport)).toBe(0);
+  });
+
+  test("rejects incomplete QA reports without creating a payload", () => {
+    const payloadReport = buildWindowsMvpQaWorkflowPayloadReport(buildWindowsMvpQaReportTemplate());
+
+    expect(payloadReport.ready).toBe(false);
+    expect(payloadReport.payloadWritten).toBe(false);
+    expect(payloadReport.payloadLength).toBe(0);
+    expect(payloadReport.nextActions.length).toBeGreaterThan(0);
+    expect(payloadReport.evaluation.ready).toBe(false);
+    expect(exitCodeForWindowsMvpQaWorkflowPayload(payloadReport)).toBe(1);
+  });
+
+  test("parses workflow payload arguments", () => {
+    expect(
+      parseWindowsMvpQaWorkflowPayloadArgs([
+        "--report-file",
+        "qa-report.json",
+        "--out-file",
+        "qa-report.base64.txt",
+        "--evaluation-out-file",
+        "qa-evaluation.json",
+      ]),
+    ).toEqual({
+      reportFile: "qa-report.json",
+      outFile: "qa-report.base64.txt",
+      evaluationOutFile: "qa-evaluation.json",
+    });
+    expect(() => parseWindowsMvpQaWorkflowPayloadArgs(["--out-file", "payload.txt"])).toThrow(
+      "--report-file is required",
+    );
+    expect(() => parseWindowsMvpQaWorkflowPayloadArgs(["--report-file", "qa-report.json"])).toThrow(
+      "--out-file is required",
+    );
+    expect(() => parseWindowsMvpQaWorkflowPayloadArgs(["--unknown"])).toThrow(
+      "unknown Windows MVP QA workflow payload argument: --unknown",
+    );
+  });
+
+  test("writes workflow payload text atomically", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-qa-workflow-payload-"));
+    const payloadFile = join(tempDirectory, "nested", "qa-report.base64.txt");
+    const report = passingReport();
+    const payload = buildWindowsMvpQaWorkflowPayload(report);
+
+    try {
+      expect(writeWindowsMvpQaWorkflowPayloadOutputFile(payloadFile, payload)).toBe(payloadFile);
+      expect(readFileSync(payloadFile, "utf8")).toBe(`${payload}\n`);
     } finally {
       rmSync(tempDirectory, { force: true, recursive: true });
     }
