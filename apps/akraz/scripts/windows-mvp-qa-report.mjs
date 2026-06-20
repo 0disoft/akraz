@@ -113,6 +113,8 @@ export function updateWindowsMvpQaReportResult(report, options, plan = buildWind
   }
 
   const planCase = plan.cases.find((testCase) => testCase.id === caseId);
+  validateStructuredEvidenceIds(options.evidence, planCase, caseId);
+
   if (options.result === "pass") {
     const missingEvidence = findMissingPlannedEvidence({ evidence: options.evidence }, planCase);
     if (missingEvidence.length > 0) {
@@ -208,6 +210,7 @@ export function parseWindowsMvpQaReportArgs(args) {
     hardware: undefined,
     environmentNotes: undefined,
   };
+  let firstEvidenceFlag;
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -234,8 +237,22 @@ export function parseWindowsMvpQaReportArgs(args) {
         options.reason = readValue(args, ++index, arg);
         break;
       case "--evidence":
+        firstEvidenceFlag ??= arg;
         options.evidence.push(readValue(args, ++index, arg));
         break;
+      case "--evidence-id": {
+        firstEvidenceFlag ??= arg;
+        const id = readValue(args, ++index, arg);
+        if (args[index + 1] !== "--evidence-note") {
+          throw new Error("--evidence-id requires a following --evidence-note");
+        }
+        const note = readValue(args, index + 2, "--evidence-note");
+        options.evidence.push({ id, note });
+        index += 2;
+        break;
+      }
+      case "--evidence-note":
+        throw new Error("--evidence-note must follow --evidence-id");
       case "--executed-at":
         options.executedAt = readValue(args, ++index, arg);
         break;
@@ -280,7 +297,7 @@ export function parseWindowsMvpQaReportArgs(args) {
   const updateOnlyArgs = [
     ["--result", options.result],
     ["--reason", options.reason],
-    ["--evidence", options.evidence.length > 0 ? options.evidence : undefined],
+    [firstEvidenceFlag ?? "--evidence", options.evidence.length > 0 ? options.evidence : undefined],
     ["--executed-at", options.executedAt],
     ["--source-os", options.sourceOs],
     ["--target-os", options.targetOs],
@@ -671,7 +688,13 @@ function hasEvidenceEntry(entry) {
     return hasText(entry);
   }
 
-  return entry && typeof entry === "object" && !Array.isArray(entry) && hasText(entry.id);
+  return (
+    entry &&
+    typeof entry === "object" &&
+    !Array.isArray(entry) &&
+    hasText(entry.id) &&
+    hasStructuredEvidenceDetail(entry)
+  );
 }
 
 function findMissingPlannedEvidence(result, testCase) {
@@ -697,7 +720,7 @@ function evidenceEntryMatchesRequirement(entry, requiredEvidence) {
   }
 
   if (entry && typeof entry === "object" && !Array.isArray(entry)) {
-    return entry.id === requiredEvidence.id;
+    return entry.id === requiredEvidence.id && hasStructuredEvidenceDetail(entry);
   }
 
   if (typeof entry !== "string") {
@@ -718,6 +741,28 @@ function normalizeEvidenceText(value) {
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function validateStructuredEvidenceIds(evidence, testCase, caseId) {
+  const plannedEvidenceIds = new Set(
+    Array.isArray(testCase?.evidenceRequirements)
+      ? testCase.evidenceRequirements.map((requiredEvidence) => requiredEvidence.id)
+      : [],
+  );
+  const unknownEvidenceIds = (Array.isArray(evidence) ? evidence : [])
+    .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+    .map((entry) => entry.id)
+    .filter((id) => hasText(id) && !plannedEvidenceIds.has(id));
+
+  if (unknownEvidenceIds.length > 0) {
+    throw new Error(
+      `unknown planned evidence id for ${caseId}: ${[...new Set(unknownEvidenceIds)].join(", ")}`,
+    );
+  }
+}
+
+function hasStructuredEvidenceDetail(entry) {
+  return Object.entries(entry).some(([key, value]) => key !== "id" && hasText(value));
 }
 
 function containsUnsafeEvidence(result) {

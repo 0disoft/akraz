@@ -192,6 +192,22 @@ describe("Windows MVP QA report evaluation", () => {
     expect(evaluation.ready).toBe(true);
   });
 
+  test("rejects object evidence entries without artifact detail", () => {
+    const report = passingReport();
+    replaceResult(report, "WIN-006", {
+      caseId: "WIN-006",
+      result: "pass",
+      evidence: [{ id: "WIN-006-E1" }, { id: "WIN-006-E2", note: "soak report artifact id" }],
+    });
+    const evaluation = evaluateWindowsMvpQaReport(report);
+
+    expect(evaluation.checks.find((check) => check.id === "result:WIN-006")).toMatchObject({
+      status: "invalid",
+      detail: "passRequiresPlannedEvidence",
+      missingEvidence: ["WIN-006-E1"],
+    });
+  });
+
   test("requires reason for blocked or failed cases and keeps the report not ready", () => {
     const blockedReport = passingReport();
     replaceResult(blockedReport, "WIN-007", {
@@ -448,8 +464,8 @@ describe("Windows MVP QA report evaluation", () => {
       caseId: "WIN-006",
       result: "pass",
       evidence: [
-        "WIN-006-E1: diagnostics support bundle artifact id",
-        "WIN-006-E2: soak report artifact id",
+        { id: "WIN-006-E1", note: "diagnostics support bundle artifact id" },
+        { id: "WIN-006-E2", note: "soak report artifact id" },
       ],
       executedAt: "2026-06-20T01:02:03.004Z",
       sourceOs: "Windows 11",
@@ -470,8 +486,8 @@ describe("Windows MVP QA report evaluation", () => {
       caseId: "WIN-006",
       result: "pass",
       evidence: [
-        "WIN-006-E1: diagnostics support bundle artifact id",
-        "WIN-006-E2: soak report artifact id",
+        { id: "WIN-006-E1", note: "diagnostics support bundle artifact id" },
+        { id: "WIN-006-E2", note: "soak report artifact id" },
       ],
     });
     expect(updatedEvaluation.checks.find((check) => check.id === "result:WIN-006")).toMatchObject({
@@ -519,6 +535,16 @@ describe("Windows MVP QA report evaluation", () => {
       updateWindowsMvpQaReportResult(template, {
         caseId: "WIN-006",
         result: "pass",
+        evidence: [
+          { id: "WIN-006-E1", note: "diagnostics support bundle artifact id" },
+          { id: "NOPE-E2", note: "soak report artifact id" },
+        ],
+      }),
+    ).toThrow("unknown planned evidence id for WIN-006: NOPE-E2");
+    expect(() =>
+      updateWindowsMvpQaReportResult(template, {
+        caseId: "WIN-006",
+        result: "pass",
         evidence: ["C:\\Users\\cherr\\Desktop\\qa.json"],
       }),
     ).toThrow("updated QA report values contain sensitive or local path data");
@@ -534,8 +560,14 @@ describe("Windows MVP QA report evaluation", () => {
         "WIN-006",
         "--result",
         "pass",
-        "--evidence",
+        "--evidence-id",
+        "WIN-006-E1",
+        "--evidence-note",
         "support bundle artifact id",
+        "--evidence-id",
+        "WIN-006-E2",
+        "--evidence-note",
+        "soak report artifact id",
         "--executed-at",
         "2026-06-20T01:02:03.004Z",
         "--source-os",
@@ -555,7 +587,10 @@ describe("Windows MVP QA report evaluation", () => {
       caseIds: ["WIN-006"],
       result: "pass",
       reason: undefined,
-      evidence: ["support bundle artifact id"],
+      evidence: [
+        { id: "WIN-006-E1", note: "support bundle artifact id" },
+        { id: "WIN-006-E2", note: "soak report artifact id" },
+      ],
       executedAt: "2026-06-20T01:02:03.004Z",
       sourceOs: "Windows 11",
       targetOs: "Windows 11",
@@ -574,6 +609,32 @@ describe("Windows MVP QA report evaluation", () => {
         "WIN-006",
       ]),
     ).toThrow("--update-result requires --result");
+    expect(() =>
+      parseWindowsMvpQaReportArgs([
+        "--update-result",
+        "--report-file",
+        "qa-report.json",
+        "--case-id",
+        "WIN-006",
+        "--result",
+        "pass",
+        "--evidence-id",
+        "WIN-006-E1",
+      ]),
+    ).toThrow("--evidence-id requires a following --evidence-note");
+    expect(() =>
+      parseWindowsMvpQaReportArgs([
+        "--update-result",
+        "--report-file",
+        "qa-report.json",
+        "--case-id",
+        "WIN-006",
+        "--result",
+        "pass",
+        "--evidence-note",
+        "support bundle artifact id",
+      ]),
+    ).toThrow("--evidence-note must follow --evidence-id");
   });
 
   test("parses and writes template or evaluation JSON to an output file", () => {
