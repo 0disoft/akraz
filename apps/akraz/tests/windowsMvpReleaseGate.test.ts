@@ -1136,6 +1136,75 @@ describe("Windows MVP release gate", () => {
     }
   });
 
+  test("verifies resolved release evidence through the app package script", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-resolved-evidence-cli-"));
+    const evidenceSourcesFile = join(tempDir, "windows-mvp-release-evidence-sources.json");
+    const qaReportFile = join(tempDir, WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport);
+    const soakReportFile = join(tempDir, WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport);
+
+    try {
+      writeJson(
+        evidenceSourcesFile,
+        buildWindowsMvpReleaseEvidenceSourcesReport({
+          sourceRunId: "27856073522",
+          manifestWritten: true,
+          dispatchInputsWritten: true,
+        }),
+      );
+      writeJson(qaReportFile, passingQaReport());
+      writeJson(soakReportFile, passingSoakReport());
+
+      const result = runAppPackageScript("release:windows-mvp-resolved-evidence", [
+        "--evidence-sources-file",
+        evidenceSourcesFile,
+        "--qa-report-file",
+        qaReportFile,
+        "--soak-report-file",
+        soakReportFile,
+      ]);
+
+      expect(result.status).toBe(0);
+
+      const report = JSON.parse(result.stdout);
+      const formatted = JSON.stringify(report);
+
+      expect(report).toMatchObject({
+        schemaVersion: WINDOWS_MVP_RELEASE_RESOLVED_EVIDENCE_SCHEMA_VERSION,
+        ready: true,
+        evidenceSourcesFileProvided: true,
+        resolvedFiles: [
+          {
+            id: "qaReport",
+            sourceId: "qaReport",
+            fileProvided: true,
+            fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+            expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.qaReport,
+            status: "pass",
+          },
+          {
+            id: "soakReport",
+            sourceId: "soakReport",
+            fileProvided: true,
+            fileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+            expectedFileName: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCE_FILES.soakReport,
+            status: "pass",
+          },
+        ],
+        privacy: {
+          includesSecretValues: false,
+          includesFullFilePaths: false,
+          includesArtifactPayloads: false,
+        },
+      });
+      expect(report.checks.every((check) => check.status === "pass")).toBe(true);
+      expect(report.nextActions).toEqual([]);
+      expect(formatted).not.toContain(tempDir);
+      expect(result.stdout.endsWith("\n")).toBe(true);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
   test("rejects resolved release evidence filename drift before bundling", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-resolved-evidence-drift-"));
     const evidenceSourcesFile = join(tempDir, "windows-mvp-release-evidence-sources.json");
