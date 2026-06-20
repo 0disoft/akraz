@@ -4,6 +4,7 @@ import type {
   DaemonStartOptions,
   DaemonStatus,
   SessionConnectParams,
+  SessionDiscoveryCandidate,
 } from "../api/types";
 
 type DaemonOperation =
@@ -17,6 +18,9 @@ type DaemonOperation =
 
 export class DaemonState {
   snapshot = $state<DaemonLifecycleSnapshot | null>(null);
+  sessionDiscoveryCandidates = $state<SessionDiscoveryCandidate[]>([]);
+  sessionDiscoveryOperation = $state<"refresh" | null>(null);
+  sessionDiscoveryError = $state<string | null>(null);
   operation = $state<DaemonOperation | null>(null);
   lastError = $state<string | null>(null);
 
@@ -26,6 +30,10 @@ export class DaemonState {
 
   get isBusy(): boolean {
     return this.operation !== null;
+  }
+
+  get isSessionDiscoveryBusy(): boolean {
+    return this.sessionDiscoveryOperation !== null;
   }
 
   async refresh() {
@@ -48,6 +56,19 @@ export class DaemonState {
     await this.run("connectSession", () => daemonClient.connectSession(params));
   }
 
+  async refreshSessionDiscoveryCandidates() {
+    this.sessionDiscoveryOperation = "refresh";
+    this.sessionDiscoveryError = null;
+    try {
+      const result = await daemonClient.sessionDiscoveryCandidates();
+      this.sessionDiscoveryCandidates = result.candidates;
+    } catch (error) {
+      this.sessionDiscoveryError = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.sessionDiscoveryOperation = null;
+    }
+  }
+
   async disconnectSession() {
     await this.run("disconnectSession", () => daemonClient.disconnectSession());
   }
@@ -61,6 +82,10 @@ export class DaemonState {
     this.lastError = null;
     try {
       this.snapshot = await action();
+      if (this.snapshot.status === null) {
+        this.sessionDiscoveryCandidates = [];
+        this.sessionDiscoveryError = null;
+      }
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
     } finally {

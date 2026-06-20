@@ -31,8 +31,8 @@
     isUsableScreenTopology,
   } from './lib/layout/layoutMismatch';
   import {
-    buildManualConnectionCandidates,
-    type ManualConnectionCandidate,
+    buildConnectionCandidates,
+    type ConnectionCandidate,
   } from './lib/session/manualConnectionCandidates';
   import { selectTrustedPeerSessionDraft } from './lib/session/sessionDraft';
   import type {
@@ -423,27 +423,33 @@
     sessionAddress = draft.address;
   }
 
-  function manualConnectionCandidates() {
-    return buildManualConnectionCandidates({
+  function connectionCandidates() {
+    return buildConnectionCandidates({
       trustedPeers: identityState.trustedPeers,
       manualPeerAddresses: settingsState.settings.manualPeerAddresses,
+      discoveryCandidates: daemonState.sessionDiscoveryCandidates,
       peerStatuses: daemonState.status?.peers ?? [],
       localDeviceId: identityState.local?.deviceId ?? null,
       draftLocalDeviceId: sessionLocalDeviceId,
     });
   }
 
-  function selectManualConnectionCandidate(candidate: ManualConnectionCandidate) {
+  function selectConnectionCandidate(candidate: ConnectionCandidate) {
     if (!candidate.ready) {
       return;
     }
 
-    selectSessionTrustedPeer(candidate.peerId);
+    sessionPeerId = candidate.peerId;
+    sessionLocalDeviceId = candidate.localDeviceId;
+    sessionAddress = candidate.address;
   }
 
-  function manualConnectionCandidateStatus(candidate: ManualConnectionCandidate) {
+  function connectionCandidateStatus(candidate: ConnectionCandidate) {
     if (candidate.connected) {
       return '연결됨';
+    }
+    if (!candidate.trusted) {
+      return '등록 필요';
     }
     if (candidate.ready) {
       return '준비됨';
@@ -456,6 +462,10 @@
     }
 
     return '확인 필요';
+  }
+
+  function connectionCandidateSourceLabel(candidate: ConnectionCandidate) {
+    return candidate.source === 'discovery' ? '주변' : '저장됨';
   }
 
   function updateSessionAddress(address: string) {
@@ -526,8 +536,14 @@
     if (daemonState.operation === 'releaseAllInputs') {
       return '입력 해제 중';
     }
+    if (daemonState.sessionDiscoveryOperation === 'refresh') {
+      return '주변 찾는 중';
+    }
     if (daemonState.lastError) {
       return daemonState.lastError;
+    }
+    if (daemonState.sessionDiscoveryError) {
+      return daemonState.sessionDiscoveryError;
     }
     if (!daemonState.status) {
       return '데몬 대기';
@@ -568,17 +584,20 @@
     }
   }
 
-  function startDaemon() {
+  async function startDaemon() {
     const layoutStartIssue = layoutDaemonStartBlockingIssueForView();
     if (layoutStartIssue) {
       layoutTestMessage = layoutStartIssue.message;
-      return Promise.resolve();
+      return;
     }
 
-    return daemonState.start({
+    await daemonState.start({
       ...settingsState.startOptions,
       edgeBindings: layoutState.layout.edgeBindings,
     });
+    if (daemonState.status) {
+      await daemonState.refreshSessionDiscoveryCandidates();
+    }
   }
 
   function testSelectedLayoutBinding() {
@@ -1295,7 +1314,7 @@
     <section class="section-block session-block" aria-labelledby="session-title">
       <div class="section-heading-row">
         <h2 id="session-title">기기 연결</h2>
-        <span class:error-text={daemonState.lastError}>{sessionMessage()}</span>
+        <span class:error-text={daemonState.lastError || daemonState.sessionDiscoveryError}>{sessionMessage()}</span>
       </div>
 
       <div class="session-row">
@@ -1345,26 +1364,30 @@
         </label>
       </div>
 
-      {#if manualConnectionCandidates().length > 0}
+      {#if connectionCandidates().length > 0}
         <div class="connection-candidate-panel">
           <h3>바로 연결</h3>
           <ul class="connection-candidate-list" aria-label="바로 연결">
-            {#each manualConnectionCandidates() as candidate (candidate.peerId)}
+            {#each connectionCandidates() as candidate (candidate.peerId)}
               <li>
                 <button
                   type="button"
                   class="connection-candidate-button"
                   disabled={daemonState.isBusy || hasConnectedPeer() || !candidate.ready}
-                  onclick={() => selectManualConnectionCandidate(candidate)}
+                  onclick={() => selectConnectionCandidate(candidate)}
                 >
                   <span class="connection-candidate-main">
                     <strong>{candidate.displayName}</strong>
                     <span class="connection-candidate-meta">
+                      <span>{connectionCandidateSourceLabel(candidate)}</span>
                       <code>{candidate.peerId}</code>
                       {#if candidate.address.length > 0}
                         <code>{candidate.address}</code>
                       {:else}
                         <span>주소 없음</span>
+                      {/if}
+                      {#if candidate.buildVersion}
+                        <span>{candidate.buildVersion}</span>
                       {/if}
                     </span>
                   </span>
@@ -1372,7 +1395,7 @@
                     class:ok={candidate.ready || candidate.connected}
                     class="connection-candidate-status"
                   >
-                    {manualConnectionCandidateStatus(candidate)}
+                    {connectionCandidateStatus(candidate)}
                   </strong>
                 </button>
               </li>
@@ -1382,6 +1405,14 @@
       {/if}
 
       <div class="settings-actions">
+        <button
+          type="button"
+          class="control-button secondary"
+          disabled={daemonState.status === null || daemonState.isBusy || daemonState.isSessionDiscoveryBusy}
+          onclick={() => daemonState.refreshSessionDiscoveryCandidates()}
+        >
+          {daemonState.sessionDiscoveryOperation === 'refresh' ? '찾는 중' : '주변 찾기'}
+        </button>
         <button type="button" class="control-button" disabled={!canConnectSession()} onclick={connectSession}>
           {daemonState.operation === 'connectSession' ? '연결 중' : '연결'}
         </button>
