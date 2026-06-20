@@ -12,6 +12,10 @@ export const WORKFLOW_CONTRACTS_SCHEMA_VERSION = "akraz.workflowContracts/v1";
 
 const WORKFLOW_DIRECTORY = ".github/workflows";
 const REQUIRED_CHECKOUT_VERSION = "v6";
+const RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH =
+  "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json";
+const RELEASE_WORKFLOW_INPUTS_MANIFEST_PATH =
+  "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-workflow-inputs.json";
 
 export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoot()) {
   const rootPackage = readJsonFile(join(workspaceRoot, "package.json"));
@@ -25,6 +29,7 @@ export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoo
     ...evaluateWorkflowScripts(workflowScripts, rootPackage.scripts ?? {}),
     evaluateReleaseWorkflowFile(workflows),
     evaluateReleaseArtifactContract(workflows),
+    evaluateReleaseEvidenceSourcesWiring(workflows),
   ];
 
   return {
@@ -219,6 +224,76 @@ function evaluateReleaseArtifactContract(workflows) {
   };
 }
 
+function evaluateReleaseEvidenceSourcesWiring(workflows) {
+  const releaseWorkflow = workflows.find(
+    (workflow) => workflow.name === WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+  );
+  if (!releaseWorkflow) {
+    return {
+      id: "releaseEvidenceSourcesWiring",
+      status: "missing",
+      detail: "releaseWorkflowFileMissing",
+      workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+    };
+  }
+
+  const requiredSnippets = [
+    {
+      id: "evidenceSourcesScript",
+      snippet: "release:windows-mvp-evidence-sources",
+    },
+    {
+      id: "evidenceSourcesOutFile",
+      snippet: "--out-file",
+    },
+    {
+      id: "evidenceSourcesManifestPath",
+      snippet: RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH,
+    },
+    {
+      id: "workflowInputsDispatchFile",
+      snippet: "--dispatch-inputs-file",
+    },
+    {
+      id: "workflowInputsManifestPath",
+      snippet: RELEASE_WORKFLOW_INPUTS_MANIFEST_PATH,
+    },
+    {
+      id: "releaseBundleScript",
+      snippet: "release:windows-mvp-bundle",
+    },
+    {
+      id: "releaseBundleEvidenceSourcesArgument",
+      snippet: "--evidence-sources-file",
+    },
+  ];
+  const missingSnippets = requiredSnippets
+    .filter((requirement) => !releaseWorkflow.source.includes(requirement.snippet))
+    .map((requirement) => requirement.id);
+
+  if (missingSnippets.length === 0) {
+    return {
+      id: "releaseEvidenceSourcesWiring",
+      status: "pass",
+      workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+      evidenceSourcesManifestPath: RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH,
+      workflowInputsManifestPath: RELEASE_WORKFLOW_INPUTS_MANIFEST_PATH,
+    };
+  }
+
+  return {
+    id: "releaseEvidenceSourcesWiring",
+    status: "invalid",
+    detail: "releaseEvidenceSourcesWiringDrifted",
+    workflowFile: WINDOWS_MVP_RELEASE_WORKFLOW_FILE,
+    missingSnippets,
+    expected: {
+      evidenceSourcesManifestPath: RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH,
+      workflowInputsManifestPath: RELEASE_WORKFLOW_INPUTS_MANIFEST_PATH,
+    },
+  };
+}
+
 function buildNextActions(checks) {
   return checks.flatMap((check) => {
     if (check.status === "pass") {
@@ -267,6 +342,15 @@ function buildNextActions(checks) {
             action:
               "sync release workflow artifact defaults with QA and soak upload artifact names",
             mismatches: check.mismatches,
+          },
+        ];
+      case "releaseEvidenceSourcesWiringDrifted":
+        return [
+          {
+            id: "syncReleaseEvidenceSourcesWiring",
+            action: "wire the release evidence source manifest generation into the bundle command",
+            workflowFile: check.workflowFile,
+            missingSnippets: check.missingSnippets,
           },
         ];
       default:

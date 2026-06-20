@@ -23,7 +23,17 @@ describe("GitHub Actions workflow contracts", () => {
       "windows-mvp-soak.yml",
     ]);
     expect(report.workflowScripts).toContain("release:windows-mvp-bundle");
+    expect(report.workflowScripts).toContain("release:windows-mvp-evidence-sources");
     expect(report.workflowScripts).toContain("smoke:windows-mvp-soak");
+    expect(
+      report.checks.find((check) => check.id === "releaseEvidenceSourcesWiring"),
+    ).toMatchObject({
+      status: "pass",
+      evidenceSourcesManifestPath:
+        "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json",
+      workflowInputsManifestPath:
+        "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-workflow-inputs.json",
+    });
     expect(report.checks.every((check) => check.status === "pass")).toBe(true);
     expect(report.privacy).toEqual({
       includesSecretValues: false,
@@ -108,6 +118,59 @@ describe("GitHub Actions workflow contracts", () => {
         id: "addPackageScript",
         action: "add the workflow-called package script or update the workflow command",
         scriptName: "missing:script",
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects release workflow drift when evidence sources are not bundled", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-workflow-contracts-"));
+
+    try {
+      writeFileSync(
+        join(tempDirectory, "package.json"),
+        readFileSync("package.json", "utf8"),
+        "utf8",
+      );
+      mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
+      for (const workflowFile of ["check.yml", "windows-mvp-qa.yml", "windows-mvp-soak.yml"]) {
+        writeFileSync(
+          join(tempDirectory, ".github", "workflows", workflowFile),
+          readFileSync(join(".github", "workflows", workflowFile), "utf8"),
+          "utf8",
+        );
+      }
+
+      const releaseWorkflowWithoutBundleEvidenceSources = readFileSync(
+        join(".github", "workflows", "windows-mvp-release.yml"),
+        "utf8",
+      ).replace(
+        '            --evidence-sources-file "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json" \\\n',
+        "",
+      );
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "windows-mvp-release.yml"),
+        releaseWorkflowWithoutBundleEvidenceSources,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(
+        report.checks.find((check) => check.id === "releaseEvidenceSourcesWiring"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "releaseEvidenceSourcesWiringDrifted",
+        missingSnippets: ["releaseBundleEvidenceSourcesArgument"],
+      });
+      expect(report.nextActions).toContainEqual({
+        id: "syncReleaseEvidenceSourcesWiring",
+        action: "wire the release evidence source manifest generation into the bundle command",
+        workflowFile: "windows-mvp-release.yml",
+        missingSnippets: ["releaseBundleEvidenceSourcesArgument"],
       });
       expect(exitCodeForWorkflowContracts(report)).toBe(1);
     } finally {
