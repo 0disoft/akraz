@@ -177,6 +177,65 @@ describe("GitHub Actions workflow contracts", () => {
       rmSync(tempDirectory, { force: true, recursive: true });
     }
   });
+
+  test("rejects release workflow drift when bundle artifact integrity is not smoked", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-bundle-smoke-contracts-"));
+
+    try {
+      writeFileSync(
+        join(tempDirectory, "package.json"),
+        readFileSync("package.json", "utf8"),
+        "utf8",
+      );
+      mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
+      for (const workflowFile of ["check.yml", "windows-mvp-qa.yml", "windows-mvp-soak.yml"]) {
+        writeFileSync(
+          join(tempDirectory, ".github", "workflows", workflowFile),
+          readFileSync(join(".github", "workflows", workflowFile), "utf8"),
+          "utf8",
+        );
+      }
+
+      const releaseWorkflowWithoutBundleIntegritySmoke = readFileSync(
+        join(".github", "workflows", "windows-mvp-release.yml"),
+        "utf8",
+      ).replace(
+        [
+          "      - name: Verify Windows MVP release bundle artifact integrity",
+          "        env:",
+          "          RELEASE_BUNDLE_DIR: ${{ github.workspace }}/release-bundle",
+          "        run: |",
+          "          set -euo pipefail",
+          "",
+          '          bun run smoke:windows-mvp-release-bundle -- --bundle-dir "$RELEASE_BUNDLE_DIR"',
+          "",
+        ].join("\n"),
+        "",
+      );
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "windows-mvp-release.yml"),
+        releaseWorkflowWithoutBundleIntegritySmoke,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(
+        report.checks.find((check) => check.id === "releaseEvidenceSourcesWiring"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "releaseEvidenceSourcesWiringDrifted",
+        missingSnippets: [
+          "releaseBundleIntegritySmokeScript",
+          "releaseBundleIntegrityBundleDirArgument",
+        ],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
 });
 
 function writeJson(path: string, payload: unknown) {

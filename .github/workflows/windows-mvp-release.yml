@@ -195,6 +195,14 @@ jobs:
             --updater-config-preflight-file "$RELEASE_EVIDENCE_DIR/updater/windows-mvp-updater-config-preflight.json" \
             --out-dir "$RELEASE_BUNDLE_DIR"
 
+      - name: Verify Windows MVP release bundle artifact integrity
+        env:
+          RELEASE_BUNDLE_DIR: ${{ github.workspace }}/release-bundle
+        run: |
+          set -euo pipefail
+
+          bun run smoke:windows-mvp-release-bundle -- --bundle-dir "$RELEASE_BUNDLE_DIR"
+
       - name: Upload Windows MVP release bundle
         if: always()
         uses: actions/upload-artifact@v4

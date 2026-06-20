@@ -266,6 +266,14 @@ function evaluateReleaseEvidenceSourcesWiring(workflows) {
       id: "releaseBundleEvidenceSourcesArgument",
       snippet: "--evidence-sources-file",
     },
+    {
+      id: "releaseBundleIntegritySmokeScript",
+      snippet: "smoke:windows-mvp-release-bundle",
+    },
+    {
+      id: "releaseBundleIntegrityBundleDirArgument",
+      snippet: "--bundle-dir",
+    },
   ];
   const missingSnippets = requiredSnippets
     .filter((requirement) => !releaseWorkflow.source.includes(requirement.snippet))

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -34,9 +34,13 @@ import {
   exitCodeForWindowsMvpReleaseGateSmoke,
 } from "../scripts/smoke-windows-mvp-release-gate.mjs";
 import {
+  WINDOWS_MVP_RELEASE_BUNDLE_ARTIFACT_INTEGRITY_SCHEMA_VERSION,
   WINDOWS_MVP_RELEASE_BUNDLE_SMOKE_SCHEMA_VERSION,
+  buildWindowsMvpReleaseBundleArtifactIntegrityReport,
   buildWindowsMvpReleaseBundleSmokeReport,
+  exitCodeForWindowsMvpReleaseBundleArtifactIntegrity,
   exitCodeForWindowsMvpReleaseBundleSmoke,
+  parseWindowsMvpReleaseBundleSmokeArgs,
 } from "../scripts/smoke-windows-mvp-release-bundle.mjs";
 import {
   WINDOWS_MVP_RELEASE_BUNDLE_FILES,
@@ -539,7 +543,97 @@ describe("Windows MVP release gate", () => {
       expect(
         existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.updaterConfigPreflight)),
       ).toBe(true);
+      const integrityReport = buildWindowsMvpReleaseBundleArtifactIntegrityReport(outDir);
+      expect(integrityReport).toMatchObject({
+        schemaVersion: WINDOWS_MVP_RELEASE_BUNDLE_ARTIFACT_INTEGRITY_SCHEMA_VERSION,
+        ready: true,
+        bundleDirectoryProvided: true,
+        expectedFiles: [
+          "windows-mvp-qa-report.json",
+          "windows-mvp-release-bundle.json",
+          "windows-mvp-release-evidence-sources.json",
+          "windows-mvp-release-gate.json",
+          "windows-mvp-signing-preflight.json",
+          "windows-mvp-soak-report.json",
+          "windows-mvp-updater-config-preflight.json",
+        ],
+        foundFiles: [
+          "windows-mvp-qa-report.json",
+          "windows-mvp-release-bundle.json",
+          "windows-mvp-release-evidence-sources.json",
+          "windows-mvp-release-gate.json",
+          "windows-mvp-signing-preflight.json",
+          "windows-mvp-soak-report.json",
+          "windows-mvp-updater-config-preflight.json",
+        ],
+      });
+      expect(integrityReport.checks.every((check) => check.status === "pass")).toBe(true);
+      expect(integrityReport.privacy).toEqual({
+        includesQaReportPayload: false,
+        includesSecretValues: false,
+        includesFullFilePaths: false,
+        includesEndpointValues: false,
+        includesSourceEvidencePaths: false,
+      });
       expect(exitCodeForWindowsMvpReleaseBundle(bundleReport)).toBe(0);
+      expect(exitCodeForWindowsMvpReleaseBundleArtifactIntegrity(integrityReport)).toBe(0);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects a release bundle directory with missing or stale canonical artifacts", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-bundle-integrity-"));
+    const outDir = join(tempDir, "bundle");
+
+    try {
+      mkdirSync(outDir, { recursive: true });
+      writeJson(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.manifest), {
+        schemaVersion: WINDOWS_MVP_RELEASE_BUNDLE_SCHEMA_VERSION,
+        ready: true,
+        releaseGateReady: true,
+        artifacts: [
+          {
+            id: "releaseGate",
+            included: true,
+          },
+        ],
+      });
+      writeJson(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.releaseGate), {
+        schemaVersion: WINDOWS_MVP_RELEASE_GATE_SCHEMA_VERSION,
+        ready: false,
+      });
+      writeJson(join(outDir, "unexpected.json"), {
+        schemaVersion: "unexpected/v1",
+      });
+
+      const report = buildWindowsMvpReleaseBundleArtifactIntegrityReport(outDir);
+      const formatted = JSON.stringify(report);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "canonicalBundleFiles")).toMatchObject({
+        status: "invalid",
+        detail: "canonicalBundleFileSetMismatch",
+        missingFiles: [
+          "windows-mvp-qa-report.json",
+          "windows-mvp-release-evidence-sources.json",
+          "windows-mvp-signing-preflight.json",
+          "windows-mvp-soak-report.json",
+          "windows-mvp-updater-config-preflight.json",
+        ],
+        extraFiles: ["unexpected.json"],
+      });
+      expect(report.checks.find((check) => check.id === "bundleArtifactSchemas")).toMatchObject({
+        status: "invalid",
+        detail: "bundleArtifactSchemaMismatch",
+      });
+      expect(report.checks.find((check) => check.id === "releaseGateArtifactReady")).toMatchObject({
+        status: "invalid",
+        detail: "releaseGateArtifactNotReady",
+        ready: false,
+      });
+      expect(formatted).not.toContain(tempDir);
+      expect(exitCodeForWindowsMvpReleaseBundleArtifactIntegrity(report)).toBe(1);
     } finally {
       rmSync(tempDir, { force: true, recursive: true });
     }
@@ -614,6 +708,15 @@ describe("Windows MVP release gate", () => {
     );
     expect(() => parseWindowsMvpReleaseBundleArgs(["--unknown"])).toThrow(
       "unknown Windows MVP release bundle argument: --unknown",
+    );
+    expect(parseWindowsMvpReleaseBundleSmokeArgs(["--bundle-dir", "release-bundle"])).toEqual({
+      bundleDir: "release-bundle",
+    });
+    expect(() => parseWindowsMvpReleaseBundleSmokeArgs(["--bundle-dir"])).toThrow(
+      "--bundle-dir requires a non-empty value",
+    );
+    expect(() => parseWindowsMvpReleaseBundleSmokeArgs(["--unknown"])).toThrow(
+      "unknown Windows MVP release bundle smoke argument: --unknown",
     );
   });
 
