@@ -845,4 +845,48 @@ describe("Windows MVP QA workflow payload", () => {
       rmSync(tempDirectory, { force: true, recursive: true });
     }
   });
+
+  test("writes workflow payload files through the app package script", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-qa-workflow-payload-cli-"));
+    const reportFile = join(tempDirectory, "qa-report.json");
+    const payloadFile = join(tempDirectory, "nested", "qa-report.base64.txt");
+    const dispatchInputsFile = join(tempDirectory, "nested", "qa-workflow-inputs.json");
+    const evaluationFile = join(tempDirectory, "nested", "qa-evaluation.json");
+    const report = passingReport();
+
+    try {
+      writeWindowsMvpQaReportOutputFile(reportFile, report);
+
+      const result = runAppPackageScript("qa:windows-mvp-workflow-payload", [
+        "--report-file",
+        reportFile,
+        "--out-file",
+        payloadFile,
+        "--dispatch-inputs-file",
+        dispatchInputsFile,
+        "--evaluation-out-file",
+        evaluationFile,
+      ]);
+
+      expect(result.status).toBe(0);
+
+      const payload = readFileSync(payloadFile, "utf8").trim();
+      const payloadReport = JSON.parse(result.stdout);
+
+      expect(JSON.parse(Buffer.from(payload, "base64").toString("utf8"))).toEqual(report);
+      expect(JSON.parse(readFileSync(dispatchInputsFile, "utf8"))).toEqual({
+        qa_report_base64: payload,
+      });
+      expect(JSON.parse(readFileSync(evaluationFile, "utf8"))).toEqual(payloadReport.evaluation);
+      expect(payloadReport).toMatchObject({
+        schemaVersion: WINDOWS_MVP_QA_WORKFLOW_PAYLOAD_SCHEMA_VERSION,
+        ready: true,
+        payloadWritten: true,
+        dispatchInputsWritten: true,
+      });
+      expect(JSON.stringify(payloadReport)).not.toContain(payload);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
 });
