@@ -19,6 +19,7 @@ import {
 import {
   DEFAULT_DURATION_MS,
   WINDOWS_MVP_SOAK_SCHEMA_VERSION,
+  WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS,
 } from "../scripts/windows-mvp-soak-report.mjs";
 import {
   WINDOWS_MVP_RELEASE_GATE_SCHEMA_VERSION,
@@ -117,6 +118,12 @@ function passingSoakReport(overrides = {}) {
       sessionDisconnects: 1,
       finalPeerLeaks: 0,
       stuckInputSuspicions: 0,
+    },
+    qaEvidence: {
+      supportedCaseIds: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS,
+      supportedCaseCount: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS.length,
+      status: "pass",
+      blockers: [],
     },
     failures: [],
     ...overrides,
@@ -239,6 +246,112 @@ describe("Windows MVP release gate", () => {
       expect(report.nextActions).toContainEqual({
         gate: "soakReport",
         action: "run the Windows MVP soak for the full release minimum duration",
+      });
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects incomplete or hand-edited soak QA evidence", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-gate-soak-qa-evidence-"));
+    const qaReportFile = join(tempDir, "qa-report.json");
+    const soakReportFile = join(tempDir, "soak-report.json");
+    const signingFile = join(tempDir, "signing.json");
+    const updaterFile = join(tempDir, "updater.json");
+    const baseOptions = {
+      qaReportFile: writeJson(qaReportFile, passingQaReport()),
+      signingPreflightFile: writeJson(signingFile, passingSigningPreflight()),
+      updaterConfigPreflightFile: writeJson(updaterFile, passingUpdaterConfigPreflight()),
+    };
+
+    try {
+      const missingQaEvidenceReport = buildWindowsMvpReleaseGateReport({
+        ...baseOptions,
+        soakReportFile: writeJson(
+          soakReportFile,
+          passingSoakReport({
+            qaEvidence: undefined,
+          }),
+        ),
+      });
+
+      expect(missingQaEvidenceReport.ready).toBe(false);
+      expect(
+        missingQaEvidenceReport.checks.find((check) => check.id === "soakReport"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "soakQaEvidenceMissing",
+        expectedQaEvidence: {
+          status: "pass",
+          supportedCaseIds: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS,
+        },
+      });
+      expect(missingQaEvidenceReport.nextActions).toContainEqual({
+        gate: "soakReport",
+        action: "regenerate the Windows MVP soak report with QA evidence fields",
+      });
+
+      const driftedQaEvidenceReport = buildWindowsMvpReleaseGateReport({
+        ...baseOptions,
+        soakReportFile: writeJson(
+          soakReportFile,
+          passingSoakReport({
+            qaEvidence: {
+              supportedCaseIds: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS,
+              supportedCaseCount: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS.length,
+              status: "pass",
+              blockers: ["remoteInputMissing"],
+            },
+          }),
+        ),
+      });
+
+      expect(driftedQaEvidenceReport.ready).toBe(false);
+      expect(
+        driftedQaEvidenceReport.checks.find((check) => check.id === "soakReport"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "soakQaEvidenceDrift",
+        qaEvidence: {
+          status: "pass",
+          blockers: ["remoteInputMissing"],
+        },
+        expectedQaEvidence: {
+          status: "pass",
+          blockers: [],
+        },
+      });
+
+      const insufficientQaEvidenceReport = buildWindowsMvpReleaseGateReport({
+        ...baseOptions,
+        soakReportFile: writeJson(
+          soakReportFile,
+          passingSoakReport({
+            metrics: {
+              ...passingSoakReport().metrics,
+              remoteSessionStarts: 0,
+              remoteSessionStops: 0,
+            },
+            qaEvidence: {
+              supportedCaseIds: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS,
+              supportedCaseCount: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS.length,
+              status: "insufficient",
+              blockers: ["remoteSessionStartMissing", "remoteSessionStopMissing"],
+            },
+          }),
+        ),
+      });
+
+      expect(insufficientQaEvidenceReport.ready).toBe(false);
+      expect(
+        insufficientQaEvidenceReport.checks.find((check) => check.id === "soakReport"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "soakQaEvidenceNotPassing",
+        qaEvidence: {
+          status: "insufficient",
+          blockers: ["remoteSessionStartMissing", "remoteSessionStopMissing"],
+        },
       });
     } finally {
       rmSync(tempDir, { force: true, recursive: true });

@@ -33,7 +33,9 @@ import {
 import {
   DEFAULT_DURATION_MS,
   WINDOWS_MVP_SOAK_SCHEMA_VERSION,
+  WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS,
   assertSoakSummaryHealthy,
+  buildSoakQaEvidence,
 } from "./windows-mvp-soak-report.mjs";
 
 export const WINDOWS_MVP_RELEASE_GATE_SCHEMA_VERSION = "akraz.windowsMvpReleaseGate/v1";
@@ -241,6 +243,26 @@ function evaluateSoakReportEvidence(fileRead, filePath) {
     };
   }
 
+  const qaEvidenceStatus = evaluateSoakQaEvidence(report);
+  if (qaEvidenceStatus.status !== "pass") {
+    return {
+      id: "soakReport",
+      source: "soakReportFile",
+      status: "invalid",
+      detail: qaEvidenceStatus.detail,
+      fileProvided: Boolean(filePath),
+      schemaVersion: report.schemaVersion,
+      expectedSchemaVersion: WINDOWS_MVP_SOAK_SCHEMA_VERSION,
+      requestedDurationMs: report.requestedDurationMs,
+      elapsedMs: report.elapsedMs,
+      completedRuns: report.completedRuns,
+      completedCycles: report.completedCycles,
+      metrics: sanitizeSoakMetrics(report.metrics),
+      qaEvidence: qaEvidenceStatus.qaEvidence,
+      expectedQaEvidence: qaEvidenceStatus.expectedQaEvidence,
+    };
+  }
+
   return {
     id: "soakReport",
     source: "soakReportFile",
@@ -253,6 +275,7 @@ function evaluateSoakReportEvidence(fileRead, filePath) {
     completedRuns: report.completedRuns,
     completedCycles: report.completedCycles,
     metrics: sanitizeSoakMetrics(report.metrics),
+    qaEvidence: qaEvidenceStatus.qaEvidence,
   };
 }
 
@@ -392,6 +415,66 @@ function evaluateSoakDuration(report) {
   };
 }
 
+function evaluateSoakQaEvidence(report) {
+  const expectedQaEvidence = buildSoakQaEvidence(
+    report.metrics ?? {},
+    Array.isArray(report.failures) ? report.failures : [],
+  );
+  const qaEvidence = sanitizeSoakQaEvidence(report.qaEvidence);
+
+  if (
+    !report.qaEvidence ||
+    typeof report.qaEvidence !== "object" ||
+    Array.isArray(report.qaEvidence)
+  ) {
+    return {
+      status: "invalid",
+      detail: "soakQaEvidenceMissing",
+      qaEvidence,
+      expectedQaEvidence,
+    };
+  }
+
+  if (
+    !sameStringArray(qaEvidence.supportedCaseIds, WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS) ||
+    qaEvidence.supportedCaseCount !== WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS.length
+  ) {
+    return {
+      status: "invalid",
+      detail: "soakQaEvidenceCoverageMismatch",
+      qaEvidence,
+      expectedQaEvidence,
+    };
+  }
+
+  if (
+    qaEvidence.status !== expectedQaEvidence.status ||
+    !sameStringArray(qaEvidence.blockers, expectedQaEvidence.blockers)
+  ) {
+    return {
+      status: "invalid",
+      detail: "soakQaEvidenceDrift",
+      qaEvidence,
+      expectedQaEvidence,
+    };
+  }
+
+  if (qaEvidence.status !== "pass") {
+    return {
+      status: "invalid",
+      detail: "soakQaEvidenceNotPassing",
+      qaEvidence,
+      expectedQaEvidence,
+    };
+  }
+
+  return {
+    status: "pass",
+    qaEvidence,
+    expectedQaEvidence,
+  };
+}
+
 function sanitizeSoakMetrics(metrics) {
   return {
     scenarioPasses: safeMetric(metrics?.scenarioPasses),
@@ -402,8 +485,25 @@ function sanitizeSoakMetrics(metrics) {
   };
 }
 
+function sanitizeSoakQaEvidence(qaEvidence) {
+  return {
+    status: typeof qaEvidence?.status === "string" ? qaEvidence.status : null,
+    supportedCaseIds: sanitizeStringArray(qaEvidence?.supportedCaseIds),
+    supportedCaseCount: safeMetric(qaEvidence?.supportedCaseCount),
+    blockers: sanitizeStringArray(qaEvidence?.blockers),
+  };
+}
+
 function safeMetric(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function sanitizeStringArray(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+}
+
+function sameStringArray(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function schemaMismatchCheck(id, source, expectedSchemaVersion, report, extra = {}) {
@@ -455,6 +555,13 @@ function releaseGateActionFor(check) {
       return "regenerate the Windows MVP soak report with duration fields";
     case "soakSummaryUnhealthy":
       return "fix the soak failure and rerun Windows MVP soak evidence";
+    case "soakQaEvidenceMissing":
+      return "regenerate the Windows MVP soak report with QA evidence fields";
+    case "soakQaEvidenceCoverageMismatch":
+    case "soakQaEvidenceDrift":
+      return "regenerate the Windows MVP soak report instead of editing evidence by hand";
+    case "soakQaEvidenceNotPassing":
+      return "rerun Windows MVP soak until QA evidence status is pass";
     default:
       if (check.id === "signingPreflight") {
         return "run release signing preflight in the release environment until every check passes";
