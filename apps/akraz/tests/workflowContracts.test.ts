@@ -275,6 +275,45 @@ describe("GitHub Actions workflow contracts", () => {
     }
   });
 
+  test("rejects release workflow drift when evidence source CLI inputs are not wired", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-evidence-args-contracts-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory);
+      copyCurrentWorkflows(tempDirectory);
+
+      const releaseWorkflowWithoutQaArtifactArgument = readFileSync(
+        join(".github", "workflows", "windows-mvp-release.yml"),
+        "utf8",
+      ).replace('            args+=("--qa-report-artifact" "$QA_REPORT_ARTIFACT")\n', "");
+      writeFileSync(
+        join(tempDirectory, ".github", "workflows", "windows-mvp-release.yml"),
+        releaseWorkflowWithoutQaArtifactArgument,
+        "utf8",
+      );
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(
+        report.checks.find((check) => check.id === "releaseEvidenceSourcesWiring"),
+      ).toMatchObject({
+        status: "invalid",
+        detail: "releaseEvidenceSourcesWiringDrifted",
+        missingSnippets: ["evidenceSourcesQaArtifactArgument"],
+      });
+      expect(report.nextActions).toContainEqual({
+        id: "syncReleaseEvidenceSourcesWiring",
+        action: "wire the release evidence source manifest generation into the bundle command",
+        workflowFile: "windows-mvp-release.yml",
+        missingSnippets: ["evidenceSourcesQaArtifactArgument"],
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
   test("rejects Tauri sidecar drift before Windows smoke jobs run", () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-sidecar-contracts-"));
 

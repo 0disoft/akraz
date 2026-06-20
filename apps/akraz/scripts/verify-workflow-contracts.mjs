@@ -37,6 +37,28 @@ const RELEASE_BUNDLE_EVIDENCE_SOURCES_SNIPPET = [
   "bun run release:windows-mvp-bundle -- \\",
   `            --evidence-sources-file "${RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH}" \\`,
 ].join("\n");
+const RELEASE_EVIDENCE_SOURCES_ARGUMENT_SNIPPETS = [
+  {
+    id: "evidenceSourcesSourceRunIdArgument",
+    snippet: 'args+=("--source-run-id" "$SOURCE_RUN_ID")',
+  },
+  {
+    id: "evidenceSourcesQaSourceRunIdArgument",
+    snippet: 'args+=("--qa-source-run-id" "$QA_SOURCE_RUN_ID")',
+  },
+  {
+    id: "evidenceSourcesSoakSourceRunIdArgument",
+    snippet: 'args+=("--soak-source-run-id" "$SOAK_SOURCE_RUN_ID")',
+  },
+  {
+    id: "evidenceSourcesQaArtifactArgument",
+    snippet: 'args+=("--qa-report-artifact" "$QA_REPORT_ARTIFACT")',
+  },
+  {
+    id: "evidenceSourcesSoakArtifactArgument",
+    snippet: 'args+=("--soak-report-artifact" "$SOAK_REPORT_ARTIFACT")',
+  },
+];
 const RESOLVED_EVIDENCE_COMMAND_SNIPPET = [
   "bun run release:windows-mvp-resolved-evidence -- \\",
   `            --evidence-sources-file "${RELEASE_EVIDENCE_SOURCES_MANIFEST_PATH}" \\`,
@@ -624,6 +646,7 @@ function evaluateReleaseEvidenceSourcesWiring(workflows) {
       id: "workflowInputsManifestPath",
       snippet: RELEASE_WORKFLOW_INPUTS_MANIFEST_PATH,
     },
+    ...RELEASE_EVIDENCE_SOURCES_ARGUMENT_SNIPPETS,
     {
       id: "releaseBundleScript",
       snippet: "release:windows-mvp-bundle",
