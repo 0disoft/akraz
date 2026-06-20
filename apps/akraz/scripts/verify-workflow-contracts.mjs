@@ -38,14 +38,81 @@ const REQUIRED_SMOKE_WORKFLOW_SCRIPTS = [
   "smoke:windows-mvp-soak",
 ];
 const SMOKE_SOAK_REPORT_PATH = "apps/akraz/reports/windows-mvp-soak-smoke.json";
+const WORKSPACE_DELEGATED_APP_SCRIPTS = [
+  "build",
+  "qa:windows-mvp-plan",
+  "qa:windows-mvp-report",
+  "qa:windows-mvp-report-template",
+  "qa:windows-mvp-report-update",
+  "qa:windows-mvp-workflow-payload",
+  "release:signing-preflight",
+  "release:updater-config-preflight",
+  "release:windows-mvp-bundle",
+  "release:windows-mvp-evidence-sources",
+  "release:windows-mvp-gate",
+  "release:windows-mvp-resolved-evidence",
+  "release:windows-mvp-workflow-inputs",
+  "smoke:daemon-lifecycle",
+  "smoke:diagnostics-snapshot",
+  "smoke:loopback-transport",
+  "smoke:peer-session",
+  "smoke:peer-session-executor",
+  "smoke:session-connect-lifecycle",
+  "smoke:settings-start",
+  "smoke:signing-preflight",
+  "smoke:tcp-transport",
+  "smoke:updater-config-preflight",
+  "smoke:windows-mvp-release-bundle",
+  "smoke:windows-mvp-release-gate",
+  "smoke:windows-mvp-soak",
+  "verify:release-metadata",
+  "verify:workflow-contracts",
+];
+const EXPECTED_APP_PACKAGE_SCRIPTS = {
+  build: "vite build",
+  check: "svelte-check --tsconfig ./tsconfig.json",
+  "prepare:sidecar": "bun scripts/prepare-sidecar.mjs",
+  "prepare:sidecar:release": "bun scripts/prepare-sidecar.mjs --release",
+  "qa:windows-mvp-plan": "bun scripts/windows-mvp-qa-plan.mjs",
+  "qa:windows-mvp-report": "bun scripts/windows-mvp-qa-report.mjs",
+  "qa:windows-mvp-report-template": "bun scripts/windows-mvp-qa-report.mjs --template",
+  "qa:windows-mvp-report-update": "bun scripts/windows-mvp-qa-report.mjs --update-result",
+  "qa:windows-mvp-workflow-payload": "bun scripts/windows-mvp-qa-workflow-payload.mjs",
+  "release:signing-preflight": "bun scripts/smoke-signing-preflight.mjs",
+  "release:updater-config-preflight": "bun scripts/smoke-updater-config-preflight.mjs",
+  "release:windows-mvp-bundle": "bun scripts/windows-mvp-release-bundle.mjs",
+  "release:windows-mvp-evidence-sources": "bun scripts/windows-mvp-release-evidence-sources.mjs",
+  "release:windows-mvp-gate": "bun scripts/windows-mvp-release-gate.mjs",
+  "release:windows-mvp-resolved-evidence": "bun scripts/windows-mvp-release-resolved-evidence.mjs",
+  "release:windows-mvp-workflow-inputs": "bun scripts/windows-mvp-release-workflow-inputs.mjs",
+  "smoke:daemon-lifecycle": "bun scripts/smoke-daemon-lifecycle.mjs",
+  "smoke:diagnostics-snapshot": "bun scripts/smoke-diagnostics-snapshot.mjs",
+  "smoke:loopback-transport": "bun scripts/smoke-loopback-transport.mjs",
+  "smoke:peer-session": "bun scripts/smoke-peer-session.mjs",
+  "smoke:peer-session-executor": "bun scripts/smoke-peer-session-executor.mjs",
+  "smoke:session-connect-lifecycle": "bun scripts/smoke-session-connect-lifecycle.mjs",
+  "smoke:settings-start": "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
+  "smoke:signing-preflight": "bun scripts/smoke-signing-preflight.mjs --expect-missing",
+  "smoke:tcp-transport": "bun scripts/smoke-tcp-transport.mjs",
+  "smoke:updater-config-preflight": "bun scripts/smoke-updater-config-preflight.mjs --expect-missing",
+  "smoke:windows-mvp-release-bundle": "bun scripts/smoke-windows-mvp-release-bundle.mjs",
+  "smoke:windows-mvp-release-gate": "bun scripts/smoke-windows-mvp-release-gate.mjs",
+  "smoke:windows-mvp-soak": "bun scripts/smoke-windows-mvp-soak.mjs",
+  tauri: "tauri",
+  "verify:release-metadata": "bun scripts/verify-release-metadata.mjs",
+  "verify:workflow-contracts": "bun scripts/verify-workflow-contracts.mjs",
+};
 
 export function buildWorkflowContractsReport(workspaceRoot = currentWorkspaceRoot()) {
   const rootPackage = readJsonFile(join(workspaceRoot, "package.json"));
+  const appPackage = readJsonFile(join(workspaceRoot, "apps", "akraz", "package.json"));
   const workflows = readWorkflowFiles(workspaceRoot);
   const expectedBunVersion = packageManagerBunVersion(rootPackage.packageManager);
   const workflowScripts = uniqueWorkflowScripts(workflows);
   const checks = [
     evaluateBunPackageManager(rootPackage.packageManager, expectedBunVersion),
+    ...evaluateWorkspaceAppScriptDelegation(rootPackage.scripts ?? {}, appPackage.scripts ?? {}),
+    ...evaluateAppPackageScripts(appPackage.scripts ?? {}),
     ...evaluateCheckoutVersions(workflows),
     ...evaluateBunVersions(workflows, expectedBunVersion),
     ...evaluateWorkflowScripts(workflowScripts, rootPackage.scripts ?? {}),
@@ -169,6 +236,58 @@ function evaluateWorkflowScripts(workflowScripts, rootScripts) {
     scriptName,
     detail: typeof rootScripts[scriptName] === "string" ? undefined : "packageScriptMissing",
   }));
+}
+
+function evaluateWorkspaceAppScriptDelegation(rootScripts, appScripts) {
+  return WORKSPACE_DELEGATED_APP_SCRIPTS.map((scriptName) => {
+    const expectedCommand = `bun run --cwd apps/akraz ${scriptName}`;
+    const actualCommand = rootScripts[scriptName];
+    const appCommand = appScripts[scriptName];
+
+    if (actualCommand === expectedCommand && typeof appCommand === "string") {
+      return {
+        id: `workspaceAppScript:${scriptName}`,
+        status: "pass",
+        scriptName,
+        expectedCommand,
+      };
+    }
+
+    return {
+      id: `workspaceAppScript:${scriptName}`,
+      status: typeof actualCommand === "string" ? "invalid" : "missing",
+      detail:
+        typeof appCommand === "string" ? "workspaceScriptDelegationDrifted" : "appScriptMissing",
+      scriptName,
+      expectedCommand,
+      actualCommand: typeof actualCommand === "string" ? actualCommand : null,
+      appCommand: typeof appCommand === "string" ? appCommand : null,
+    };
+  });
+}
+
+function evaluateAppPackageScripts(appScripts) {
+  return Object.entries(EXPECTED_APP_PACKAGE_SCRIPTS).map(([scriptName, expectedCommand]) => {
+    const actualCommand = appScripts[scriptName];
+
+    if (actualCommand === expectedCommand) {
+      return {
+        id: `appPackageScript:${scriptName}`,
+        status: "pass",
+        scriptName,
+        expectedCommand,
+      };
+    }
+
+    return {
+      id: `appPackageScript:${scriptName}`,
+      status: typeof actualCommand === "string" ? "invalid" : "missing",
+      detail: "appPackageScriptDrifted",
+      scriptName,
+      expectedCommand,
+      actualCommand: typeof actualCommand === "string" ? actualCommand : null,
+    };
+  });
 }
 
 function evaluateReleaseWorkflowFile(workflows) {
@@ -435,6 +554,25 @@ function buildNextActions(checks) {
             id: "addPackageScript",
             action: "add the workflow-called package script or update the workflow command",
             scriptName: check.scriptName,
+          },
+        ];
+      case "workspaceScriptDelegationDrifted":
+      case "appScriptMissing":
+        return [
+          {
+            id: "syncWorkspaceAppScript",
+            action: "sync the root package script with the app package script",
+            scriptName: check.scriptName,
+            expectedCommand: check.expectedCommand,
+          },
+        ];
+      case "appPackageScriptDrifted":
+        return [
+          {
+            id: "syncAppPackageScript",
+            action: "restore the expected app package script command",
+            scriptName: check.scriptName,
+            expectedCommand: check.expectedCommand,
           },
         ];
       case "releaseWorkflowFileMissing":

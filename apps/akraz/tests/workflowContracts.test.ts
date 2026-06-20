@@ -35,6 +35,16 @@ describe("GitHub Actions workflow contracts", () => {
     expect(report.workflowScripts).toContain("release:windows-mvp-evidence-sources");
     expect(report.workflowScripts).toContain("release:windows-mvp-resolved-evidence");
     expect(report.workflowScripts).toContain("smoke:windows-mvp-soak");
+    expect(report.checks.find((check) => check.id === "workspaceAppScript:smoke:tcp-transport"))
+      .toMatchObject({
+        status: "pass",
+        expectedCommand: "bun run --cwd apps/akraz smoke:tcp-transport",
+      });
+    expect(report.checks.find((check) => check.id === "appPackageScript:smoke:settings-start"))
+      .toMatchObject({
+        status: "pass",
+        expectedCommand: "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
+      });
     expect(report.checks.find((check) => check.id === "smokeWorkflowCoverage")).toMatchObject({
       status: "pass",
       workflowFile: "check.yml",
@@ -84,6 +94,7 @@ describe("GitHub Actions workflow contracts", () => {
           test: "bun test",
         },
       });
+      writeCurrentAppPackageFixture(tempDirectory);
       mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
       writeFileSync(
         join(tempDirectory, ".github", "workflows", "check.yml"),
@@ -160,11 +171,7 @@ describe("GitHub Actions workflow contracts", () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-workflow-contracts-"));
 
     try {
-      writeFileSync(
-        join(tempDirectory, "package.json"),
-        readFileSync("package.json", "utf8"),
-        "utf8",
-      );
+      writeCurrentPackageFixtures(tempDirectory);
       mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
       for (const workflowFile of ["check.yml", "windows-mvp-qa.yml", "windows-mvp-soak.yml"]) {
         writeFileSync(
@@ -216,11 +223,7 @@ describe("GitHub Actions workflow contracts", () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-bundle-smoke-contracts-"));
 
     try {
-      writeFileSync(
-        join(tempDirectory, "package.json"),
-        readFileSync("package.json", "utf8"),
-        "utf8",
-      );
+      writeCurrentPackageFixtures(tempDirectory);
       mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
       for (const workflowFile of ["check.yml", "windows-mvp-qa.yml", "windows-mvp-soak.yml"]) {
         writeFileSync(
@@ -275,11 +278,7 @@ describe("GitHub Actions workflow contracts", () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-release-resolved-evidence-contracts-"));
 
     try {
-      writeFileSync(
-        join(tempDirectory, "package.json"),
-        readFileSync("package.json", "utf8"),
-        "utf8",
-      );
+      writeCurrentPackageFixtures(tempDirectory);
       mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
       for (const workflowFile of ["check.yml", "windows-mvp-qa.yml", "windows-mvp-soak.yml"]) {
         writeFileSync(
@@ -328,11 +327,7 @@ describe("GitHub Actions workflow contracts", () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-smoke-workflow-contracts-"));
 
     try {
-      writeFileSync(
-        join(tempDirectory, "package.json"),
-        readFileSync("package.json", "utf8"),
-        "utf8",
-      );
+      writeCurrentPackageFixtures(tempDirectory);
       mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
       for (const workflowFile of [
         "windows-mvp-qa.yml",
@@ -382,11 +377,7 @@ describe("GitHub Actions workflow contracts", () => {
     const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-smoke-soak-contracts-"));
 
     try {
-      writeFileSync(
-        join(tempDirectory, "package.json"),
-        readFileSync("package.json", "utf8"),
-        "utf8",
-      );
+      writeCurrentPackageFixtures(tempDirectory);
       mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
       for (const workflowFile of [
         "windows-mvp-qa.yml",
@@ -426,7 +417,118 @@ describe("GitHub Actions workflow contracts", () => {
       rmSync(tempDirectory, { force: true, recursive: true });
     }
   });
+
+  test("rejects root package script drift before heavy smoke scripts run", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-workspace-script-contracts-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory, {
+        rootScripts: {
+          "smoke:tcp-transport": "bun run --cwd apps/akraz smoke:peer-session",
+        },
+      });
+      copyCurrentWorkflows(tempDirectory);
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "workspaceAppScript:smoke:tcp-transport"))
+        .toMatchObject({
+          status: "invalid",
+          detail: "workspaceScriptDelegationDrifted",
+          expectedCommand: "bun run --cwd apps/akraz smoke:tcp-transport",
+          actualCommand: "bun run --cwd apps/akraz smoke:peer-session",
+        });
+      expect(report.nextActions).toContainEqual({
+        id: "syncWorkspaceAppScript",
+        action: "sync the root package script with the app package script",
+        scriptName: "smoke:tcp-transport",
+        expectedCommand: "bun run --cwd apps/akraz smoke:tcp-transport",
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects app package script command drift before heavy smoke scripts run", () => {
+    const tempDirectory = mkdtempSync(join(tmpdir(), "akraz-app-script-contracts-"));
+
+    try {
+      writeCurrentPackageFixtures(tempDirectory, {
+        appScripts: {
+          "smoke:settings-start": "bun scripts/smoke-daemon-lifecycle.mjs",
+        },
+      });
+      copyCurrentWorkflows(tempDirectory);
+
+      const report = buildWorkflowContractsReport(tempDirectory);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "appPackageScript:smoke:settings-start"))
+        .toMatchObject({
+          status: "invalid",
+          detail: "appPackageScriptDrifted",
+          expectedCommand: "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
+          actualCommand: "bun scripts/smoke-daemon-lifecycle.mjs",
+        });
+      expect(report.nextActions).toContainEqual({
+        id: "syncAppPackageScript",
+        action: "restore the expected app package script command",
+        scriptName: "smoke:settings-start",
+        expectedCommand: "bun scripts/smoke-daemon-lifecycle.mjs settings-start",
+      });
+      expect(exitCodeForWorkflowContracts(report)).toBe(1);
+    } finally {
+      rmSync(tempDirectory, { force: true, recursive: true });
+    }
+  });
 });
+
+function copyCurrentWorkflows(tempDirectory: string) {
+  mkdirSync(join(tempDirectory, ".github", "workflows"), { recursive: true });
+  for (const workflowFile of [
+    "check.yml",
+    "windows-mvp-qa.yml",
+    "windows-mvp-release.yml",
+    "windows-mvp-soak.yml",
+  ]) {
+    writeFileSync(
+      join(tempDirectory, ".github", "workflows", workflowFile),
+      readFileSync(join(".github", "workflows", workflowFile), "utf8"),
+      "utf8",
+    );
+  }
+}
+
+function writeCurrentPackageFixtures(
+  tempDirectory: string,
+  overrides: {
+    appScripts?: Record<string, string>;
+    rootScripts?: Record<string, string>;
+  } = {},
+) {
+  const rootPackage = JSON.parse(readFileSync("package.json", "utf8"));
+  rootPackage.scripts = {
+    ...rootPackage.scripts,
+    ...overrides.rootScripts,
+  };
+  writeJson(join(tempDirectory, "package.json"), rootPackage);
+  writeCurrentAppPackageFixture(tempDirectory, overrides.appScripts);
+}
+
+function writeCurrentAppPackageFixture(
+  tempDirectory: string,
+  scriptOverrides: Record<string, string> = {},
+) {
+  const appPackage = JSON.parse(readFileSync(join("apps", "akraz", "package.json"), "utf8"));
+  appPackage.scripts = {
+    ...appPackage.scripts,
+    ...scriptOverrides,
+  };
+  mkdirSync(join(tempDirectory, "apps", "akraz"), { recursive: true });
+  writeJson(join(tempDirectory, "apps", "akraz", "package.json"), appPackage);
+}
 
 function writeJson(path: string, payload: unknown) {
   writeFileSync(path, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
