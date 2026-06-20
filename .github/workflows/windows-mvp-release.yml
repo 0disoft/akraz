@@ -188,6 +188,7 @@ jobs:
           set -euo pipefail
 
           bun run release:windows-mvp-bundle -- \
+            --evidence-sources-file "$RELEASE_EVIDENCE_DIR/manifest/windows-mvp-release-evidence-sources.json" \
             --qa-report-file "$QA_REPORT_FILE" \
             --soak-report-file "$SOAK_REPORT_FILE" \
             --signing-preflight-file "$RELEASE_EVIDENCE_DIR/signing/windows-mvp-signing-preflight.json" \

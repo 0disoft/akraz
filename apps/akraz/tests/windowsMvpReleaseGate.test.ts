@@ -336,7 +336,16 @@ describe("Windows MVP release gate", () => {
     const soakReportFile = join(tempDir, "soak-report.json");
     const signingFile = join(tempDir, "signing.json");
     const updaterFile = join(tempDir, "updater.json");
+    const evidenceSourcesFile = join(tempDir, "evidence-sources.json");
     const options = {
+      evidenceSourcesFile: writeJson(
+        evidenceSourcesFile,
+        buildWindowsMvpReleaseEvidenceSourcesReport({
+          sourceRunId: "27856073522",
+          manifestWritten: true,
+          dispatchInputsWritten: true,
+        }),
+      ),
       qaReportFile: writeJson(qaReportFile, passingQaReport()),
       signingPreflightFile: writeJson(signingFile, passingSigningPreflight()),
       soakReportFile: writeJson(soakReportFile, passingSoakReport()),
@@ -365,9 +374,10 @@ describe("Windows MVP release gate", () => {
       expect(formatted).not.toContain(tempDir);
       expect(formatted).not.toContain("super-secret");
       expect(formatted).not.toContain("updates.example.com");
-      expect(written.files.length).toBe(6);
+      expect(written.files.length).toBe(7);
       expect(JSON.parse(readFileSync(manifestPath, "utf8"))).toEqual(bundleReport);
       expect(JSON.parse(readFileSync(gatePath, "utf8"))).toEqual(gateReport);
+      expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.evidenceSources))).toBe(true);
       expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.qaReport))).toBe(true);
       expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.soakReport))).toBe(true);
       expect(existsSync(join(outDir, WINDOWS_MVP_RELEASE_BUNDLE_FILES.signingPreflight))).toBe(
@@ -406,6 +416,9 @@ describe("Windows MVP release gate", () => {
         artifactId: "qaReport",
         action: "provide qaReport evidence file before bundling",
       });
+      expect(report.checks.find((check) => check.id === "optionalEvidenceFiles")).toMatchObject({
+        status: "pass",
+      });
       expect(formatted).not.toContain(tempDir);
       expect(exitCodeForWindowsMvpReleaseBundle(report)).toBe(1);
       expect(() => writeWindowsMvpReleaseBundleOutput(undefined, {}, report, {})).toThrow(
@@ -422,6 +435,8 @@ describe("Windows MVP release gate", () => {
   test("parses release bundle arguments", () => {
     expect(
       parseWindowsMvpReleaseBundleArgs([
+        "--evidence-sources-file",
+        "evidence-sources.json",
         "--qa-report-file",
         "qa.json",
         "--soak-report-file",
@@ -435,6 +450,7 @@ describe("Windows MVP release gate", () => {
       ]),
     ).toEqual({
       outDir: "bundle",
+      evidenceSourcesFile: "evidence-sources.json",
       qaReportFile: "qa.json",
       signingPreflightFile: "signing.json",
       soakReportFile: "soak.json",
@@ -446,6 +462,47 @@ describe("Windows MVP release gate", () => {
     expect(() => parseWindowsMvpReleaseBundleArgs(["--unknown"])).toThrow(
       "unknown Windows MVP release bundle argument: --unknown",
     );
+  });
+
+  test("rejects invalid optional release evidence source manifest before copying it", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "akraz-release-bundle-sources-invalid-"));
+    const evidenceSourcesFile = join(tempDir, "evidence-sources.json");
+
+    try {
+      const report = buildWindowsMvpReleaseBundleReport({
+        evidenceSourcesFile: writeJson(evidenceSourcesFile, {
+          schemaVersion: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
+          ready: false,
+          privacy: {
+            includesSecretValues: false,
+            includesFullFilePaths: false,
+            includesArtifactPayloads: false,
+          },
+        }),
+      });
+      const formatted = JSON.stringify(report);
+
+      expect(report.ready).toBe(false);
+      expect(report.checks.find((check) => check.id === "optionalEvidenceFiles")).toMatchObject({
+        status: "invalid",
+        detail: "optionalEvidenceFilesNotReady",
+        invalidArtifactIds: ["evidenceSources"],
+      });
+      expect(report.artifacts.find((artifact) => artifact.id === "evidenceSources")).toMatchObject({
+        status: "invalid",
+        detail: "evidenceSourcesNotReady",
+        included: false,
+        required: false,
+      });
+      expect(report.nextActions).toContainEqual({
+        gate: "releaseBundle",
+        artifactId: "evidenceSources",
+        action: "regenerate passing evidenceSources evidence before bundling",
+      });
+      expect(formatted).not.toContain(evidenceSourcesFile);
+    } finally {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
   });
 
   test("builds release workflow dispatch inputs from one shared evidence run", () => {

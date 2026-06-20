@@ -17,12 +17,14 @@ import {
   buildWindowsMvpReleaseGateReport,
   exitCodeForWindowsMvpReleaseGate,
 } from "./windows-mvp-release-gate.mjs";
+import { WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION } from "./windows-mvp-release-evidence-sources.mjs";
 
 export const WINDOWS_MVP_RELEASE_BUNDLE_SCHEMA_VERSION = "akraz.windowsMvpReleaseBundle/v1";
 
 export const WINDOWS_MVP_RELEASE_BUNDLE_FILES = {
   manifest: "windows-mvp-release-bundle.json",
   releaseGate: "windows-mvp-release-gate.json",
+  evidenceSources: "windows-mvp-release-evidence-sources.json",
   qaReport: "windows-mvp-qa-report.json",
   soakReport: "windows-mvp-soak-report.json",
   signingPreflight: "windows-mvp-signing-preflight.json",
@@ -56,6 +58,16 @@ const REQUIRED_EVIDENCE_OPTIONS = [
   },
 ];
 
+const OPTIONAL_EVIDENCE_OPTIONS = [
+  {
+    id: "evidenceSources",
+    optionKey: "evidenceSourcesFile",
+    source: "evidenceSourcesFile",
+    fileName: WINDOWS_MVP_RELEASE_BUNDLE_FILES.evidenceSources,
+    expectedSchemaVersion: WINDOWS_MVP_RELEASE_EVIDENCE_SOURCES_SCHEMA_VERSION,
+  },
+];
+
 export function buildWindowsMvpReleaseBundleReport(
   options = {},
   workspaceRoot = currentWorkspaceRoot(),
@@ -64,10 +76,14 @@ export function buildWindowsMvpReleaseBundleReport(
   const evidenceArtifacts = REQUIRED_EVIDENCE_OPTIONS.map((definition) =>
     buildEvidenceArtifact(definition, options, releaseGate),
   );
+  const optionalArtifacts = OPTIONAL_EVIDENCE_OPTIONS.map((definition) =>
+    buildOptionalEvidenceArtifact(definition, options),
+  );
   const checks = [
     evaluateReleaseGateSchema(releaseGate),
     evaluateReleaseGateReady(releaseGate),
     evaluateBundleEvidenceFiles(evidenceArtifacts),
+    evaluateOptionalEvidenceFiles(optionalArtifacts),
   ];
 
   return {
@@ -77,6 +93,7 @@ export function buildWindowsMvpReleaseBundleReport(
     bundleFiles: {
       manifest: WINDOWS_MVP_RELEASE_BUNDLE_FILES.manifest,
       releaseGate: WINDOWS_MVP_RELEASE_BUNDLE_FILES.releaseGate,
+      evidenceSources: WINDOWS_MVP_RELEASE_BUNDLE_FILES.evidenceSources,
     },
     artifacts: [
       {
@@ -88,6 +105,7 @@ export function buildWindowsMvpReleaseBundleReport(
         included: true,
       },
       ...evidenceArtifacts,
+      ...optionalArtifacts,
     ],
     checks,
     nextActions: buildBundleNextActions(checks, releaseGate.nextActions),
@@ -105,6 +123,7 @@ export function buildWindowsMvpReleaseBundleReport(
 export function parseWindowsMvpReleaseBundleArgs(args) {
   const options = {
     outDir: undefined,
+    evidenceSourcesFile: undefined,
     qaReportFile: undefined,
     signingPreflightFile: undefined,
     soakReportFile: undefined,
@@ -116,6 +135,9 @@ export function parseWindowsMvpReleaseBundleArgs(args) {
     switch (arg) {
       case "--out-dir":
         options.outDir = readValue(args, ++index, arg);
+        break;
+      case "--evidence-sources-file":
+        options.evidenceSourcesFile = readValue(args, ++index, arg);
         break;
       case "--qa-report-file":
         options.qaReportFile = readValue(args, ++index, arg);
@@ -165,7 +187,9 @@ export function writeWindowsMvpReleaseBundleOutput(outDir, options, bundleReport
       continue;
     }
 
-    const definition = REQUIRED_EVIDENCE_OPTIONS.find((candidate) => candidate.id === artifact.id);
+    const definition = [...REQUIRED_EVIDENCE_OPTIONS, ...OPTIONAL_EVIDENCE_OPTIONS].find(
+      (candidate) => candidate.id === artifact.id,
+    );
     const inputFile = definition ? options[definition.optionKey] : undefined;
     if (inputFile) {
       writtenFiles.push(copyFileAtomic(inputFile, join(resolvedOutDir, artifact.fileName)));
@@ -175,6 +199,46 @@ export function writeWindowsMvpReleaseBundleOutput(outDir, options, bundleReport
   return {
     directory: resolvedOutDir,
     files: writtenFiles,
+  };
+}
+
+function buildOptionalEvidenceArtifact(definition, options) {
+  const fileProvided = typeof options[definition.optionKey] === "string";
+  if (!fileProvided) {
+    return {
+      id: definition.id,
+      source: definition.source,
+      fileName: definition.fileName,
+      status: "skipped",
+      detail: "optionalFileArgumentMissing",
+      fileProvided,
+      included: false,
+      required: false,
+    };
+  }
+
+  const fileRead = readJsonEvidence(options[definition.optionKey]);
+  const valid =
+    fileRead.ok &&
+    fileRead.payload?.schemaVersion === definition.expectedSchemaVersion &&
+    fileRead.payload?.ready === true &&
+    hasPrivacyFlags(fileRead.payload?.privacy, [
+      "includesSecretValues",
+      "includesFullFilePaths",
+      "includesArtifactPayloads",
+    ]);
+
+  return {
+    id: definition.id,
+    source: definition.source,
+    fileName: definition.fileName,
+    status: valid ? "pass" : "invalid",
+    detail: valid ? undefined : optionalEvidenceDetail(fileRead, definition),
+    schemaVersion: fileRead.payload?.schemaVersion,
+    expectedSchemaVersion: definition.expectedSchemaVersion,
+    fileProvided,
+    included: valid,
+    required: false,
   };
 }
 
@@ -264,6 +328,26 @@ function evaluateBundleEvidenceFiles(artifacts) {
   };
 }
 
+function evaluateOptionalEvidenceFiles(artifacts) {
+  const invalidArtifactIds = artifacts
+    .filter((artifact) => artifact.fileProvided && !artifact.included)
+    .map((artifact) => artifact.id);
+
+  if (invalidArtifactIds.length === 0) {
+    return {
+      id: "optionalEvidenceFiles",
+      status: "pass",
+    };
+  }
+
+  return {
+    id: "optionalEvidenceFiles",
+    status: "invalid",
+    detail: "optionalEvidenceFilesNotReady",
+    invalidArtifactIds,
+  };
+}
+
 function buildBundleNextActions(checks, releaseGateNextActions) {
   const bundleActions = checks.flatMap((check) => {
     if (check.status === "pass") {
@@ -291,6 +375,12 @@ function buildBundleNextActions(checks, releaseGateNextActions) {
             action: "resolve the release gate blockers before publishing a bundle",
           },
         ];
+      case "optionalEvidenceFiles":
+        return check.invalidArtifactIds.map((artifactId) => ({
+          gate: "releaseBundle",
+          artifactId,
+          action: `regenerate passing ${artifactId} evidence before bundling`,
+        }));
       default:
         return [
           {
@@ -302,6 +392,45 @@ function buildBundleNextActions(checks, releaseGateNextActions) {
   });
 
   return [...bundleActions, ...releaseGateNextActions];
+}
+
+function optionalEvidenceDetail(fileRead, definition) {
+  if (!fileRead.ok) {
+    return fileRead.detail;
+  }
+
+  if (fileRead.payload?.schemaVersion !== definition.expectedSchemaVersion) {
+    return "schemaVersionMismatch";
+  }
+
+  if (fileRead.payload?.ready !== true) {
+    return "evidenceSourcesNotReady";
+  }
+
+  return "privacyFlagsNotReady";
+}
+
+function readJsonEvidence(path) {
+  try {
+    return {
+      ok: true,
+      payload: JSON.parse(readFileSync(path, "utf8")),
+    };
+  } catch {
+    return {
+      ok: false,
+      detail: "fileNotReadableJson",
+      payload: undefined,
+    };
+  }
+}
+
+function hasPrivacyFlags(privacy, flagNames) {
+  return (
+    typeof privacy === "object" &&
+    privacy !== null &&
+    flagNames.every((flagName) => privacy[flagName] === false)
+  );
 }
 
 function writeJsonFileAtomic(outFile, payload) {
