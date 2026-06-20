@@ -506,6 +506,17 @@ describe("Windows MVP release gate", () => {
       expect(bundleReport.ready).toBe(true);
       expect(bundleReport.releaseGateReady).toBe(true);
       expect(bundleReport.artifacts.every((artifact) => artifact.included)).toBe(true);
+      expect(bundleReport.artifacts.find((artifact) => artifact.id === "soakReport")).toMatchObject(
+        {
+          status: "pass",
+          qaEvidence: {
+            supportedCaseIds: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS,
+            supportedCaseCount: WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS.length,
+            status: "pass",
+            blockers: [],
+          },
+        },
+      );
       expect(bundleReport.privacy).toEqual({
         includesQaReportPayload: false,
         includesSecretValues: false,

@@ -259,7 +259,7 @@ function buildEvidenceArtifact(definition, options, releaseGate) {
 
   const included = fileProvided && check?.status === "pass";
 
-  return {
+  const artifact = {
     id: definition.id,
     source: definition.source,
     fileName: definition.fileName,
@@ -269,6 +269,20 @@ function buildEvidenceArtifact(definition, options, releaseGate) {
     expectedSchemaVersion: check?.expectedSchemaVersion,
     fileProvided,
     included,
+  };
+
+  return addEvidenceArtifactSummary(artifact, definition, check);
+}
+
+function addEvidenceArtifactSummary(artifact, definition, check) {
+  if (definition.id !== "soakReport") {
+    return artifact;
+  }
+
+  return {
+    ...artifact,
+    ...(check?.qaEvidence ? { qaEvidence: check.qaEvidence } : {}),
+    ...(check?.expectedQaEvidence ? { expectedQaEvidence: check.expectedQaEvidence } : {}),
   };
 }
 
