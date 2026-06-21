@@ -67,6 +67,7 @@ describe("Windows MVP soak reporting", () => {
       "loopback-transport",
       "peer-session",
       "peer-session-executor",
+      "remote-control-loopback",
       "tcp-transport",
       "session-connect-lifecycle",
     ]);

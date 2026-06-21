@@ -32,6 +32,10 @@ export const windowsMvpSoakScenarios = [
     script: "smoke-peer-session-executor.mjs",
   },
   {
+    name: "remote-control-loopback",
+    script: "smoke-remote-control-loopback.mjs",
+  },
+  {
     name: "tcp-transport",
     script: "smoke-tcp-transport.mjs",
   },

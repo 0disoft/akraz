@@ -13,8 +13,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use akraz_core::{
-    CoreAction, DeviceId, EdgeCrossing, InjectedInputEvent, LogicalPoint, MouseButton, PeerId,
-    PhysicalKey, PressState, RuntimeInputState, ScreenEdge, ScreenEdgeBinding, SessionId,
+    CapturedInputEvent, CoreAction, DEFAULT_PANIC_HOTKEY_KEY, DeviceId, EdgeCrossing,
+    InjectedInputEvent, LogicalPoint, MouseButton, PeerId, PhysicalKey, PressState, RuntimeEvent,
+    RuntimeInputState, ScreenEdge, ScreenEdgeBinding, SessionId,
 };
 use akraz_daemon::{
     CoreActionDispatcher, DaemonInputCaptureConfig, DaemonInputCaptureWorker, DaemonIpcRunConfig,
@@ -24,7 +25,9 @@ use akraz_daemon::{
     TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher, build_daemon_status,
     execute_paired_peer_transport_or_identity_probe_until_closed_with_timeout, serve_daemon_ipc,
     serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
-    serve_tcp_peer_transport_session_and_execute, shared_runtime_state,
+    serve_tcp_peer_transport_session_and_execute,
+    serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout,
+    shared_daemon_log_buffer, shared_runtime_state,
     start_monitored_daemon_input_capture_with_edge_bindings_dispatcher_and_logs,
 };
 use akraz_discovery::{MdnsDiscoveryConfig, MdnsDiscoveryRuntime, SharedDiscoveredPeers};
@@ -35,12 +38,15 @@ use akraz_ipc::{
     resolve_current_default_endpoint,
 };
 use akraz_platform::{
-    FakePlatformAdapter, PlatformAdapter, PlatformError, runtime_platform_adapter,
+    FakePlatformAdapter, InputCaptureConfig, PlatformAdapter, PlatformError,
+    runtime_platform_adapter,
 };
 use serde::Serialize;
 
 const PEER_LISTENER_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const REMOTE_CONTROL_LOOPBACK_SMOKE_SESSION_ID: &str = "remote-control-loopback-session";
+const REMOTE_CONTROL_LOOPBACK_SMOKE_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     match parse_daemon_command(env::args().skip(1)) {
@@ -56,6 +62,7 @@ fn main() -> ExitCode {
         Ok(DaemonCommand::TcpTransportSmoke) => run_tcp_transport_smoke(),
         Ok(DaemonCommand::PeerSessionSmoke) => run_peer_session_smoke(),
         Ok(DaemonCommand::PeerSessionExecutorSmoke) => run_peer_session_executor_smoke(),
+        Ok(DaemonCommand::RemoteControlLoopbackSmoke) => run_remote_control_loopback_smoke(),
         Ok(DaemonCommand::Serve(options)) => run_daemon(options),
         Err(error) => {
             eprintln!("{error}");
@@ -767,6 +774,25 @@ fn run_peer_session_executor_smoke() -> ExitCode {
     }
 }
 
+fn run_remote_control_loopback_smoke() -> ExitCode {
+    match build_remote_control_loopback_smoke_report() {
+        Ok(report) => match serde_json::to_string(&report) {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("failed to encode remote control loopback smoke report: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("remote control loopback smoke failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn build_loopback_transport_smoke_report()
 -> Result<LoopbackTransportSmokeReport, akraz_platform::PlatformError> {
     let transport = LoopbackPeerTransport::new();
@@ -897,6 +923,78 @@ fn build_peer_session_executor_smoke_report()
     ))
 }
 
+fn build_remote_control_loopback_smoke_report()
+-> Result<RemoteControlLoopbackSmokeReport, PlatformError> {
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| {
+        PlatformError::new(format!(
+            "failed to bind remote control loopback smoke listener: {error}"
+        ))
+    })?;
+    let address = listener.local_addr().map_err(|error| {
+        PlatformError::new(format!(
+            "failed to read remote control loopback smoke listener address: {error}"
+        ))
+    })?;
+    let server_thread = thread::spawn(move || {
+        let platform = FakePlatformAdapter::default();
+        let execution = serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout(
+            &listener,
+            &platform,
+            REMOTE_CONTROL_LOOPBACK_SMOKE_HEARTBEAT_TIMEOUT,
+        )?;
+        let injected_events = platform.injected_events()?;
+        let release_all_count = platform.release_all_count()?;
+
+        Ok::<_, PlatformError>((execution, injected_events, release_all_count))
+    });
+
+    let peer_sessions = ManagedPeerSessionTransport::new();
+    let session = TcpPeerSessionTransport::connect(
+        PeerId::new("loopback-peer"),
+        DeviceId::new("local-smoke-device"),
+        address,
+    )?;
+    peer_sessions.attach_session(session)?;
+
+    let captured_inputs = remote_control_loopback_smoke_captured_inputs();
+    let source_platform =
+        FakePlatformAdapter::default().with_captured_events(captured_inputs.clone());
+    let dispatcher = LocalPlatformCoreActionDispatcher::new(
+        source_platform.clone(),
+        TransportCoreActionDispatcher::new(peer_sessions.clone()),
+    );
+
+    dispatcher.dispatch_core_actions(&[CoreAction::StartRemoteSession {
+        peer_id: PeerId::new("loopback-peer"),
+        crossing: Some(remote_control_loopback_smoke_crossing()),
+    }])?;
+
+    let state = shared_runtime_state(remote_control_loopback_smoke_remote_state()?);
+    let worker = start_monitored_daemon_input_capture_with_edge_bindings_dispatcher_and_logs(
+        state,
+        &source_platform,
+        remote_control_loopback_smoke_capture_config(),
+        remote_control_loopback_smoke_edge_bindings(),
+        dispatcher,
+        shared_daemon_log_buffer(8),
+    )?;
+
+    let (execution, injected_events, release_all_count) = server_thread
+        .join()
+        .map_err(|_| PlatformError::new("remote control loopback smoke server panicked"))??;
+    worker.stop()?;
+
+    Ok(RemoteControlLoopbackSmokeReport::from_execution(
+        env!("CARGO_PKG_VERSION"),
+        REMOTE_CONTROL_LOOPBACK_SMOKE_SESSION_ID,
+        &captured_inputs,
+        &execution,
+        &injected_events,
+        release_all_count,
+        source_platform.release_all_count()?,
+    ))
+}
+
 fn loopback_transport_smoke_actions() -> [CoreAction; 4] {
     let crossing = EdgeCrossing {
         peer_id: PeerId::new("loopback-peer"),
@@ -924,6 +1022,87 @@ fn loopback_transport_smoke_actions() -> [CoreAction; 4] {
     ]
 }
 
+fn remote_control_loopback_smoke_remote_state() -> Result<RuntimeInputState, PlatformError> {
+    let mut state = RuntimeInputState::new();
+    state
+        .apply_event(RuntimeEvent::RemoteEntryRequested {
+            peer_id: PeerId::new("loopback-peer"),
+        })
+        .map_err(|error| {
+            PlatformError::new(format!(
+                "failed to seed remote control loopback entry request: {error}"
+            ))
+        })?;
+    state
+        .apply_event(RuntimeEvent::RemoteEntryConfirmed {
+            session_id: SessionId::new(REMOTE_CONTROL_LOOPBACK_SMOKE_SESSION_ID),
+        })
+        .map_err(|error| {
+            PlatformError::new(format!(
+                "failed to seed remote control loopback entry confirmation: {error}"
+            ))
+        })?;
+
+    Ok(state)
+}
+
+fn remote_control_loopback_smoke_captured_inputs() -> Vec<CapturedInputEvent> {
+    vec![
+        CapturedInputEvent::PointerMoved {
+            delta_x: 8,
+            delta_y: 2,
+        },
+        CapturedInputEvent::MouseButton {
+            button: MouseButton::Left,
+            state: PressState::Pressed,
+        },
+        CapturedInputEvent::Scroll {
+            delta_x: 0,
+            delta_y: -120,
+        },
+        CapturedInputEvent::Key {
+            key: PhysicalKey::LeftControl,
+            state: PressState::Pressed,
+        },
+        CapturedInputEvent::Key {
+            key: PhysicalKey::LeftAlt,
+            state: PressState::Pressed,
+        },
+        CapturedInputEvent::Key {
+            key: DEFAULT_PANIC_HOTKEY_KEY,
+            state: PressState::Pressed,
+        },
+    ]
+}
+
+fn remote_control_loopback_smoke_capture_config() -> DaemonInputCaptureConfig {
+    DaemonInputCaptureConfig {
+        input_capture: InputCaptureConfig {
+            event_buffer_capacity: 16,
+        },
+        drain_batch_size: 16,
+        idle_poll_interval: Duration::from_millis(1),
+    }
+}
+
+fn remote_control_loopback_smoke_edge_bindings() -> Vec<ScreenEdgeBinding> {
+    vec![ScreenEdgeBinding {
+        local_edge: ScreenEdge::Right,
+        peer_id: PeerId::new("loopback-peer"),
+        remote_edge: ScreenEdge::Left,
+    }]
+}
+
+fn remote_control_loopback_smoke_crossing() -> EdgeCrossing {
+    EdgeCrossing {
+        peer_id: PeerId::new("loopback-peer"),
+        local_edge: ScreenEdge::Right,
+        remote_edge: ScreenEdge::Left,
+        exit_position: LogicalPoint { x: 1920, y: 540 },
+        edge_offset: 540,
+    }
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct LoopbackTransportSmokeReport {
@@ -947,6 +1126,19 @@ struct PeerSessionExecutorSmokeReport {
     outcomes: Vec<PeerSessionExecutorSmokeOutcome>,
     injected_inputs: Vec<LoopbackTransportSmokeInputEvent>,
     release_all_count: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RemoteControlLoopbackSmokeReport {
+    daemon_version: &'static str,
+    seeded_session_id: String,
+    captured_inputs: Vec<LoopbackTransportSmokeInputEvent>,
+    hello: PeerSessionSmokeHello,
+    outcomes: Vec<PeerSessionExecutorSmokeOutcome>,
+    injected_inputs: Vec<LoopbackTransportSmokeInputEvent>,
+    release_all_count: u64,
+    local_release_all_count: u64,
 }
 
 impl PeerSessionSmokeReport {
@@ -993,6 +1185,44 @@ impl PeerSessionExecutorSmokeReport {
                 .map(LoopbackTransportSmokeInputEvent::from)
                 .collect(),
             release_all_count,
+        }
+    }
+}
+
+impl RemoteControlLoopbackSmokeReport {
+    fn from_execution(
+        daemon_version: &'static str,
+        seeded_session_id: &str,
+        captured_inputs: &[CapturedInputEvent],
+        execution: &PeerTransportSessionExecution,
+        injected_events: &[InjectedInputEvent],
+        release_all_count: u64,
+        local_release_all_count: u64,
+    ) -> Self {
+        Self {
+            daemon_version,
+            seeded_session_id: seeded_session_id.to_string(),
+            captured_inputs: captured_inputs
+                .iter()
+                .map(LoopbackTransportSmokeInputEvent::from)
+                .collect(),
+            hello: PeerSessionSmokeHello {
+                protocol_major: execution.hello.protocol.major,
+                protocol_minor: execution.hello.protocol.minor,
+                device_id: execution.hello.device_id.as_str().to_string(),
+                peer_id: execution.hello.peer_id.as_str().to_string(),
+            },
+            outcomes: execution
+                .outcomes
+                .iter()
+                .map(PeerSessionExecutorSmokeOutcome::from)
+                .collect(),
+            injected_inputs: injected_events
+                .iter()
+                .map(LoopbackTransportSmokeInputEvent::from)
+                .collect(),
+            release_all_count,
+            local_release_all_count,
         }
     }
 }
@@ -1152,6 +1382,29 @@ impl From<&InjectedInputEvent> for LoopbackTransportSmokeInputEvent {
     }
 }
 
+impl From<&CapturedInputEvent> for LoopbackTransportSmokeInputEvent {
+    fn from(event: &CapturedInputEvent) -> Self {
+        match event {
+            CapturedInputEvent::Key { key, state } => Self::Key {
+                key: physical_key_name(*key),
+                state: press_state_name(*state),
+            },
+            CapturedInputEvent::MouseButton { button, state } => Self::MouseButton {
+                button: mouse_button_name(*button),
+                state: press_state_name(*state),
+            },
+            CapturedInputEvent::PointerMoved { delta_x, delta_y } => Self::PointerMoved {
+                delta_x: *delta_x,
+                delta_y: *delta_y,
+            },
+            CapturedInputEvent::Scroll { delta_x, delta_y } => Self::Scroll {
+                delta_x: *delta_x,
+                delta_y: *delta_y,
+            },
+        }
+    }
+}
+
 fn screen_edge_name(edge: ScreenEdge) -> &'static str {
     match edge {
         ScreenEdge::Left => "left",
@@ -1203,6 +1456,7 @@ enum DaemonCommand {
     TcpTransportSmoke,
     PeerSessionSmoke,
     PeerSessionExecutorSmoke,
+    RemoteControlLoopbackSmoke,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1246,6 +1500,9 @@ where
         "--akraz-smoke-peer-session" => reject_trailing_args(args, DaemonCommand::PeerSessionSmoke),
         "--akraz-smoke-peer-session-executor" => {
             reject_trailing_args(args, DaemonCommand::PeerSessionExecutorSmoke)
+        }
+        "--akraz-smoke-remote-control-loopback" => {
+            reject_trailing_args(args, DaemonCommand::RemoteControlLoopbackSmoke)
         }
         "--serve" => parse_serve_options(args),
         argument
@@ -1588,9 +1845,9 @@ mod tests {
         LoopbackTransportSmokeInputEvent, ServeOptions, ServePeerSessionOptions,
         build_daemon_crash_marker, build_loopback_transport_smoke_report,
         build_peer_session_executor_smoke_report, build_peer_session_smoke_report,
-        build_tcp_transport_smoke_report, current_unix_millis, format_daemon_ipc_error,
-        panic_payload_class, parse_daemon_command, peer_listener_discovery_addresses,
-        write_daemon_crash_marker_file,
+        build_remote_control_loopback_smoke_report, build_tcp_transport_smoke_report,
+        current_unix_millis, format_daemon_ipc_error, panic_payload_class, parse_daemon_command,
+        peer_listener_discovery_addresses, write_daemon_crash_marker_file,
     };
 
     fn unique_crash_marker_path(label: &str) -> PathBuf {
@@ -1962,6 +2219,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_hidden_remote_control_loopback_smoke_command() {
+        assert_eq!(
+            parse_daemon_command(["--akraz-smoke-remote-control-loopback"].map(String::from)),
+            Ok(DaemonCommand::RemoteControlLoopbackSmoke)
+        );
+        assert_eq!(
+            parse_daemon_command(
+                ["--akraz-smoke-remote-control-loopback", "--once"].map(String::from)
+            ),
+            Err(DaemonUsageError::UnknownArgument("--once".to_string()))
+        );
+    }
+
+    #[test]
     fn loopback_transport_smoke_report_covers_transport_commands() {
         let report =
             build_loopback_transport_smoke_report().expect("loopback transport smoke report");
@@ -2088,6 +2359,94 @@ mod tests {
             }
         );
         assert_eq!(report.release_all_count, 1);
+    }
+
+    #[test]
+    fn remote_control_loopback_smoke_report_covers_capture_forward_and_recovery() {
+        let report = build_remote_control_loopback_smoke_report()
+            .expect("remote control loopback smoke report");
+
+        assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(report.seeded_session_id, "remote-control-loopback-session");
+        assert_eq!(report.hello.protocol_major, 1);
+        assert_eq!(report.hello.protocol_minor, 5);
+        assert_eq!(report.hello.device_id, "local-smoke-device");
+        assert_eq!(report.hello.peer_id, "loopback-peer");
+        assert_eq!(report.captured_inputs.len(), 6);
+        assert_eq!(report.outcomes.len(), 8);
+        assert_eq!(report.injected_inputs.len(), 5);
+        assert_eq!(report.release_all_count, 1);
+        assert_eq!(report.local_release_all_count, 1);
+        assert!(matches!(
+            &report.outcomes[0],
+            super::PeerSessionExecutorSmokeOutcome::RemoteSessionStarted {
+                peer_id,
+                crossing: Some(_),
+            } if peer_id == "loopback-peer"
+        ));
+        assert_eq!(
+            report.outcomes[1],
+            super::PeerSessionExecutorSmokeOutcome::InputForwarded {
+                event: LoopbackTransportSmokeInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+            }
+        );
+        assert_eq!(
+            report.outcomes[2],
+            super::PeerSessionExecutorSmokeOutcome::InputForwarded {
+                event: LoopbackTransportSmokeInputEvent::MouseButton {
+                    button: "left".to_string(),
+                    state: "pressed",
+                },
+            }
+        );
+        assert_eq!(
+            report.outcomes[3],
+            super::PeerSessionExecutorSmokeOutcome::InputForwarded {
+                event: LoopbackTransportSmokeInputEvent::Scroll {
+                    delta_x: 0,
+                    delta_y: -120,
+                },
+            }
+        );
+        assert_eq!(
+            report.outcomes[4],
+            super::PeerSessionExecutorSmokeOutcome::InputForwarded {
+                event: LoopbackTransportSmokeInputEvent::Key {
+                    key: "leftControl".to_string(),
+                    state: "pressed",
+                },
+            }
+        );
+        assert_eq!(
+            report.outcomes[5],
+            super::PeerSessionExecutorSmokeOutcome::InputForwarded {
+                event: LoopbackTransportSmokeInputEvent::Key {
+                    key: "leftAlt".to_string(),
+                    state: "pressed",
+                },
+            }
+        );
+        assert_eq!(
+            report.outcomes[6],
+            super::PeerSessionExecutorSmokeOutcome::InputsReleased
+        );
+        assert!(matches!(
+            &report.outcomes[7],
+            super::PeerSessionExecutorSmokeOutcome::RemoteSessionStopped {
+                session_id: Some(session_id),
+            } if session_id == "remote-control-loopback-session"
+        ));
+        assert_eq!(report.injected_inputs, report.captured_inputs[..5]);
+        assert_eq!(
+            report.captured_inputs[5],
+            LoopbackTransportSmokeInputEvent::Key {
+                key: "code:14".to_string(),
+                state: "pressed",
+            }
+        );
     }
 
     #[test]

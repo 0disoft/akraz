@@ -64,6 +64,7 @@ jobs:
       - run: bun run smoke:tcp-transport
       - run: bun run smoke:peer-session
       - run: bun run smoke:peer-session-executor
+      - run: bun run smoke:remote-control-loopback
       - run: bun run smoke:session-connect-lifecycle
       - run: bun run smoke:diagnostics-snapshot
       - run: bun run smoke:daemon-lifecycle
