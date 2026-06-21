@@ -108,24 +108,24 @@ describe("Windows MVP QA report evaluation", () => {
     expect(evaluation.ready).toBe(false);
     expect(evaluation.checks.find((check) => check.id === "duplicateCaseIds")).toMatchObject({
       status: "invalid",
-      caseIds: ["WIN-002"],
+      caseIds: ["WIN-001"],
     });
     expect(evaluation.checks.find((check) => check.id === "releaseBlockingCoverage")).toMatchObject(
       {
         status: "missing",
-        caseIds: listWindowsMvpQaCaseIds().filter((caseId) => caseId !== "WIN-002"),
+        caseIds: listWindowsMvpQaCaseIds().filter((caseId) => caseId !== "WIN-001"),
       },
     );
     expect(evaluation.nextActions).toEqual([
       {
         id: "dedupeResults",
         action: "keep exactly one result per QA case id",
-        caseIds: ["WIN-002"],
+        caseIds: ["WIN-001"],
       },
       {
         id: "addReleaseBlockingResults",
         action: "add results for every missing release-blocking QA case",
-        caseIds: listWindowsMvpQaCaseIds().filter((caseId) => caseId !== "WIN-002"),
+        caseIds: listWindowsMvpQaCaseIds().filter((caseId) => caseId !== "WIN-001"),
       },
     ]);
     expect(exitCodeForWindowsMvpQaReport(evaluation)).toBe(1);

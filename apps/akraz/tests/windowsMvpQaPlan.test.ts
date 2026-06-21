@@ -26,6 +26,7 @@ describe("Windows MVP QA plan", () => {
     expect(plan.caseCount).toBe(plan.cases.length);
     expect(plan.releaseBlockingCaseCount).toBe(plan.cases.length);
     expect(plan.cases.map((testCase) => testCase.id)).toEqual([
+      "WIN-001",
       "WIN-002",
       "WIN-003",
       "WIN-006",
@@ -89,6 +90,7 @@ describe("Windows MVP QA plan", () => {
 
   test("parses list and repeated case id arguments", () => {
     expect(listWindowsMvpQaCaseIds()).toEqual([
+      "WIN-001",
       "WIN-002",
       "WIN-003",
       "WIN-006",

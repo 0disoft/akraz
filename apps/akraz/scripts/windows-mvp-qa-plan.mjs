@@ -2,6 +2,45 @@ export const WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION = "akraz.windowsMvpQaPlan/v1";
 
 const windowsMvpQaCases = [
   {
+    id: "WIN-001",
+    milestone: "M6",
+    category: "baseline-remote-control",
+    title: "Baseline Windows remote control loop",
+    priority: "release-blocking",
+    automation: "manual",
+    environment: {
+      sourceOs: "Windows 11",
+      targetOs: "Windows 11",
+      hardware: "Two physical machines or two stable Windows endpoints",
+    },
+    prerequisites: [
+      "Both devices are paired and trusted.",
+      "A right or left edge binding is saved.",
+      "The target device can receive pointer, button, scroll, and keyboard injection.",
+      "A non-sensitive target window is focused before entering remote mode.",
+    ],
+    steps: [
+      "Start Akraz on both devices.",
+      "Capture screen topology diagnostics on the source device.",
+      "Cross the configured source edge into the target device.",
+      "Move the pointer, click, drag, and scroll on the target device.",
+      "Press and release basic non-text keys on the target device.",
+      "Leave remote mode and use local input on the source device.",
+    ],
+    expected: [
+      "The pointer enters the target device from the configured remote edge.",
+      "Pointer movement, click, drag, scroll, and basic keyboard input are applied on the target device.",
+      "Local source apps do not receive remote-mode pointer, button, scroll, or keyboard input.",
+      "Leaving remote mode restores local control on the source device.",
+    ],
+    evidence: [
+      "Screen topology diagnostics and saved edge binding snapshot",
+      "Manual target pointer, click, drag, scroll, and keyboard pass note without typed content",
+      "Manual source local-input-leak pass note",
+      "Windows MVP soak report with remote input and release QA evidence passing",
+    ],
+  },
+  {
     id: "WIN-002",
     milestone: "M8",
     category: "disconnect-recovery",
