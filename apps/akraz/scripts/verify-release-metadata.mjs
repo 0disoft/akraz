@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 export const RELEASE_METADATA_SCHEMA_VERSION = "akraz.releaseMetadata/v1";
 
 const AKRAZ_LOCK_PACKAGE_PREFIX = "akraz";
+const EXPECTED_REPOSITORY_URL = "https://github.com/0disoft/akraz";
 const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 
 export function evaluateReleaseMetadataVersions(metadata) {
@@ -24,6 +25,12 @@ export function evaluateReleaseMetadataVersions(metadata) {
       expectedVersion,
     ),
     checkVersion("cargoWorkspace", "Cargo.toml", metadata.cargoWorkspaceVersion, expectedVersion),
+    checkExactValue(
+      "cargoWorkspaceRepository",
+      "Cargo.toml",
+      metadata.cargoWorkspaceRepository,
+      EXPECTED_REPOSITORY_URL,
+    ),
     checkCargoLockPackages(metadata.cargoLockPackages, expectedVersion),
   ];
 
@@ -49,12 +56,22 @@ export function readReleaseMetadata(workspaceRoot) {
     appPackageVersion: appPackage.version,
     tauriConfigVersion: tauriConfig.version,
     cargoWorkspaceVersion: parseCargoWorkspacePackageVersion(cargoToml),
+    cargoWorkspaceRepository: parseCargoWorkspacePackageRepository(cargoToml),
     cargoLockPackages: parseCargoLockPackages(cargoLock),
   };
 }
 
 export function parseCargoWorkspacePackageVersion(cargoToml) {
+  return parseCargoWorkspacePackageField(cargoToml, "version");
+}
+
+export function parseCargoWorkspacePackageRepository(cargoToml) {
+  return parseCargoWorkspacePackageField(cargoToml, "repository");
+}
+
+function parseCargoWorkspacePackageField(cargoToml, fieldName) {
   let inWorkspacePackage = false;
+  const fieldPattern = new RegExp(`^${fieldName}\\s*=\\s*"(?<value>[^"]+)"$`);
 
   for (const line of cargoToml.split(/\r?\n/)) {
     if (line.trim() === "[workspace.package]") {
@@ -67,14 +84,33 @@ export function parseCargoWorkspacePackageVersion(cargoToml) {
     }
 
     if (inWorkspacePackage) {
-      const version = line.match(/^version\s*=\s*"(?<version>[^"]+)"$/);
-      if (version?.groups?.version) {
-        return version.groups.version;
+      const match = line.match(fieldPattern);
+      if (match?.groups?.value) {
+        return match.groups.value;
       }
     }
   }
 
   return undefined;
+}
+
+function checkExactValue(id, source, actualValue, expectedValue) {
+  if (!actualValue) {
+    return {
+      id,
+      source,
+      status: "missing",
+      expectedValue,
+    };
+  }
+
+  return {
+    id,
+    source,
+    status: actualValue === expectedValue ? "pass" : "mismatch",
+    expectedValue,
+    actualValue,
+  };
 }
 
 export function parseCargoLockPackages(cargoLock) {

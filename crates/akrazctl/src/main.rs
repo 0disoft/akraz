@@ -11,16 +11,17 @@ use akraz_identity::{
     TrustedPeerIdentity,
 };
 use akraz_ipc::{
-    DaemonLogEntry, DaemonLogsTail, DaemonLogsTailParams, DaemonStatus, DaemonStatusParams,
-    DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams, DiagnosticsScreenTopology,
-    DiagnosticsScreenTopologyParams, DiagnosticsSnapshot, InputReleaseAllParams, IpcCallError,
-    IpcEndpoint, IpcEndpointError, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure,
-    JsonRpcRequest, JsonRpcSuccess, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
-    METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
-    METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
-    METHOD_SESSION_DISCONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES, OsLocalIpcClient,
-    PermissionsProbe, PermissionsProbeParams, SessionConnectParams, SessionDisconnectParams,
-    SessionDiscoveryCandidatesParams, build_diagnostics_latency_histogram,
+    DEFAULT_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS, DaemonLogEntry, DaemonLogsTail,
+    DaemonLogsTailParams, DaemonStatus, DaemonStatusParams, DiagnosticsKeyboardLayout,
+    DiagnosticsKeyboardLayoutParams, DiagnosticsScreenTopology, DiagnosticsScreenTopologyParams,
+    DiagnosticsSnapshot, InputReleaseAllParams, InputSmokeTestParams, IpcCallError, IpcEndpoint,
+    IpcEndpointError, IpcTransportError, JSONRPC_VERSION, JsonRpcFailure, JsonRpcRequest,
+    JsonRpcSuccess, MAX_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS, METHOD_DAEMON_LOGS_TAIL,
+    METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+    METHOD_INPUT_RELEASE_ALL, METHOD_INPUT_SMOKE_TEST, METHOD_PERMISSIONS_PROBE,
+    METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES,
+    OsLocalIpcClient, PermissionsProbe, PermissionsProbeParams, SessionConnectParams,
+    SessionDisconnectParams, SessionDiscoveryCandidatesParams, build_diagnostics_latency_histogram,
     build_diagnostics_snapshot, build_diagnostics_support_bundle, call_json_rpc,
     resolve_current_default_endpoint,
 };
@@ -95,6 +96,13 @@ fn main() -> ExitCode {
         Some("input") => match args.next().as_deref() {
             Some("release-all") => match parse_endpoint_options(args) {
                 Ok(options) => print_input_release_all(options),
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            },
+            Some("smoke-test") => match parse_input_smoke_test_options(args) {
+                Ok(options) => print_input_smoke_test(options),
                 Err(error) => {
                     eprintln!("{error}");
                     ExitCode::from(2)
@@ -184,7 +192,7 @@ fn main() -> ExitCode {
         }
         None => {
             eprintln!(
-                "usage: akrazctl <status|diagnostics snapshot|diagnostics bundle|permissions probe|input release-all|identity show|identity list|identity trust|identity forget|session connect|session discovery-candidates|session disconnect|daemon-args|--version>"
+                "usage: akrazctl <status|diagnostics snapshot|diagnostics bundle|permissions probe|input release-all|input smoke-test|identity show|identity list|identity trust|identity forget|session connect|session discovery-candidates|session disconnect|daemon-args|--version>"
             );
             ExitCode::from(2)
         }
@@ -207,6 +215,11 @@ fn print_permissions_probe(options: EndpointOptions) -> ExitCode {
 
 fn print_input_release_all(options: EndpointOptions) -> ExitCode {
     let request = input_release_all_request();
+    print_local_daemon_response(options.endpoint, &request)
+}
+
+fn print_input_smoke_test(options: InputSmokeTestOptions) -> ExitCode {
+    let request = input_smoke_test_request(options.capture_timeout_ms);
     print_local_daemon_response(options.endpoint, &request)
 }
 
@@ -542,6 +555,14 @@ fn input_release_all_request() -> JsonRpcRequest<InputReleaseAllParams> {
     )
 }
 
+fn input_smoke_test_request(capture_timeout_ms: u64) -> JsonRpcRequest<InputSmokeTestParams> {
+    JsonRpcRequest::new(
+        LOCAL_REQUEST_ID,
+        METHOD_INPUT_SMOKE_TEST,
+        InputSmokeTestParams { capture_timeout_ms },
+    )
+}
+
 fn session_discovery_candidates_request() -> JsonRpcRequest<SessionDiscoveryCandidatesParams> {
     JsonRpcRequest::new(
         LOCAL_REQUEST_ID,
@@ -676,6 +697,12 @@ struct EndpointOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct InputSmokeTestOptions {
+    endpoint: Option<IpcEndpoint>,
+    capture_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DaemonArgsOptions {
     capture_input: bool,
     edge_bindings: Vec<String>,
@@ -780,6 +807,47 @@ where
     }
 
     Ok(EndpointOptions { endpoint })
+}
+
+fn parse_input_smoke_test_options<I>(args: I) -> Result<InputSmokeTestOptions, CliUsageError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut endpoint = None;
+    let mut capture_timeout_ms = None;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        if let Some(value) = argument.strip_prefix("--endpoint=") {
+            endpoint = Some(IpcEndpoint::manual(value).map_err(CliUsageError::from)?);
+        } else if argument == "--endpoint" {
+            let value = args.next().ok_or(CliUsageError::MissingEndpointValue)?;
+            endpoint = Some(IpcEndpoint::manual(value).map_err(CliUsageError::from)?);
+        } else if let Some(value) = argument.strip_prefix("--capture-timeout-ms=") {
+            set_once_input_u64_option(
+                "--capture-timeout-ms",
+                &mut capture_timeout_ms,
+                normalize_input_smoke_capture_timeout_ms_arg(value)?,
+            )?;
+        } else if argument == "--capture-timeout-ms" {
+            let value = args.next().ok_or(CliUsageError::MissingInputOptionValue(
+                "--capture-timeout-ms",
+            ))?;
+            set_once_input_u64_option(
+                "--capture-timeout-ms",
+                &mut capture_timeout_ms,
+                normalize_input_smoke_capture_timeout_ms_arg(&value)?,
+            )?;
+        } else {
+            return Err(CliUsageError::UnknownInputOption(argument));
+        }
+    }
+
+    Ok(InputSmokeTestOptions {
+        endpoint,
+        capture_timeout_ms: capture_timeout_ms
+            .unwrap_or(DEFAULT_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS),
+    })
 }
 
 fn parse_identity_show_options<I>(args: I) -> Result<IdentityShowOptions, CliUsageError>
@@ -1192,6 +1260,39 @@ fn set_once_identity_string_option(
     Ok(())
 }
 
+fn set_once_input_u64_option(
+    option_name: &'static str,
+    target: &mut Option<u64>,
+    value: u64,
+) -> Result<(), CliUsageError> {
+    if target.is_some() {
+        return Err(CliUsageError::DuplicateInputOption(option_name));
+    }
+
+    *target = Some(value);
+    Ok(())
+}
+
+fn normalize_input_smoke_capture_timeout_ms_arg(value: &str) -> Result<u64, CliUsageError> {
+    let value = value.trim();
+    let timeout_ms = value
+        .parse::<u64>()
+        .map_err(|_| CliUsageError::InvalidInputOptionValue {
+            option: "--capture-timeout-ms",
+            value: value.to_string(),
+            reason: "expected a positive integer number of milliseconds".to_string(),
+        })?;
+    if timeout_ms == 0 || timeout_ms > MAX_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS {
+        return Err(CliUsageError::InvalidInputOptionValue {
+            option: "--capture-timeout-ms",
+            value: value.to_string(),
+            reason: format!("expected 1..={MAX_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS} milliseconds"),
+        });
+    }
+
+    Ok(timeout_ms)
+}
+
 fn normalize_edge_binding_arg(value: &str) -> Result<String, CliUsageError> {
     let parts = value.split(':').collect::<Vec<_>>();
     if parts.len() != 3 {
@@ -1400,6 +1501,7 @@ fn format_daemon_command_line(options: &DaemonArgsOptions) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliUsageError {
     MissingEndpointValue,
+    MissingInputOptionValue(&'static str),
     MissingDaemonOptionValue(&'static str),
     MissingIdentityOptionValue(&'static str),
     MissingSessionOptionValue(&'static str),
@@ -1409,6 +1511,7 @@ enum CliUsageError {
     MissingSessionConnectPeerId,
     MissingSessionConnectLocalDeviceId,
     MissingSessionConnectAddress,
+    DuplicateInputOption(&'static str),
     DuplicateDaemonOption(&'static str),
     DuplicateIdentityOption(&'static str),
     PeerTransportRequiresIdentityStore,
@@ -1423,7 +1526,13 @@ enum CliUsageError {
         value: String,
         reason: String,
     },
+    InvalidInputOptionValue {
+        option: &'static str,
+        value: String,
+        reason: String,
+    },
     UnknownEndpointOption(String),
+    UnknownInputOption(String),
     UnknownIdentityOption(String),
     UnknownSessionOption(String),
     UnknownDaemonArgsOption(String),
@@ -1439,6 +1548,9 @@ impl Display for CliUsageError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingEndpointValue => formatter.write_str("missing value for --endpoint"),
+            Self::MissingInputOptionValue(option) => {
+                write!(formatter, "missing value for {option}")
+            }
             Self::MissingDaemonOptionValue(option) => {
                 write!(formatter, "missing value for {option}")
             }
@@ -1466,6 +1578,9 @@ impl Display for CliUsageError {
             Self::MissingSessionConnectAddress => {
                 formatter.write_str("session connect requires --address")
             }
+            Self::DuplicateInputOption(option) => {
+                write!(formatter, "{option} can only be provided once")
+            }
             Self::DuplicateDaemonOption(option) => {
                 write!(formatter, "{option} can only be provided once")
             }
@@ -1490,8 +1605,18 @@ impl Display for CliUsageError {
             } => {
                 write!(formatter, "invalid value for {option}: {value} ({reason})")
             }
+            Self::InvalidInputOptionValue {
+                option,
+                value,
+                reason,
+            } => {
+                write!(formatter, "invalid value for {option}: {value} ({reason})")
+            }
             Self::UnknownEndpointOption(argument) => {
                 write!(formatter, "unknown endpoint option: {argument}")
+            }
+            Self::UnknownInputOption(argument) => {
+                write!(formatter, "unknown input option: {argument}")
             }
             Self::UnknownIdentityOption(argument) => {
                 write!(formatter, "unknown identity option: {argument}")
@@ -1577,22 +1702,25 @@ mod tests {
 
     use super::{
         CliRuntimeError, CliUsageError, DaemonArgsOptions, EndpointOptions, IdentityForgetOptions,
-        IdentityListOptions, IdentityShowOptions, IdentityTrustOptions, LOCAL_REQUEST_ID,
-        METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
-        METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
-        METHOD_SESSION_DISCOVERY_CANDIDATES, SessionConnectOptions,
-        build_daemon_client_with_resolver, build_pairing_identity_document,
+        IdentityListOptions, IdentityShowOptions, IdentityTrustOptions, InputSmokeTestOptions,
+        LOCAL_REQUEST_ID, METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_STATUS,
+        METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
+        METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES,
+        SessionConnectOptions, build_daemon_client_with_resolver, build_pairing_identity_document,
         daemon_logs_tail_request, daemon_status_request, default_pairing_capabilities,
         diagnostics_keyboard_layout_request, diagnostics_screen_topology_request,
         forget_trusted_peer_identity, format_daemon_call_error, format_daemon_command_line,
-        input_release_all_request, list_trusted_peer_identities, parse_daemon_args_options,
-        parse_endpoint_options, parse_identity_forget_options, parse_identity_list_options,
-        parse_identity_show_options, parse_identity_trust_options, parse_json_rpc_response,
-        parse_session_connect_options, permissions_probe_request,
-        session_discovery_candidates_request, trust_pairing_identity_document,
+        input_release_all_request, input_smoke_test_request, list_trusted_peer_identities,
+        parse_daemon_args_options, parse_endpoint_options, parse_identity_forget_options,
+        parse_identity_list_options, parse_identity_show_options, parse_identity_trust_options,
+        parse_input_smoke_test_options, parse_json_rpc_response, parse_session_connect_options,
+        permissions_probe_request, session_discovery_candidates_request,
+        trust_pairing_identity_document,
     };
     use akraz_ipc::{
-        JSONRPC_ERROR_PARSE, JSONRPC_VERSION, METHOD_INPUT_RELEASE_ALL, METHOD_PERMISSIONS_PROBE,
+        DEFAULT_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS, JSONRPC_ERROR_PARSE, JSONRPC_VERSION,
+        MAX_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS, METHOD_INPUT_RELEASE_ALL, METHOD_INPUT_SMOKE_TEST,
+        METHOD_PERMISSIONS_PROBE,
     };
 
     fn monitor_snapshots() -> Vec<DiagnosticsMonitorSnapshot> {
@@ -1649,6 +1777,59 @@ mod tests {
         assert_eq!(
             parse_endpoint_options(["--bad"].map(String::from)),
             Err(CliUsageError::UnknownEndpointOption("--bad".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_input_smoke_test_options_with_endpoint_and_timeout() {
+        assert_eq!(
+            parse_input_smoke_test_options(
+                ["--endpoint", "local-test", "--capture-timeout-ms", "250",].map(String::from)
+            ),
+            Ok(InputSmokeTestOptions {
+                endpoint: Some(IpcEndpoint {
+                    kind: IpcEndpointKind::Manual,
+                    address: "local-test".to_string(),
+                }),
+                capture_timeout_ms: 250,
+            })
+        );
+        assert_eq!(
+            parse_input_smoke_test_options(Vec::<String>::new()),
+            Ok(InputSmokeTestOptions {
+                endpoint: None,
+                capture_timeout_ms: DEFAULT_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_input_smoke_test_options() {
+        assert_eq!(
+            parse_input_smoke_test_options(["--capture-timeout-ms"].map(String::from)),
+            Err(CliUsageError::MissingInputOptionValue(
+                "--capture-timeout-ms"
+            ))
+        );
+        assert_eq!(
+            parse_input_smoke_test_options(["--capture-timeout-ms=0"].map(String::from)),
+            Err(CliUsageError::InvalidInputOptionValue {
+                option: "--capture-timeout-ms",
+                value: "0".to_string(),
+                reason: format!(
+                    "expected 1..={MAX_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS} milliseconds"
+                ),
+            })
+        );
+        assert_eq!(
+            parse_input_smoke_test_options(
+                ["--capture-timeout-ms=1", "--capture-timeout-ms=2"].map(String::from)
+            ),
+            Err(CliUsageError::DuplicateInputOption("--capture-timeout-ms"))
+        );
+        assert_eq!(
+            parse_input_smoke_test_options(["--bad"].map(String::from)),
+            Err(CliUsageError::UnknownInputOption("--bad".to_string()))
         );
     }
 
@@ -2225,6 +2406,15 @@ mod tests {
 
         assert_eq!(request.id, LOCAL_REQUEST_ID);
         assert_eq!(request.method, METHOD_INPUT_RELEASE_ALL);
+    }
+
+    #[test]
+    fn input_smoke_test_request_uses_input_smoke_test_ipc_method() {
+        let request = input_smoke_test_request(250);
+
+        assert_eq!(request.id, LOCAL_REQUEST_ID);
+        assert_eq!(request.method, METHOD_INPUT_SMOKE_TEST);
+        assert_eq!(request.params.capture_timeout_ms, 250);
     }
 
     #[test]

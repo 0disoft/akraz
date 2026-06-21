@@ -13,12 +13,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
 authors = ["Akraz contributors"]
-repository = "https://github.com/akraz/akraz"
+repository = "https://github.com/0disoft/akraz"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

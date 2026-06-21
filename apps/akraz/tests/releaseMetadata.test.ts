@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   evaluateReleaseMetadataVersions,
   parseCargoLockPackages,
+  parseCargoWorkspacePackageRepository,
   parseCargoWorkspacePackageVersion,
 } from "../scripts/verify-release-metadata.mjs";
 
@@ -21,6 +22,7 @@ const releaseMetadataFixture = {
   appPackageVersion: "0.4.69",
   tauriConfigVersion: "0.4.69",
   cargoWorkspaceVersion: "0.4.69",
+  cargoWorkspaceRepository: "https://github.com/0disoft/akraz",
   cargoLockPackages: [
     { name: "akraz-app", version: "0.4.69" },
     { name: "akraz-core", version: "0.4.69" },
@@ -62,6 +64,7 @@ describe("release metadata verification", () => {
       appPackageVersion: "next",
       tauriConfigVersion: "next",
       cargoWorkspaceVersion: undefined,
+      cargoWorkspaceRepository: undefined,
       cargoLockPackages: [],
     });
 
@@ -72,7 +75,23 @@ describe("release metadata verification", () => {
       "invalid",
       "missing",
       "missing",
+      "missing",
     ]);
+  });
+
+  test("reports mismatched Cargo workspace repository metadata", () => {
+    const report = evaluateReleaseMetadataVersions({
+      ...releaseMetadataFixture,
+      cargoWorkspaceRepository: "https://github.com/akraz/akraz",
+    });
+    const repositoryCheck = report.checks.find((check) => check.id === "cargoWorkspaceRepository");
+
+    expect(report.ready).toBe(false);
+    expect(repositoryCheck).toMatchObject({
+      status: "mismatch",
+      expectedValue: "https://github.com/0disoft/akraz",
+      actualValue: "https://github.com/akraz/akraz",
+    });
   });
 
   test("parses Cargo workspace package version", () => {
@@ -86,6 +105,19 @@ version = "0.4.69"
 edition = "2024"
 `),
     ).toBe("0.4.69");
+  });
+
+  test("parses Cargo workspace package repository", () => {
+    expect(
+      parseCargoWorkspacePackageRepository(`
+[workspace]
+members = []
+
+[workspace.package]
+version = "0.4.69"
+repository = "https://github.com/0disoft/akraz"
+`),
+    ).toBe("https://github.com/0disoft/akraz");
   });
 
   test("parses Akraz packages from Cargo.lock", () => {
@@ -121,7 +153,7 @@ version = "0.4.69"
     expect(result.status).toBe(0);
     expect(report.ready).toBe(true);
     expect(report.schemaVersion).toBe("akraz.releaseMetadata/v1");
-    expect(report.expectedVersion).toBe("0.13.0");
+    expect(report.expectedVersion).toBe("0.14.0");
     expect(report.checks.every((check) => check.status === "pass")).toBe(true);
   });
 });

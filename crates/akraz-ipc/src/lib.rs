@@ -80,6 +80,9 @@ pub const METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT: &str = "diagnostics.keyboardLayout
 /// JSON-RPC method for emergency input release and local-control recovery.
 pub const METHOD_INPUT_RELEASE_ALL: &str = "input.releaseAll";
 
+/// JSON-RPC method for local input capture/injection smoke testing.
+pub const METHOD_INPUT_SMOKE_TEST: &str = "input.smokeTest";
+
 /// JSON-RPC method for starting a local peer pairing confirmation.
 pub const METHOD_PAIRING_START: &str = "pairing.start";
 
@@ -796,6 +799,7 @@ pub enum IpcRequest {
     DiagnosticsScreenTopology(JsonRpcRequest<DiagnosticsScreenTopologyParams>),
     DiagnosticsKeyboardLayout(JsonRpcRequest<DiagnosticsKeyboardLayoutParams>),
     InputReleaseAll(JsonRpcRequest<InputReleaseAllParams>),
+    InputSmokeTest(JsonRpcRequest<InputSmokeTestParams>),
     PairingStart(JsonRpcRequest<PairingStartParams>),
     PairingAccept(JsonRpcRequest<PairingAcceptParams>),
     PairingReject(JsonRpcRequest<PairingRejectParams>),
@@ -816,6 +820,7 @@ impl IpcRequest {
             Self::DiagnosticsScreenTopology(request) => &request.id,
             Self::DiagnosticsKeyboardLayout(request) => &request.id,
             Self::InputReleaseAll(request) => &request.id,
+            Self::InputSmokeTest(request) => &request.id,
             Self::PairingStart(request) => &request.id,
             Self::PairingAccept(request) => &request.id,
             Self::PairingReject(request) => &request.id,
@@ -836,6 +841,7 @@ impl IpcRequest {
             Self::DiagnosticsScreenTopology(request) => &request.method,
             Self::DiagnosticsKeyboardLayout(request) => &request.method,
             Self::InputReleaseAll(request) => &request.method,
+            Self::InputSmokeTest(request) => &request.method,
             Self::PairingStart(request) => &request.method,
             Self::PairingAccept(request) => &request.method,
             Self::PairingReject(request) => &request.method,
@@ -956,6 +962,32 @@ pub struct DiagnosticsKeyboardLayoutParams {}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputReleaseAllParams {}
+
+/// Default local capture wait used by `input.smokeTest`.
+pub const DEFAULT_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS: u64 = 1_500;
+
+/// Maximum local capture wait accepted by `input.smokeTest`.
+pub const MAX_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS: u64 = 10_000;
+
+/// Params for `input.smokeTest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputSmokeTestParams {
+    #[serde(default = "default_input_smoke_test_capture_timeout_ms")]
+    pub capture_timeout_ms: u64,
+}
+
+impl Default for InputSmokeTestParams {
+    fn default() -> Self {
+        Self {
+            capture_timeout_ms: DEFAULT_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS,
+        }
+    }
+}
+
+fn default_input_smoke_test_capture_timeout_ms() -> u64 {
+    DEFAULT_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS
+}
 
 /// Params for `pairing.start`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1354,6 +1386,28 @@ pub struct DiagnosticsPrivacySnapshot {
 pub struct InputReleaseAllResult {
     pub released: bool,
     pub mode: ControlModeSnapshot,
+}
+
+/// `input.smokeTest` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputSmokeTestResult {
+    pub adapter_name: String,
+    pub capabilities: IpcPlatformCapabilities,
+    pub capture_timeout_ms: u64,
+    pub capture_started: bool,
+    pub captured_event_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_error: Option<String>,
+    pub injection_attempted: bool,
+    pub injected_event_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub injection_error: Option<String>,
+    pub release_all_attempts: u64,
+    pub release_all_idempotent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_all_error: Option<String>,
+    pub ready: bool,
 }
 
 /// `pairing.start` result.
@@ -1782,6 +1836,7 @@ pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
             parse_typed_request(raw).map(IpcRequest::DiagnosticsKeyboardLayout)
         }
         METHOD_INPUT_RELEASE_ALL => parse_typed_request(raw).map(IpcRequest::InputReleaseAll),
+        METHOD_INPUT_SMOKE_TEST => parse_typed_request(raw).map(IpcRequest::InputSmokeTest),
         METHOD_PAIRING_START => parse_typed_request(raw).map(IpcRequest::PairingStart),
         METHOD_PAIRING_ACCEPT => parse_typed_request(raw).map(IpcRequest::PairingAccept),
         METHOD_PAIRING_REJECT => parse_typed_request(raw).map(IpcRequest::PairingReject),
@@ -1849,19 +1904,20 @@ mod tests {
         LocalIpcClient, LocalIpcServer, LogicalPointSnapshot, LogicalRectSnapshot,
         METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS,
         METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
-        METHOD_INPUT_RELEASE_ALL, METHOD_PAIRING_ACCEPT, METHOD_PAIRING_REJECT,
-        METHOD_PAIRING_START, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
-        METHOD_SESSION_DISCOVERY_CANDIDATES, METHOD_SESSION_PROBE_MANUAL_CANDIDATE,
-        OsLocalIpcClient, PairingAcceptParams, PairingAcceptResult, PairingRejectParams,
-        PairingRejectResult, PairingStartParams, PairingStartResult, PeerStatus, PermissionIssue,
-        PermissionsProbe, ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult,
-        SessionDisconnectParams, SessionDisconnectResult, SessionDiscoveryCandidate,
-        SessionDiscoveryCandidatesParams, SessionDiscoveryCandidatesResult,
-        SessionProbeManualCandidateParams, SessionProbeManualCandidateResult, SessionStatus,
-        build_diagnostics_latency_histogram, build_diagnostics_snapshot,
-        build_diagnostics_support_bundle, build_diagnostics_support_bundle_with_previous_crash,
-        call_json_rpc, diagnostics_session_type_from_values, parse_request_line,
-        resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
+        METHOD_INPUT_RELEASE_ALL, METHOD_INPUT_SMOKE_TEST, METHOD_PAIRING_ACCEPT,
+        METHOD_PAIRING_REJECT, METHOD_PAIRING_START, METHOD_SESSION_CONNECT,
+        METHOD_SESSION_DISCONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES,
+        METHOD_SESSION_PROBE_MANUAL_CANDIDATE, OsLocalIpcClient, PairingAcceptParams,
+        PairingAcceptResult, PairingRejectParams, PairingRejectResult, PairingStartParams,
+        PairingStartResult, PeerStatus, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
+        SessionConnectParams, SessionConnectResult, SessionDisconnectParams,
+        SessionDisconnectResult, SessionDiscoveryCandidate, SessionDiscoveryCandidatesParams,
+        SessionDiscoveryCandidatesResult, SessionProbeManualCandidateParams,
+        SessionProbeManualCandidateResult, SessionStatus, build_diagnostics_latency_histogram,
+        build_diagnostics_snapshot, build_diagnostics_support_bundle,
+        build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
+        diagnostics_session_type_from_values, parse_request_line, resolve_default_endpoint,
+        serve_os_local_ipc_once, to_json_line,
     };
     use akraz_protocol::CapabilityFlags;
     use serde_json::json;
@@ -3241,6 +3297,66 @@ mod tests {
             parse_request_line(&line),
             Ok(IpcRequest::InputReleaseAll(request))
         );
+    }
+
+    #[test]
+    fn input_smoke_test_request_and_response_use_camel_case_contract() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_INPUT_SMOKE_TEST,
+            super::InputSmokeTestParams {
+                capture_timeout_ms: 250,
+            },
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line)
+                .expect("request JSON")
+                .get("params")
+                .expect("params")
+                .get("captureTimeoutMs")
+                .and_then(serde_json::Value::as_u64),
+            Some(250)
+        );
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(IpcRequest::InputSmokeTest(request))
+        );
+
+        let response = JsonRpcSuccess::new(
+            "req_1",
+            super::InputSmokeTestResult {
+                adapter_name: "fake".to_string(),
+                capabilities: IpcPlatformCapabilities {
+                    can_capture_pointer: true,
+                    can_capture_keyboard: true,
+                    can_inject_pointer: true,
+                    can_inject_keyboard: true,
+                },
+                capture_timeout_ms: 250,
+                capture_started: true,
+                captured_event_count: 2,
+                capture_error: None,
+                injection_attempted: true,
+                injected_event_count: 1,
+                injection_error: None,
+                release_all_attempts: 2,
+                release_all_idempotent: true,
+                release_all_error: None,
+                ready: true,
+            },
+        );
+        let encoded = serde_json::to_value(response).expect("response JSON");
+
+        assert_eq!(encoded["result"]["adapterName"], "fake");
+        assert_eq!(encoded["result"]["captureTimeoutMs"], 250);
+        assert_eq!(encoded["result"]["capturedEventCount"], 2);
+        assert_eq!(encoded["result"]["releaseAllIdempotent"], true);
+        assert_eq!(encoded["result"]["ready"], true);
     }
 
     #[test]

@@ -28,8 +28,9 @@ use akraz_identity::{
 use akraz_ipc::{
     ControlModeSnapshot, DaemonLogEntry, DaemonLogLevel, DaemonLogsTail, DaemonShutdownResult,
     DaemonStatus, DiagnosticsKeyboardLayout, DiagnosticsScreenTopology, InputReleaseAllResult,
-    IpcCodecError, IpcPlatformCapabilities, IpcRequest, IpcTransportError, JsonRpcError,
-    JsonRpcFailure, JsonRpcSuccess, LocalIpcServer, PairingAcceptParams, PairingAcceptResult,
+    InputSmokeTestParams, InputSmokeTestResult, IpcCodecError, IpcPlatformCapabilities, IpcRequest,
+    IpcTransportError, JsonRpcError, JsonRpcFailure, JsonRpcSuccess, LocalIpcServer,
+    MAX_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS, PairingAcceptParams, PairingAcceptResult,
     PairingRejectParams, PairingRejectResult, PairingStartParams, PairingStartResult, PeerStatus,
     PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectParams,
     SessionConnectResult, SessionDisconnectResult, SessionDiscoveryCandidate,
@@ -4053,6 +4054,32 @@ fn handle_ipc_request(
                 }
             }
         }
+        IpcRequest::InputSmokeTest(request) => match run_input_smoke_test(platform, request.params)
+        {
+            Ok(result) => {
+                let level = if result.ready {
+                    DaemonLogLevel::Info
+                } else {
+                    DaemonLogLevel::Warn
+                };
+                record_daemon_event(
+                    logs,
+                    level,
+                    "input.smokeTest",
+                    "Input smoke test requested.",
+                );
+                encode_response(&JsonRpcSuccess::new(request.id, result))
+            }
+            Err(error) => {
+                record_daemon_event(
+                    logs,
+                    DaemonLogLevel::Error,
+                    "input.smokeTest.failed",
+                    "Input smoke test failed.",
+                );
+                encode_platform_error(request.id, "input smoke test unavailable", error)
+            }
+        },
         IpcRequest::PairingStart(request) => match peer_sessions.start_pairing(&request.params) {
             Ok(result) => {
                 record_daemon_event(
@@ -4389,6 +4416,112 @@ pub fn recover_local_control_and_release_inputs(
     })
 }
 
+/// Run a bounded local input capture/injection smoke test through the selected platform adapter.
+pub fn run_input_smoke_test(
+    platform: &impl PlatformAdapter,
+    params: InputSmokeTestParams,
+) -> Result<InputSmokeTestResult, PlatformError> {
+    let capabilities = platform.probe_capabilities()?;
+    let capture_timeout_ms = normalize_input_smoke_test_capture_timeout_ms(params);
+    let (capture_started, captured_event_count, capture_error) =
+        run_input_smoke_test_capture(platform, Duration::from_millis(capture_timeout_ms));
+    let (injection_attempted, injected_event_count, injection_error) =
+        run_input_smoke_test_injection(platform);
+    let (release_all_attempts, release_all_idempotent, release_all_error) =
+        run_input_smoke_test_release_all(platform);
+    let ready = capture_started
+        && captured_event_count > 0
+        && capture_error.is_none()
+        && injection_error.is_none()
+        && release_all_idempotent;
+
+    Ok(InputSmokeTestResult {
+        adapter_name: platform.name().to_string(),
+        capabilities: IpcPlatformCapabilities::from(capabilities),
+        capture_timeout_ms,
+        capture_started,
+        captured_event_count,
+        capture_error,
+        injection_attempted,
+        injected_event_count,
+        injection_error,
+        release_all_attempts,
+        release_all_idempotent,
+        release_all_error,
+        ready,
+    })
+}
+
+fn normalize_input_smoke_test_capture_timeout_ms(params: InputSmokeTestParams) -> u64 {
+    params
+        .capture_timeout_ms
+        .min(MAX_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS)
+}
+
+fn run_input_smoke_test_capture(
+    platform: &impl PlatformAdapter,
+    timeout: Duration,
+) -> (bool, u64, Option<String>) {
+    let capture_session = match platform.start_input_capture(InputCaptureConfig::default()) {
+        Ok(session) => session,
+        Err(error) => return (false, 0, Some(error.to_string())),
+    };
+    let captured_event_count = count_input_smoke_test_capture_events(&capture_session, timeout);
+    let stop_error = capture_session.stop().err().map(|error| error.to_string());
+
+    (true, captured_event_count, stop_error)
+}
+
+fn count_input_smoke_test_capture_events(session: &InputCaptureSession, timeout: Duration) -> u64 {
+    let started = Instant::now();
+    let mut captured_event_count = 0;
+
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return captured_event_count;
+        }
+        let remaining = timeout.saturating_sub(elapsed);
+        let poll_timeout = remaining.min(DEFAULT_CAPTURE_IDLE_POLL_INTERVAL);
+
+        match session.recv_timeout(poll_timeout) {
+            Ok(_) => {
+                captured_event_count += 1;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return captured_event_count,
+        }
+    }
+}
+
+fn run_input_smoke_test_injection(platform: &impl PlatformAdapter) -> (bool, u64, Option<String>) {
+    match platform.inject_input(&InjectedInputEvent::PointerMoved {
+        delta_x: 0,
+        delta_y: 0,
+    }) {
+        Ok(()) => (true, 1, None),
+        Err(error) => (true, 0, Some(error.to_string())),
+    }
+}
+
+fn run_input_smoke_test_release_all(
+    platform: &impl PlatformAdapter,
+) -> (u64, bool, Option<String>) {
+    let mut attempts = 0;
+    let mut release_all_error = None;
+
+    for _ in 0..2 {
+        attempts += 1;
+        if let Err(error) = platform.release_all()
+            && release_all_error.is_none()
+        {
+            release_all_error = Some(error.to_string());
+        }
+    }
+
+    (attempts, release_all_error.is_none(), release_all_error)
+}
+
 fn recovery_transition_error(error: CoreTransitionError) -> PlatformError {
     PlatformError::new(format!("failed to recover local control: {error}"))
 }
@@ -4490,12 +4623,13 @@ mod tests {
         ControlModeSnapshot, DaemonLogLevel, DaemonLogsTail, DaemonLogsTailParams,
         DaemonShutdownParams, DaemonShutdownResult, DaemonStatus, DaemonStatusParams,
         DiagnosticsKeyboardLayout, DiagnosticsKeyboardLayoutParams, DiagnosticsScreenTopology,
-        DiagnosticsScreenTopologyParams, InputReleaseAllParams, InputReleaseAllResult, IpcEndpoint,
-        IpcPlatformCapabilities, JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer,
-        METHOD_DAEMON_LOGS_TAIL, METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS,
-        METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
-        METHOD_INPUT_RELEASE_ALL, METHOD_PAIRING_ACCEPT, METHOD_PAIRING_START,
-        METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES,
+        DiagnosticsScreenTopologyParams, InputReleaseAllParams, InputReleaseAllResult,
+        InputSmokeTestParams, InputSmokeTestResult, IpcEndpoint, IpcPlatformCapabilities,
+        JsonRpcFailure, JsonRpcRequest, JsonRpcSuccess, LocalIpcServer, METHOD_DAEMON_LOGS_TAIL,
+        METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
+        METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_INPUT_SMOKE_TEST,
+        METHOD_PAIRING_ACCEPT, METHOD_PAIRING_START, METHOD_PERMISSIONS_PROBE,
+        METHOD_SESSION_CONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES,
         METHOD_SESSION_PROBE_MANUAL_CANDIDATE, OsLocalIpcClient, PairingAcceptParams,
         PairingAcceptResult, PairingRejectParams, PairingRejectResult, PairingStartParams,
         PairingStartResult, PeerStatus, PermissionsProbe, PermissionsProbeParams,
@@ -4538,8 +4672,8 @@ mod tests {
         handle_ipc_request_line, input_capture_policy_for_control_mode,
         inspect_runtime_environment_and_recover, probe_peer_identity_document,
         recover_local_control_and_release_inputs, recover_runtime_after_system_resume_and_dispatch,
-        serve_daemon_ipc, serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
-        serve_tcp_peer_transport_session_and_execute,
+        run_input_smoke_test, serve_daemon_ipc, serve_tcp_peer_transport_commands,
+        serve_tcp_peer_transport_session, serve_tcp_peer_transport_session_and_execute,
         serve_tcp_peer_transport_session_and_execute_until_closed,
         serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout,
         shared_daemon_log_buffer, shared_runtime_state, start_daemon_input_capture,
@@ -7957,6 +8091,125 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn input_smoke_test_reports_capture_injection_and_idempotent_release() {
+        let platform = FakePlatformAdapter::default().with_captured_events([
+            CapturedInputEvent::PointerMoved {
+                delta_x: 8,
+                delta_y: 2,
+            },
+            CapturedInputEvent::MouseButton {
+                button: MouseButton::Left,
+                state: PressState::Pressed,
+            },
+        ]);
+
+        let report = run_input_smoke_test(
+            &platform,
+            InputSmokeTestParams {
+                capture_timeout_ms: 25,
+            },
+        )
+        .expect("input smoke test report");
+
+        assert_eq!(
+            report,
+            InputSmokeTestResult {
+                adapter_name: "fake".to_string(),
+                capabilities: IpcPlatformCapabilities {
+                    can_capture_pointer: true,
+                    can_capture_keyboard: true,
+                    can_inject_pointer: true,
+                    can_inject_keyboard: true,
+                },
+                capture_timeout_ms: 25,
+                capture_started: true,
+                captured_event_count: 2,
+                capture_error: None,
+                injection_attempted: true,
+                injected_event_count: 1,
+                injection_error: None,
+                release_all_attempts: 2,
+                release_all_idempotent: true,
+                release_all_error: None,
+                ready: true,
+            }
+        );
+        assert_eq!(
+            platform.injected_events().expect("injected events"),
+            vec![InjectedInputEvent::PointerMoved {
+                delta_x: 0,
+                delta_y: 0,
+            }]
+        );
+        assert_eq!(platform.release_all_count(), Ok(2));
+    }
+
+    #[test]
+    fn input_smoke_test_clamps_capture_timeout_and_marks_missing_capture_unready() {
+        let platform = FakePlatformAdapter::default();
+
+        let report = run_input_smoke_test(
+            &platform,
+            InputSmokeTestParams {
+                capture_timeout_ms: akraz_ipc::MAX_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS + 1,
+            },
+        )
+        .expect("input smoke test report");
+
+        assert_eq!(
+            report.capture_timeout_ms,
+            akraz_ipc::MAX_INPUT_SMOKE_TEST_CAPTURE_TIMEOUT_MS
+        );
+        assert!(report.capture_started);
+        assert_eq!(report.captured_event_count, 0);
+        assert_eq!(report.injected_event_count, 1);
+        assert!(report.release_all_idempotent);
+        assert!(!report.ready);
+    }
+
+    #[test]
+    fn daemon_ipc_server_handles_input_smoke_test_request() {
+        let state = shared_runtime_state(RuntimeInputState::new());
+        let platform = FakePlatformAdapter::default().with_captured_events([
+            CapturedInputEvent::PointerMoved {
+                delta_x: 4,
+                delta_y: 1,
+            },
+        ]);
+        let server = DaemonIpcServer::from_shared_state(state, platform);
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_INPUT_SMOKE_TEST,
+            InputSmokeTestParams {
+                capture_timeout_ms: 25,
+            },
+        );
+        let request_line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        let response_line = match server.handle_request_line(&request_line) {
+            Ok(line) => line,
+            Err(error) => panic!("expected daemon smoke-test response: {error}"),
+        };
+        let response: JsonRpcSuccess<InputSmokeTestResult> =
+            match serde_json::from_str(&response_line) {
+                Ok(response) => response,
+                Err(error) => panic!("expected smoke-test response JSON: {error}"),
+            };
+
+        assert_eq!(response.id, "req_1");
+        assert_eq!(response.result.adapter_name, "fake");
+        assert_eq!(response.result.capture_timeout_ms, 25);
+        assert_eq!(response.result.captured_event_count, 1);
+        assert_eq!(response.result.injected_event_count, 1);
+        assert_eq!(response.result.release_all_attempts, 2);
+        assert!(response.result.release_all_idempotent);
+        assert!(response.result.ready);
     }
 
     #[test]
