@@ -32,7 +32,7 @@ use std::thread;
 use std::thread::JoinHandle;
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 #[cfg(windows)]
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
@@ -53,20 +53,30 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VK_BACK, VK_LCONTROL, VK_LMENU,
-    VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VK_BACK, VK_CONTROL, VK_LCONTROL,
+    VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+};
+#[cfg(windows)]
+use windows_sys::Win32::UI::Input::{
+    GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+    RAWKEYBOARD, RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
+    RegisterRawInputDevices,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
-    GetWindowThreadProcessId, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED,
-    LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT,
-    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WINDOWS_HOOK_ID, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    XBUTTON1, XBUTTON2,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+    GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, HHOOK,
+    HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED,
+    LLMHF_LOWER_IL_INJECTED, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW,
+    PostThreadMessageW, RI_KEY_BREAK, RI_KEY_E0, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP,
+    RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, RI_MOUSE_HWHEEL, RI_MOUSE_LEFT_BUTTON_DOWN,
+    RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP,
+    RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, RI_MOUSE_WHEEL, RegisterClassW,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOWS_HOOK_ID, WM_INPUT,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, XBUTTON1, XBUTTON2,
 };
 #[cfg(windows)]
 use windows_sys::core::BOOL;
@@ -737,7 +747,9 @@ thread_local! {
 struct WindowsCaptureThreadState {
     sender: Option<SyncSender<CapturedInputEvent>>,
     policy: Option<SharedInputCapturePolicy>,
+    raw_input_enabled: bool,
     last_pointer: Option<(i32, i32)>,
+    last_raw_absolute_pointer: Option<(i32, i32)>,
 }
 
 #[cfg(windows)]
@@ -792,7 +804,9 @@ fn run_windows_input_capture_thread(
         let mut state = state.borrow_mut();
         state.sender = Some(sender);
         state.policy = Some(policy);
+        state.raw_input_enabled = false;
         state.last_pointer = None;
+        state.last_raw_absolute_pointer = None;
     });
 
     let result = run_windows_input_capture_message_loop(thread_id, &ready);
@@ -801,7 +815,9 @@ fn run_windows_input_capture_thread(
         let mut state = state.borrow_mut();
         state.sender = None;
         state.policy = None;
+        state.raw_input_enabled = false;
         state.last_pointer = None;
+        state.last_raw_absolute_pointer = None;
     });
 
     if let Err(error) = result {
@@ -816,6 +832,12 @@ fn run_windows_input_capture_message_loop(
 ) -> Result<(), PlatformError> {
     let _input_desktop = InputDesktopHandle::open_for_hook_probe()
         .ok_or_else(|| PlatformError::new("failed to open input desktop for capture"))?;
+    let _hidden_window = WindowsHiddenMessageWindow::create()?;
+    register_windows_raw_input(_hidden_window.hwnd())?;
+    WINDOWS_CAPTURE_STATE.with(|state| {
+        state.borrow_mut().raw_input_enabled = true;
+    });
+
     let _mouse_hook = LowLevelHookHandle::install(WH_MOUSE_LL)
         .ok_or_else(|| PlatformError::new("failed to install low-level mouse hook"))?;
     let _keyboard_hook = LowLevelHookHandle::install(WH_KEYBOARD_LL)
@@ -833,7 +855,151 @@ fn run_windows_input_capture_message_loop(
         if result == 0 || message.message == WM_QUIT {
             return Ok(());
         }
+        // SAFETY: message was returned by GetMessageW and is dispatched on the same thread.
+        unsafe {
+            DispatchMessageW(&message);
+        }
     }
+}
+
+#[cfg(windows)]
+const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
+#[cfg(windows)]
+const HID_USAGE_GENERIC_MOUSE: u16 = 0x02;
+#[cfg(windows)]
+const HID_USAGE_GENERIC_KEYBOARD: u16 = 0x06;
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsHiddenMessageWindow {
+    hwnd: HWND,
+}
+
+#[cfg(windows)]
+impl WindowsHiddenMessageWindow {
+    fn create() -> Result<Self, PlatformError> {
+        let class_name = windows_capture_window_class_name();
+        // SAFETY: A null module name asks Windows for the module handle of this process image.
+        let module = unsafe { GetModuleHandleW(null()) };
+        if module.is_null() {
+            return Err(PlatformError::new(
+                "failed to load module handle for raw input window",
+            ));
+        }
+
+        let window_class = WNDCLASSW {
+            lpfnWndProc: Some(windows_raw_input_window_proc),
+            hInstance: module,
+            lpszClassName: class_name.as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: window_class contains a stable class-name pointer for the duration of this call.
+        unsafe {
+            RegisterClassW(&window_class);
+        }
+
+        // SAFETY: class_name is a null-terminated UTF-16 string. HWND_MESSAGE creates a
+        // message-only hidden window on this thread. The HWND is owned by WindowsHiddenMessageWindow.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                class_name.as_ptr(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                null_mut(),
+                module,
+                null(),
+            )
+        };
+        if hwnd.is_null() {
+            Err(PlatformError::new(
+                "failed to create hidden raw input message window",
+            ))
+        } else {
+            Ok(Self { hwnd })
+        }
+    }
+
+    fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsHiddenMessageWindow {
+    fn drop(&mut self) {
+        // SAFETY: self.hwnd is a non-null HWND created by CreateWindowExW and owned by this wrapper.
+        unsafe {
+            DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_capture_window_class_name() -> Vec<u16> {
+    "AkrazRawInputCaptureWindow\0".encode_utf16().collect()
+}
+
+#[cfg(windows)]
+fn register_windows_raw_input(hwnd: HWND) -> Result<(), PlatformError> {
+    let devices = windows_raw_input_devices(hwnd);
+    // SAFETY: devices points to two initialized RAWINPUTDEVICE records and cbSize matches the ABI.
+    let registered = unsafe {
+        RegisterRawInputDevices(
+            devices.as_ptr(),
+            devices.len() as u32,
+            size_of::<RAWINPUTDEVICE>() as u32,
+        )
+    };
+
+    if registered == 0 {
+        Err(PlatformError::new(
+            "failed to register Windows raw input devices",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn windows_raw_input_devices(hwnd: HWND) -> [RAWINPUTDEVICE; 2] {
+    [
+        RAWINPUTDEVICE {
+            usUsagePage: HID_USAGE_PAGE_GENERIC,
+            usUsage: HID_USAGE_GENERIC_MOUSE,
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd,
+        },
+        RAWINPUTDEVICE {
+            usUsagePage: HID_USAGE_PAGE_GENERIC,
+            usUsage: HID_USAGE_GENERIC_KEYBOARD,
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd,
+        },
+    ]
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn windows_raw_input_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_INPUT {
+        forward_captured_raw_input(lparam);
+        // SAFETY: WM_INPUT still flows through DefWindowProcW after Akraz consumes the
+        // raw payload so Windows can complete its normal message cleanup path.
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+    }
+
+    // SAFETY: Unhandled messages are delegated to the system default window procedure.
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
 #[cfg(windows)]
@@ -958,15 +1124,266 @@ fn forward_captured_windows_event(wparam: WPARAM, lparam: LPARAM) -> bool {
         let Some(capture) = windows_capture_from_hook(wparam as u32, lparam, &mut state) else {
             return false;
         };
-        let Some(sender) = state.sender.as_ref() else {
-            return capture.consume;
-        };
-
-        match sender.try_send(capture.event) {
-            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        if !state.raw_input_enabled
+            && let Some(sender) = state.sender.as_ref()
+        {
+            try_send_captured_input_event(sender, capture.event);
         }
+
         capture.consume
     })
+}
+
+#[cfg(windows)]
+fn try_send_captured_input_event(
+    sender: &SyncSender<CapturedInputEvent>,
+    event: CapturedInputEvent,
+) {
+    match sender.try_send(event) {
+        Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+    }
+}
+
+#[cfg(windows)]
+fn forward_captured_raw_input(lparam: LPARAM) {
+    WINDOWS_CAPTURE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(raw_input) = windows_raw_input_from_lparam(lparam) else {
+            return;
+        };
+        let events = captured_events_from_windows_raw_input(raw_input, &mut state);
+        let Some(sender) = state.sender.as_ref() else {
+            return;
+        };
+
+        for event in events {
+            try_send_captured_input_event(sender, event);
+        }
+    });
+}
+
+#[cfg(windows)]
+fn windows_raw_input_from_lparam(lparam: LPARAM) -> Option<RAWINPUT> {
+    if lparam == 0 {
+        return None;
+    }
+
+    let handle = lparam as HRAWINPUT;
+    let mut raw_input = RAWINPUT::default();
+    let mut size = size_of::<RAWINPUT>() as u32;
+    // SAFETY: raw_input points to an initialized RAWINPUT buffer and size points to its byte length.
+    let read = unsafe {
+        GetRawInputData(
+            handle,
+            RID_INPUT,
+            &mut raw_input as *mut RAWINPUT as *mut _,
+            &mut size,
+            size_of::<RAWINPUTHEADER>() as u32,
+        )
+    };
+
+    if read == u32::MAX || read == 0 {
+        None
+    } else {
+        Some(raw_input)
+    }
+}
+
+#[cfg(windows)]
+fn captured_events_from_windows_raw_input(
+    raw_input: RAWINPUT,
+    state: &mut WindowsCaptureThreadState,
+) -> Vec<CapturedInputEvent> {
+    match raw_input.header.dwType {
+        RIM_TYPEMOUSE => {
+            // SAFETY: dwType identifies the active RAWINPUT union member as mouse.
+            let mouse = unsafe { raw_input.data.mouse };
+            captured_events_from_windows_raw_mouse(mouse, state)
+        }
+        RIM_TYPEKEYBOARD => {
+            // SAFETY: dwType identifies the active RAWINPUT union member as keyboard.
+            let keyboard = unsafe { raw_input.data.keyboard };
+            captured_event_from_windows_raw_keyboard(keyboard)
+                .into_iter()
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(windows)]
+fn captured_events_from_windows_raw_mouse(
+    mouse: RAWMOUSE,
+    state: &mut WindowsCaptureThreadState,
+) -> Vec<CapturedInputEvent> {
+    let mut events = Vec::new();
+    if let Some(event) = captured_pointer_move_from_raw_mouse(mouse, state) {
+        events.push(event);
+    }
+
+    let (button_flags, button_data) = raw_mouse_button_fields(mouse);
+    push_raw_mouse_button_event(
+        &mut events,
+        button_flags,
+        RI_MOUSE_LEFT_BUTTON_DOWN,
+        RI_MOUSE_LEFT_BUTTON_UP,
+        MouseButton::Left,
+    );
+    push_raw_mouse_button_event(
+        &mut events,
+        button_flags,
+        RI_MOUSE_RIGHT_BUTTON_DOWN,
+        RI_MOUSE_RIGHT_BUTTON_UP,
+        MouseButton::Right,
+    );
+    push_raw_mouse_button_event(
+        &mut events,
+        button_flags,
+        RI_MOUSE_MIDDLE_BUTTON_DOWN,
+        RI_MOUSE_MIDDLE_BUTTON_UP,
+        MouseButton::Middle,
+    );
+    push_raw_mouse_button_event(
+        &mut events,
+        button_flags,
+        RI_MOUSE_BUTTON_4_DOWN,
+        RI_MOUSE_BUTTON_4_UP,
+        MouseButton::Back,
+    );
+    push_raw_mouse_button_event(
+        &mut events,
+        button_flags,
+        RI_MOUSE_BUTTON_5_DOWN,
+        RI_MOUSE_BUTTON_5_UP,
+        MouseButton::Forward,
+    );
+
+    let wheel_delta = raw_mouse_button_data_delta(button_data);
+    if button_flags & RI_MOUSE_WHEEL as u16 != 0 && wheel_delta != 0 {
+        events.push(CapturedInputEvent::Scroll {
+            delta_x: 0,
+            delta_y: wheel_delta,
+        });
+    }
+    if button_flags & RI_MOUSE_HWHEEL as u16 != 0 && wheel_delta != 0 {
+        events.push(CapturedInputEvent::Scroll {
+            delta_x: wheel_delta,
+            delta_y: 0,
+        });
+    }
+
+    events
+}
+
+#[cfg(windows)]
+fn captured_pointer_move_from_raw_mouse(
+    mouse: RAWMOUSE,
+    state: &mut WindowsCaptureThreadState,
+) -> Option<CapturedInputEvent> {
+    let (delta_x, delta_y) = if mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0 {
+        let next = (mouse.lLastX, mouse.lLastY);
+        let previous = state.last_raw_absolute_pointer.replace(next)?;
+        (
+            next.0.saturating_sub(previous.0),
+            next.1.saturating_sub(previous.1),
+        )
+    } else {
+        state.last_raw_absolute_pointer = None;
+        (mouse.lLastX, mouse.lLastY)
+    };
+
+    if delta_x == 0 && delta_y == 0 {
+        None
+    } else {
+        Some(CapturedInputEvent::PointerMoved { delta_x, delta_y })
+    }
+}
+
+#[cfg(windows)]
+fn raw_mouse_button_fields(mouse: RAWMOUSE) -> (u16, u16) {
+    // SAFETY: Accessing the documented button-fields view of RAWMOUSE's anonymous union.
+    let fields = unsafe { mouse.Anonymous.Anonymous };
+    (fields.usButtonFlags, fields.usButtonData)
+}
+
+#[cfg(windows)]
+fn push_raw_mouse_button_event(
+    events: &mut Vec<CapturedInputEvent>,
+    button_flags: u16,
+    down_flag: u32,
+    up_flag: u32,
+    button: MouseButton,
+) {
+    if button_flags & down_flag as u16 != 0 {
+        events.push(CapturedInputEvent::MouseButton {
+            button,
+            state: PressState::Pressed,
+        });
+    }
+    if button_flags & up_flag as u16 != 0 {
+        events.push(CapturedInputEvent::MouseButton {
+            button,
+            state: PressState::Released,
+        });
+    }
+}
+
+#[cfg(windows)]
+fn raw_mouse_button_data_delta(button_data: u16) -> i32 {
+    (button_data as i16) as i32
+}
+
+#[cfg(windows)]
+fn captured_event_from_windows_raw_keyboard(keyboard: RAWKEYBOARD) -> Option<CapturedInputEvent> {
+    if keyboard.MakeCode == 0 && keyboard.VKey == 0 {
+        return None;
+    }
+
+    let state = if keyboard.Flags & RI_KEY_BREAK as u16 != 0 {
+        PressState::Released
+    } else {
+        PressState::Pressed
+    };
+
+    Some(CapturedInputEvent::Key {
+        key: physical_key_from_windows_raw_keyboard(keyboard),
+        state,
+    })
+}
+
+#[cfg(windows)]
+fn physical_key_from_windows_raw_keyboard(keyboard: RAWKEYBOARD) -> PhysicalKey {
+    let extended = keyboard.Flags & RI_KEY_E0 as u16 != 0;
+    match keyboard.VKey {
+        VK_SHIFT => match keyboard.MakeCode {
+            0x36 => PhysicalKey::RightShift,
+            _ => PhysicalKey::LeftShift,
+        },
+        VK_CONTROL => {
+            if extended {
+                PhysicalKey::RightControl
+            } else {
+                PhysicalKey::LeftControl
+            }
+        }
+        VK_MENU => {
+            if extended {
+                PhysicalKey::RightAlt
+            } else {
+                PhysicalKey::LeftAlt
+            }
+        }
+        VK_LSHIFT => PhysicalKey::LeftShift,
+        VK_RSHIFT => PhysicalKey::RightShift,
+        VK_LCONTROL => PhysicalKey::LeftControl,
+        VK_RCONTROL => PhysicalKey::RightControl,
+        VK_LMENU => PhysicalKey::LeftAlt,
+        VK_RMENU => PhysicalKey::RightAlt,
+        VK_LWIN => PhysicalKey::LeftMeta,
+        VK_RWIN => PhysicalKey::RightMeta,
+        VK_BACK => DEFAULT_PANIC_HOTKEY_KEY,
+        _ => PhysicalKey::Code(keyboard.MakeCode),
+    }
 }
 
 #[cfg(windows)]
@@ -999,30 +1416,12 @@ fn captured_event_from_windows_hook(
 ) -> Option<CapturedInputEvent> {
     match message {
         WM_MOUSEMOVE => captured_pointer_move(lparam, state),
-        WM_LBUTTONDOWN => Some(CapturedInputEvent::MouseButton {
-            button: MouseButton::Left,
-            state: PressState::Pressed,
-        }),
-        WM_LBUTTONUP => Some(CapturedInputEvent::MouseButton {
-            button: MouseButton::Left,
-            state: PressState::Released,
-        }),
-        WM_RBUTTONDOWN => Some(CapturedInputEvent::MouseButton {
-            button: MouseButton::Right,
-            state: PressState::Pressed,
-        }),
-        WM_RBUTTONUP => Some(CapturedInputEvent::MouseButton {
-            button: MouseButton::Right,
-            state: PressState::Released,
-        }),
-        WM_MBUTTONDOWN => Some(CapturedInputEvent::MouseButton {
-            button: MouseButton::Middle,
-            state: PressState::Pressed,
-        }),
-        WM_MBUTTONUP => Some(CapturedInputEvent::MouseButton {
-            button: MouseButton::Middle,
-            state: PressState::Released,
-        }),
+        WM_LBUTTONDOWN => captured_mouse_button(lparam, MouseButton::Left, PressState::Pressed),
+        WM_LBUTTONUP => captured_mouse_button(lparam, MouseButton::Left, PressState::Released),
+        WM_RBUTTONDOWN => captured_mouse_button(lparam, MouseButton::Right, PressState::Pressed),
+        WM_RBUTTONUP => captured_mouse_button(lparam, MouseButton::Right, PressState::Released),
+        WM_MBUTTONDOWN => captured_mouse_button(lparam, MouseButton::Middle, PressState::Pressed),
+        WM_MBUTTONUP => captured_mouse_button(lparam, MouseButton::Middle, PressState::Released),
         WM_XBUTTONDOWN => captured_x_button(lparam, PressState::Pressed),
         WM_XBUTTONUP => captured_x_button(lparam, PressState::Released),
         WM_MOUSEWHEEL => captured_scroll(lparam, WindowsScrollAxis::Vertical),
@@ -1031,6 +1430,20 @@ fn captured_event_from_windows_hook(
         WM_KEYUP | WM_SYSKEYUP => captured_keyboard_input(lparam, PressState::Released),
         _ => None,
     }
+}
+
+#[cfg(windows)]
+fn captured_mouse_button(
+    lparam: LPARAM,
+    button: MouseButton,
+    state: PressState,
+) -> Option<CapturedInputEvent> {
+    let mouse = windows_mouse_hook_data(lparam)?;
+    if mouse.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0 {
+        return None;
+    }
+
+    Some(CapturedInputEvent::MouseButton { button, state })
 }
 
 #[cfg(windows)]
@@ -1730,13 +2143,20 @@ mod tests {
 
     #[cfg(windows)]
     use super::{
-        LLMHF_INJECTED, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_WHEEL,
-        MOUSEEVENTF_XUP, MSLLHOOKSTRUCT, POINT, WindowsInjectedInputState, WindowsPressedInput,
-        WindowsProbeResults, WindowsScrollAxis, captured_scroll_from_mouse,
+        HID_USAGE_GENERIC_KEYBOARD, HID_USAGE_GENERIC_MOUSE, HID_USAGE_PAGE_GENERIC, HWND,
+        LLMHF_INJECTED, MOUSE_MOVE_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_WHEEL, MOUSEEVENTF_XUP, MSLLHOOKSTRUCT, POINT, RAWINPUTDEVICE, RAWKEYBOARD,
+        RAWMOUSE, RI_KEY_BREAK, RI_KEY_E0, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_WHEEL,
+        RIDEV_INPUTSINK, VK_CONTROL, VK_SHIFT, WindowsCaptureThreadState,
+        WindowsInjectedInputState, WindowsPressedInput, WindowsProbeResults, WindowsScrollAxis,
+        captured_event_from_windows_raw_keyboard, captured_events_from_windows_raw_mouse,
+        captured_scroll_from_mouse, raw_mouse_button_data_delta,
         windows_capabilities_from_probe_results, windows_mouse_button_flags,
-        windows_mouse_wheel_flags, windows_scan_code_for_physical_key,
+        windows_mouse_wheel_flags, windows_raw_input_devices, windows_scan_code_for_physical_key,
         windows_wheel_delta_from_mouse_data,
     };
+    #[cfg(windows)]
+    use windows_sys::Win32::UI::Input::{RAWMOUSE_0, RAWMOUSE_0_0};
     #[cfg(windows)]
     use windows_sys::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
 
@@ -2091,6 +2511,132 @@ mod tests {
         assert_eq!(
             captured_scroll_from_mouse(injected, WindowsScrollAxis::Vertical),
             None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_raw_input_registration_targets_hidden_window_for_mouse_and_keyboard() {
+        let hwnd = 1usize as HWND;
+        let devices: [RAWINPUTDEVICE; 2] = windows_raw_input_devices(hwnd);
+
+        assert_eq!(devices[0].usUsagePage, HID_USAGE_PAGE_GENERIC);
+        assert_eq!(devices[0].usUsage, HID_USAGE_GENERIC_MOUSE);
+        assert_eq!(devices[0].dwFlags, RIDEV_INPUTSINK);
+        assert_eq!(devices[0].hwndTarget, hwnd);
+        assert_eq!(devices[1].usUsagePage, HID_USAGE_PAGE_GENERIC);
+        assert_eq!(devices[1].usUsage, HID_USAGE_GENERIC_KEYBOARD);
+        assert_eq!(devices[1].dwFlags, RIDEV_INPUTSINK);
+        assert_eq!(devices[1].hwndTarget, hwnd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_raw_mouse_events_preserve_move_button_and_scroll_order() {
+        let mut state = WindowsCaptureThreadState::default();
+        let mouse = RAWMOUSE {
+            usFlags: 0,
+            Anonymous: RAWMOUSE_0 {
+                Anonymous: RAWMOUSE_0_0 {
+                    usButtonFlags: (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_WHEEL) as u16,
+                    usButtonData: WHEEL_DELTA as u16,
+                },
+            },
+            ulRawButtons: 0,
+            lLastX: 8,
+            lLastY: -3,
+            ulExtraInformation: 0,
+        };
+
+        assert_eq!(
+            captured_events_from_windows_raw_mouse(mouse, &mut state),
+            vec![
+                CapturedInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: -3,
+                },
+                CapturedInputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    state: PressState::Pressed,
+                },
+                CapturedInputEvent::Scroll {
+                    delta_x: 0,
+                    delta_y: WHEEL_DELTA as i32,
+                },
+            ]
+        );
+        assert_eq!(
+            raw_mouse_button_data_delta((-(WHEEL_DELTA as i16)) as u16),
+            -(WHEEL_DELTA as i32)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_raw_absolute_mouse_normalizes_against_previous_position() {
+        let mut state = WindowsCaptureThreadState::default();
+        let first = RAWMOUSE {
+            usFlags: MOUSE_MOVE_ABSOLUTE,
+            Anonymous: RAWMOUSE_0 {
+                Anonymous: RAWMOUSE_0_0 {
+                    usButtonFlags: 0,
+                    usButtonData: 0,
+                },
+            },
+            ulRawButtons: 0,
+            lLastX: 100,
+            lLastY: 120,
+            ulExtraInformation: 0,
+        };
+        let second = RAWMOUSE {
+            lLastX: 115,
+            lLastY: 110,
+            ..first
+        };
+
+        assert!(captured_events_from_windows_raw_mouse(first, &mut state).is_empty());
+        assert_eq!(
+            captured_events_from_windows_raw_mouse(second, &mut state),
+            vec![CapturedInputEvent::PointerMoved {
+                delta_x: 15,
+                delta_y: -10,
+            }]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_raw_keyboard_maps_side_specific_modifiers_and_release_state() {
+        let right_control = RAWKEYBOARD {
+            MakeCode: 0x1d,
+            Flags: RI_KEY_E0 as u16,
+            Reserved: 0,
+            VKey: VK_CONTROL,
+            Message: 0,
+            ExtraInformation: 0,
+        };
+        let right_shift_release = RAWKEYBOARD {
+            MakeCode: 0x36,
+            Flags: RI_KEY_BREAK as u16,
+            Reserved: 0,
+            VKey: VK_SHIFT,
+            Message: 0,
+            ExtraInformation: 0,
+        };
+
+        assert_eq!(
+            captured_event_from_windows_raw_keyboard(right_control),
+            Some(CapturedInputEvent::Key {
+                key: PhysicalKey::RightControl,
+                state: PressState::Pressed,
+            })
+        );
+        assert_eq!(
+            captured_event_from_windows_raw_keyboard(right_shift_release),
+            Some(CapturedInputEvent::Key {
+                key: PhysicalKey::RightShift,
+                state: PressState::Released,
+            })
         );
     }
 
