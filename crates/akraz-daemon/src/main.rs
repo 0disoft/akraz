@@ -1126,6 +1126,7 @@ enum LoopbackTransportSmokeInputEvent {
     Key { key: String, state: &'static str },
     MouseButton { button: String, state: &'static str },
     PointerMoved { delta_x: i32, delta_y: i32 },
+    Scroll { delta_x: i32, delta_y: i32 },
 }
 
 impl From<&InjectedInputEvent> for LoopbackTransportSmokeInputEvent {
@@ -1140,6 +1141,10 @@ impl From<&InjectedInputEvent> for LoopbackTransportSmokeInputEvent {
                 state: press_state_name(*state),
             },
             InjectedInputEvent::PointerMoved { delta_x, delta_y } => Self::PointerMoved {
+                delta_x: *delta_x,
+                delta_y: *delta_y,
+            },
+            InjectedInputEvent::Scroll { delta_x, delta_y } => Self::Scroll {
                 delta_x: *delta_x,
                 delta_y: *delta_y,
             },

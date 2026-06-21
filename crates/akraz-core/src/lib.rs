@@ -157,6 +157,10 @@ pub enum CapturedInputEvent {
         delta_x: i32,
         delta_y: i32,
     },
+    Scroll {
+        delta_x: i32,
+        delta_y: i32,
+    },
 }
 
 /// Input event that should be injected on a remote or local platform adapter.
@@ -174,6 +178,10 @@ pub enum InjectedInputEvent {
         delta_x: i32,
         delta_y: i32,
     },
+    Scroll {
+        delta_x: i32,
+        delta_y: i32,
+    },
 }
 
 impl From<CapturedInputEvent> for InjectedInputEvent {
@@ -186,6 +194,7 @@ impl From<CapturedInputEvent> for InjectedInputEvent {
             CapturedInputEvent::PointerMoved { delta_x, delta_y } => {
                 Self::PointerMoved { delta_x, delta_y }
             }
+            CapturedInputEvent::Scroll { delta_x, delta_y } => Self::Scroll { delta_x, delta_y },
         }
     }
 }
@@ -778,7 +787,7 @@ impl RuntimeInputState {
                     self.pressed_buttons.remove(button);
                 }
             },
-            CapturedInputEvent::PointerMoved { .. } => {}
+            CapturedInputEvent::PointerMoved { .. } | CapturedInputEvent::Scroll { .. } => {}
         }
     }
 
@@ -958,6 +967,39 @@ mod tests {
         };
         let actions = apply_ok(&mut state, RuntimeEvent::Input(input.clone()));
 
+        assert_eq!(
+            actions,
+            vec![CoreAction::ForwardInput {
+                event: InjectedInputEvent::from(input),
+            }]
+        );
+    }
+
+    #[test]
+    fn scroll_input_is_forwarded_while_remote_without_pressed_state() {
+        let mut state = RuntimeInputState::new();
+
+        apply_ok(
+            &mut state,
+            RuntimeEvent::RemoteEntryRequested {
+                peer_id: PeerId::new("windows-box"),
+            },
+        );
+        apply_ok(
+            &mut state,
+            RuntimeEvent::RemoteEntryConfirmed {
+                session_id: SessionId::new("session-scroll"),
+            },
+        );
+
+        let input = CapturedInputEvent::Scroll {
+            delta_x: 0,
+            delta_y: 120,
+        };
+        let actions = apply_ok(&mut state, RuntimeEvent::Input(input.clone()));
+
+        assert!(state.pressed_keys().is_empty());
+        assert!(state.pressed_buttons().is_empty());
         assert_eq!(
             actions,
             vec![CoreAction::ForwardInput {

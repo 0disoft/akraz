@@ -50,11 +50,11 @@ use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardLayout, GetKeyboardLayoutNameW, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
-    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    SendInput, VK_BACK, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU,
-    VK_RSHIFT, VK_RWIN,
+    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VK_BACK, VK_LCONTROL, VK_LMENU,
+    VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -64,8 +64,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
     WH_MOUSE_LL, WINDOWS_HOOK_ID, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    XBUTTON1, XBUTTON2,
 };
 #[cfg(windows)]
 use windows_sys::core::BOOL;
@@ -1024,6 +1025,8 @@ fn captured_event_from_windows_hook(
         }),
         WM_XBUTTONDOWN => captured_x_button(lparam, PressState::Pressed),
         WM_XBUTTONUP => captured_x_button(lparam, PressState::Released),
+        WM_MOUSEWHEEL => captured_scroll(lparam, WindowsScrollAxis::Vertical),
+        WM_MOUSEHWHEEL => captured_scroll(lparam, WindowsScrollAxis::Horizontal),
         WM_KEYDOWN | WM_SYSKEYDOWN => captured_keyboard_input(lparam, PressState::Pressed),
         WM_KEYUP | WM_SYSKEYUP => captured_keyboard_input(lparam, PressState::Released),
         _ => None,
@@ -1066,6 +1069,51 @@ fn captured_x_button(lparam: LPARAM, state: PressState) -> Option<CapturedInputE
     };
 
     Some(CapturedInputEvent::MouseButton { button, state })
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsScrollAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[cfg(windows)]
+fn captured_scroll(lparam: LPARAM, axis: WindowsScrollAxis) -> Option<CapturedInputEvent> {
+    let mouse = windows_mouse_hook_data(lparam)?;
+
+    captured_scroll_from_mouse(mouse, axis)
+}
+
+#[cfg(windows)]
+fn captured_scroll_from_mouse(
+    mouse: MSLLHOOKSTRUCT,
+    axis: WindowsScrollAxis,
+) -> Option<CapturedInputEvent> {
+    if mouse.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0 {
+        return None;
+    }
+
+    let delta = windows_wheel_delta_from_mouse_data(mouse.mouseData);
+    if delta == 0 {
+        return None;
+    }
+
+    match axis {
+        WindowsScrollAxis::Horizontal => Some(CapturedInputEvent::Scroll {
+            delta_x: delta,
+            delta_y: 0,
+        }),
+        WindowsScrollAxis::Vertical => Some(CapturedInputEvent::Scroll {
+            delta_x: 0,
+            delta_y: delta,
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn windows_wheel_delta_from_mouse_data(mouse_data: u32) -> i32 {
+    ((mouse_data >> 16) as u16 as i16) as i32
 }
 
 #[cfg(windows)]
@@ -1133,6 +1181,7 @@ fn inject_windows_input(
         InjectedInputEvent::PointerMoved { delta_x, delta_y } => {
             send_windows_mouse_move(*delta_x, *delta_y)
         }
+        InjectedInputEvent::Scroll { delta_x, delta_y } => send_windows_scroll(*delta_x, *delta_y),
         InjectedInputEvent::Key { key, state } => {
             send_windows_keyboard_input(*key, *state)?;
             update_windows_injected_state(injected_state, WindowsPressedInput::Key(*key), *state)
@@ -1214,6 +1263,18 @@ fn send_windows_mouse_move(delta_x: i32, delta_y: i32) -> Result<(), PlatformErr
 }
 
 #[cfg(windows)]
+fn send_windows_scroll(delta_x: i32, delta_y: i32) -> Result<(), PlatformError> {
+    if delta_y != 0 {
+        send_windows_mouse_wheel_input(WindowsScrollAxis::Vertical, delta_y)?;
+    }
+    if delta_x != 0 {
+        send_windows_mouse_wheel_input(WindowsScrollAxis::Horizontal, delta_x)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
 fn send_windows_keyboard_input(
     key: PhysicalKey,
     press_state: PressState,
@@ -1232,6 +1293,17 @@ fn send_windows_mouse_button_input(
     send_windows_input(
         windows_input_for_mouse_button(button, press_state)?,
         "failed to send Windows mouse button input",
+    )
+}
+
+#[cfg(windows)]
+fn send_windows_mouse_wheel_input(
+    axis: WindowsScrollAxis,
+    delta: i32,
+) -> Result<(), PlatformError> {
+    send_windows_input(
+        windows_input_for_mouse_wheel(axis, delta),
+        "failed to send Windows mouse wheel input",
     )
 }
 
@@ -1269,6 +1341,31 @@ fn windows_input_for_keyboard(key: PhysicalKey, press_state: PressState) -> INPU
                 dwExtraInfo: 0,
             },
         },
+    }
+}
+
+#[cfg(windows)]
+fn windows_input_for_mouse_wheel(axis: WindowsScrollAxis, delta: i32) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: delta as u32,
+                dwFlags: windows_mouse_wheel_flags(axis),
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+#[cfg(windows)]
+fn windows_mouse_wheel_flags(axis: WindowsScrollAxis) -> u32 {
+    match axis {
+        WindowsScrollAxis::Horizontal => MOUSEEVENTF_HWHEEL,
+        WindowsScrollAxis::Vertical => MOUSEEVENTF_WHEEL,
     }
 }
 
@@ -1633,10 +1730,15 @@ mod tests {
 
     #[cfg(windows)]
     use super::{
-        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_XUP, WindowsInjectedInputState, WindowsPressedInput,
-        WindowsProbeResults, windows_capabilities_from_probe_results, windows_mouse_button_flags,
-        windows_scan_code_for_physical_key,
+        LLMHF_INJECTED, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_WHEEL,
+        MOUSEEVENTF_XUP, MSLLHOOKSTRUCT, POINT, WindowsInjectedInputState, WindowsPressedInput,
+        WindowsProbeResults, WindowsScrollAxis, captured_scroll_from_mouse,
+        windows_capabilities_from_probe_results, windows_mouse_button_flags,
+        windows_mouse_wheel_flags, windows_scan_code_for_physical_key,
+        windows_wheel_delta_from_mouse_data,
     };
+    #[cfg(windows)]
+    use windows_sys::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
 
     fn count_or_panic(adapter: &FakePlatformAdapter) -> u64 {
         match adapter.release_all_count() {
@@ -1873,13 +1975,26 @@ mod tests {
             }),
             Ok(())
         );
+        assert_eq!(
+            adapter.inject_input(&InjectedInputEvent::Scroll {
+                delta_x: 0,
+                delta_y: -120,
+            }),
+            Ok(())
+        );
 
         assert_eq!(
             adapter.injected_events().expect("fake injected events"),
-            vec![InjectedInputEvent::PointerMoved {
-                delta_x: 8,
-                delta_y: 2,
-            }]
+            vec![
+                InjectedInputEvent::PointerMoved {
+                    delta_x: 8,
+                    delta_y: 2,
+                },
+                InjectedInputEvent::Scroll {
+                    delta_x: 0,
+                    delta_y: -120,
+                },
+            ]
         );
     }
 
@@ -1917,6 +2032,65 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unsupported Windows mouse button for injection"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_scroll_flags_cover_vertical_and_horizontal_wheels() {
+        assert_eq!(
+            windows_mouse_wheel_flags(WindowsScrollAxis::Vertical),
+            MOUSEEVENTF_WHEEL
+        );
+        assert_eq!(
+            windows_mouse_wheel_flags(WindowsScrollAxis::Horizontal),
+            MOUSEEVENTF_HWHEEL
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_scroll_capture_normalizes_wheel_delta_and_ignores_injected_events() {
+        let vertical = MSLLHOOKSTRUCT {
+            pt: POINT { x: 0, y: 0 },
+            mouseData: WHEEL_DELTA << 16,
+            flags: 0,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        let horizontal = MSLLHOOKSTRUCT {
+            pt: POINT { x: 0, y: 0 },
+            mouseData: (-(WHEEL_DELTA as i16) as u16 as u32) << 16,
+            flags: 0,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        let injected = MSLLHOOKSTRUCT {
+            flags: LLMHF_INJECTED,
+            ..vertical
+        };
+
+        assert_eq!(
+            windows_wheel_delta_from_mouse_data(vertical.mouseData),
+            WHEEL_DELTA as i32
+        );
+        assert_eq!(
+            captured_scroll_from_mouse(vertical, WindowsScrollAxis::Vertical),
+            Some(CapturedInputEvent::Scroll {
+                delta_x: 0,
+                delta_y: WHEEL_DELTA as i32,
+            })
+        );
+        assert_eq!(
+            captured_scroll_from_mouse(horizontal, WindowsScrollAxis::Horizontal),
+            Some(CapturedInputEvent::Scroll {
+                delta_x: -(WHEEL_DELTA as i32),
+                delta_y: 0,
+            })
+        );
+        assert_eq!(
+            captured_scroll_from_mouse(injected, WindowsScrollAxis::Vertical),
+            None
         );
     }
 

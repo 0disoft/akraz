@@ -2361,6 +2361,7 @@ pub enum PeerTransportInputEvent {
     Key { key: String, state: String },
     MouseButton { button: String, state: String },
     PointerMoved { delta_x: i32, delta_y: i32 },
+    Scroll { delta_x: i32, delta_y: i32 },
 }
 
 impl From<&InjectedInputEvent> for PeerTransportInputEvent {
@@ -2375,6 +2376,10 @@ impl From<&InjectedInputEvent> for PeerTransportInputEvent {
                 state: press_state_name(*state).to_string(),
             },
             InjectedInputEvent::PointerMoved { delta_x, delta_y } => Self::PointerMoved {
+                delta_x: *delta_x,
+                delta_y: *delta_y,
+            },
+            InjectedInputEvent::Scroll { delta_x, delta_y } => Self::Scroll {
                 delta_x: *delta_x,
                 delta_y: *delta_y,
             },
@@ -2395,6 +2400,9 @@ impl PeerTransportInputEvent {
             }),
             Self::PointerMoved { delta_x, delta_y } => {
                 Ok(InjectedInputEvent::PointerMoved { delta_x, delta_y })
+            }
+            Self::Scroll { delta_x, delta_y } => {
+                Ok(InjectedInputEvent::Scroll { delta_x, delta_y })
             }
         }
     }
@@ -6469,6 +6477,12 @@ mod tests {
                     state: PressState::Released,
                 },
             },
+            DaemonTransportCommand::ForwardInput {
+                event: InjectedInputEvent::Scroll {
+                    delta_x: 120,
+                    delta_y: -240,
+                },
+            },
             DaemonTransportCommand::ReleaseAllInputs,
             DaemonTransportCommand::StopRemoteSession {
                 session_id: Some(SessionId::new("session-1")),
@@ -6483,6 +6497,30 @@ mod tests {
                 command
             );
         }
+    }
+
+    #[test]
+    fn peer_transport_scroll_input_event_uses_camel_case_wire_contract() {
+        let event = PeerTransportInputEvent::from(&InjectedInputEvent::Scroll {
+            delta_x: 120,
+            delta_y: -240,
+        });
+
+        assert_eq!(
+            serde_json::to_value(&event).expect("scroll input event JSON"),
+            serde_json::json!({
+                "kind": "scroll",
+                "deltaX": 120,
+                "deltaY": -240,
+            })
+        );
+        assert_eq!(
+            event.into_input_event().expect("scroll input event"),
+            InjectedInputEvent::Scroll {
+                delta_x: 120,
+                delta_y: -240,
+            }
+        );
     }
 
     #[test]
