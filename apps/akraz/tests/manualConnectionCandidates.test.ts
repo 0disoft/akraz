@@ -243,6 +243,31 @@ describe("manual connection candidates", () => {
     });
   });
 
+  test("labels manual probe candidates separately from mDNS discovery", () => {
+    expect(
+      buildConnectionCandidates({
+        trustedPeers: [],
+        manualPeerAddresses: [],
+        discoveryCandidates: [
+          discoveryCandidate("new-peer", {
+            source: "manualProbe",
+            fingerprint: "AKRZ-new-peer",
+            peerDocumentJson: '{"kind":"akraz.peerIdentity"}',
+            trusted: false,
+          }),
+        ],
+        peerStatuses: [],
+        localDeviceId: "windows-desktop",
+        draftLocalDeviceId: "",
+      })[0],
+    ).toMatchObject({
+      peerId: "new-peer",
+      trusted: false,
+      ready: false,
+      source: "manualProbe",
+    });
+  });
+
   test("marks connected discovery candidates as unavailable for another session", () => {
     expect(
       buildConnectionCandidates({

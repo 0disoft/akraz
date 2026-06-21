@@ -15,6 +15,8 @@ import type {
   PermissionsProbe,
   SessionConnectParams,
   SessionDiscoveryCandidatesResult,
+  SessionProbeManualCandidateParams,
+  SessionProbeManualCandidateResult,
 } from "./types";
 
 export const daemonClient = {
@@ -56,6 +58,12 @@ export const daemonClient = {
 
   sessionDiscoveryCandidates(): Promise<SessionDiscoveryCandidatesResult> {
     return invoke<SessionDiscoveryCandidatesResult>("session_discovery_candidates");
+  },
+
+  probeManualCandidate(
+    params: SessionProbeManualCandidateParams,
+  ): Promise<SessionProbeManualCandidateResult> {
+    return invoke<SessionProbeManualCandidateResult>("session_probe_manual_candidate", { params });
   },
 
   startPairing(params: PairingStartParams): Promise<PairingStartResult> {

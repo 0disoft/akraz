@@ -22,7 +22,7 @@ use akraz_daemon::{
     LoopbackPeerTransport, ManagedPeerSessionTransport, PeerTransportCommandExecution,
     PeerTransportSession, PeerTransportSessionExecution, SharedCoreActionDispatcher,
     TcpPeerSessionTransport, TcpPeerTransport, TransportCoreActionDispatcher, build_daemon_status,
-    execute_paired_tcp_peer_transport_session_until_closed_with_timeout, serve_daemon_ipc,
+    execute_paired_peer_transport_or_identity_probe_until_closed_with_timeout, serve_daemon_ipc,
     serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
     serve_tcp_peer_transport_session_and_execute, shared_runtime_state,
     start_monitored_daemon_input_capture_with_edge_bindings_dispatcher_and_logs,
@@ -131,6 +131,10 @@ fn run_daemon(options: ServeOptions) -> ExitCode {
                 address,
                 platform.clone(),
                 identity_store,
+                options
+                    .identity_display_name
+                    .clone()
+                    .unwrap_or_else(|| "Akraz Daemon".to_string()),
                 local_device_id,
             ) {
                 Ok(worker) => Some(worker),
@@ -498,6 +502,7 @@ fn start_peer_session_listener<P>(
     address: SocketAddr,
     platform: P,
     identity_store: PathBuf,
+    identity_display_name: String,
     local_device_id: DeviceId,
 ) -> Result<PeerSessionListenerWorker, PlatformError>
 where
@@ -526,6 +531,7 @@ where
             platform,
             worker_running,
             identity_store,
+            identity_display_name,
             local_device_id,
         )
     });
@@ -543,11 +549,39 @@ fn run_peer_session_listener<P>(
     platform: P,
     running: Arc<AtomicBool>,
     identity_store: PathBuf,
+    identity_display_name: String,
     local_device_id: DeviceId,
 ) -> Result<(), PlatformError>
 where
     P: PlatformAdapter,
 {
+    let store = FileIdentityStore::new(&identity_store);
+    let local_identity = store
+        .load_or_create(&identity_display_name)
+        .map_err(|error| {
+            PlatformError::new(format!(
+                "failed to load identity store {}: {error}",
+                identity_store.display()
+            ))
+        })?;
+    if local_identity.identity().device_id() != local_device_id.as_str() {
+        return Err(PlatformError::new(format!(
+            "peer session listener identity {} does not match resolved local device id {}",
+            local_identity.identity().device_id(),
+            local_device_id.as_str()
+        )));
+    }
+    let local_peer_document = akraz_identity::PairingIdentityDocument::from_device_identity(
+        local_identity.identity(),
+        akraz_daemon::peer_session_capabilities_for_discovery(),
+    );
+    let local_peer_document_json =
+        serde_json::to_string(&local_peer_document).map_err(|error| {
+            PlatformError::new(format!(
+                "failed to encode local peer identity document: {error}"
+            ))
+        })?;
+
     while running.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -558,10 +592,11 @@ where
                 })?;
                 let store = FileIdentityStore::new(&identity_store);
                 if let Err(error) =
-                    execute_paired_tcp_peer_transport_session_until_closed_with_timeout(
+                    execute_paired_peer_transport_or_identity_probe_until_closed_with_timeout(
                         stream,
                         &platform,
                         Duration::from_secs(2),
+                        &local_peer_document_json,
                         &local_device_id,
                         |peer_device_id| {
                             store
@@ -1996,7 +2031,7 @@ mod tests {
 
         assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(report.hello.protocol_major, 1);
-        assert_eq!(report.hello.protocol_minor, 4);
+        assert_eq!(report.hello.protocol_minor, 5);
         assert_eq!(report.hello.device_id, "local-smoke-device");
         assert_eq!(report.hello.peer_id, "loopback-peer");
         assert_eq!(report.commands.len(), 4);
@@ -2035,7 +2070,7 @@ mod tests {
 
         assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(report.hello.protocol_major, 1);
-        assert_eq!(report.hello.protocol_minor, 4);
+        assert_eq!(report.hello.protocol_minor, 5);
         assert_eq!(report.hello.device_id, "local-smoke-device");
         assert_eq!(report.hello.peer_id, "loopback-peer");
         assert_eq!(report.outcomes.len(), 4);

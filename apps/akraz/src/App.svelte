@@ -94,6 +94,7 @@
   let draggedLayoutBindingIndex = $state<number | null>(null);
   let layoutTestMessage = $state('');
   let pairingCandidatePeerId = $state<string | null>(null);
+  let manualProbeAddress = $state('');
 
   onMount(() => {
     void daemonState.refresh();
@@ -467,6 +468,24 @@
     pairingCandidatePeerId = null;
   }
 
+  function canProbeManualCandidate() {
+    return (
+      daemonState.status !== null &&
+      !daemonState.isBusy &&
+      !hasConnectedPeer() &&
+      manualProbeAddress.trim().length > 0
+    );
+  }
+
+  async function probeManualCandidate() {
+    const address = manualProbeAddress.trim();
+    if (!canProbeManualCandidate()) {
+      return;
+    }
+
+    await daemonState.probeManualCandidate({ address });
+  }
+
   async function acceptPendingPairing() {
     const accepted = await pairingState.accept();
     if (!accepted) {
@@ -529,6 +548,9 @@
   }
 
   function connectionCandidateSourceLabel(candidate: ConnectionCandidate) {
+    if (candidate.source === 'manualProbe') {
+      return '주소';
+    }
     return candidate.source === 'discovery' ? '주변' : '저장됨';
   }
 
@@ -1428,9 +1450,30 @@
         </label>
       </div>
 
-      {#if connectionCandidates().length > 0}
-        <div class="connection-candidate-panel">
-          <h3>바로 연결</h3>
+      <div class="connection-candidate-panel">
+        <h3>바로 연결</h3>
+        <div class="manual-probe-row">
+          <label>
+            <span>주소로 찾기</span>
+            <input
+              type="text"
+              bind:value={manualProbeAddress}
+              placeholder="127.0.0.1:4455"
+              spellcheck="false"
+              disabled={daemonState.isBusy || hasConnectedPeer()}
+            />
+          </label>
+          <button
+            type="button"
+            class="control-button secondary"
+            disabled={!canProbeManualCandidate()}
+            onclick={probeManualCandidate}
+          >
+            {daemonState.operation === 'probeManualCandidate' ? '찾는 중' : '찾기'}
+          </button>
+        </div>
+
+        {#if connectionCandidates().length > 0}
           <ul class="connection-candidate-list" aria-label="바로 연결">
             {#each connectionCandidates() as candidate (candidate.peerId)}
               <li>
@@ -1479,6 +1522,7 @@
               </li>
             {/each}
           </ul>
+        {/if}
 
           {#if pairingState.pending || pairingState.accepted || pairingState.lastError}
             <div class="pairing-panel" aria-live="polite">
@@ -1537,8 +1581,7 @@
               {/if}
             </div>
           {/if}
-        </div>
-      {/if}
+      </div>
 
       <div class="settings-actions">
         <button

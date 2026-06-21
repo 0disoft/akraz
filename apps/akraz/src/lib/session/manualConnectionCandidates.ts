@@ -29,7 +29,7 @@ export interface ConnectionCandidatesInput extends ManualConnectionCandidatesInp
   discoveryCandidates: SessionDiscoveryCandidate[];
 }
 
-export type ConnectionCandidateSource = "discovery" | "manual";
+export type ConnectionCandidateSource = "discovery" | "manualProbe" | "manual";
 
 export interface ConnectionCandidate {
   peerId: string;
@@ -107,7 +107,7 @@ export function buildConnectionCandidates(input: ConnectionCandidatesInput): Con
       connected,
       trusted,
       ready: trusted && !connected && address.length > 0 && localDeviceId.length > 0,
-      source: "discovery",
+      source: candidate.source === "manualProbe" ? "manualProbe" : "discovery",
       buildVersion: candidate.buildVersion,
     };
 

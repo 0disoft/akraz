@@ -5,6 +5,7 @@ import type {
   DaemonStatus,
   SessionConnectParams,
   SessionDiscoveryCandidate,
+  SessionProbeManualCandidateParams,
 } from "../api/types";
 
 type DaemonOperation =
@@ -13,6 +14,7 @@ type DaemonOperation =
   | "start"
   | "stop"
   | "connectSession"
+  | "probeManualCandidate"
   | "disconnectSession"
   | "releaseAllInputs";
 
@@ -69,6 +71,22 @@ export class DaemonState {
     }
   }
 
+  async probeManualCandidate(params: SessionProbeManualCandidateParams) {
+    this.operation = "probeManualCandidate";
+    this.lastError = null;
+    try {
+      const result = await daemonClient.probeManualCandidate(params);
+      this.sessionDiscoveryCandidates = upsertSessionDiscoveryCandidate(
+        this.sessionDiscoveryCandidates,
+        { ...result.candidate, source: "manualProbe" },
+      );
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.operation = null;
+    }
+  }
+
   async disconnectSession() {
     await this.run("disconnectSession", () => daemonClient.disconnectSession());
   }
@@ -95,3 +113,17 @@ export class DaemonState {
 }
 
 export const daemonState = new DaemonState();
+
+function upsertSessionDiscoveryCandidate(
+  candidates: SessionDiscoveryCandidate[],
+  candidate: SessionDiscoveryCandidate,
+): SessionDiscoveryCandidate[] {
+  const peerId = candidate.peerId.trim();
+  if (peerId.length === 0) {
+    return candidates;
+  }
+
+  const next = candidates.filter((existing) => existing.peerId.trim() !== peerId);
+  next.unshift(candidate);
+  return next;
+}

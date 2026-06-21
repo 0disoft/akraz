@@ -33,7 +33,8 @@ use akraz_ipc::{
     PairingRejectParams, PairingRejectResult, PairingStartParams, PairingStartResult, PeerStatus,
     PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot, SessionConnectParams,
     SessionConnectResult, SessionDisconnectResult, SessionDiscoveryCandidate,
-    SessionDiscoveryCandidatesResult, SessionStatus, parse_request_line, serve_os_local_ipc_once,
+    SessionDiscoveryCandidatesResult, SessionProbeManualCandidateParams,
+    SessionProbeManualCandidateResult, SessionStatus, parse_request_line, serve_os_local_ipc_once,
     to_json_line,
 };
 use akraz_platform::{
@@ -67,6 +68,11 @@ const PRE_TLS_EXPORTER: [u8; TLS_EXPORTER_LEN] = [0; TLS_EXPORTER_LEN];
 
 fn peer_session_capabilities() -> CapabilityFlags {
     CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+}
+
+/// Return the public capability set advertised by the daemon's peer-session listener.
+pub fn peer_session_capabilities_for_discovery() -> CapabilityFlags {
+    peer_session_capabilities()
 }
 
 fn normalize_pairing_document_json(value: &str) -> Result<String, PlatformError> {
@@ -574,6 +580,38 @@ impl TcpPeerSessionTransport {
     pub fn address(&self) -> SocketAddr {
         self.address
     }
+}
+
+/// Public identity returned by a manual peer address probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIdentityProbeResult {
+    pub peer_document_json: String,
+    pub build_version: String,
+}
+
+/// Probe a peer session listener for its public pairing identity document.
+pub fn probe_peer_identity_document(
+    address: SocketAddr,
+) -> Result<PeerIdentityProbeResult, PlatformError> {
+    let mut stream = TcpStream::connect(address).map_err(|error| {
+        PlatformError::new(format!(
+            "failed to connect peer identity probe at {address}: {error}"
+        ))
+    })?;
+    stream
+        .set_read_timeout(Some(DEFAULT_PEER_SESSION_HEARTBEAT_TIMEOUT))
+        .map_err(|error| {
+            PlatformError::new(format!(
+                "failed to configure peer identity probe timeout at {address}: {error}"
+            ))
+        })?;
+    let probe = PeerTransportSessionFrame::IdentityProbe {
+        protocol: PeerTransportProtocolVersion::current(),
+    };
+    write_peer_transport_session_frame(&mut stream, &probe)?;
+
+    let mut reader = BufReader::new(stream);
+    read_peer_transport_identity_document(&mut reader)
 }
 
 #[derive(Debug)]
@@ -1245,6 +1283,13 @@ pub struct PeerTransportSessionExecution {
     pub outcomes: Vec<PeerTransportCommandExecution>,
 }
 
+/// Outcome from accepting one peer-session listener connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerTransportSessionListenerOutcome {
+    IdentityProbeResponded,
+    SessionExecuted(PeerTransportSessionExecution),
+}
+
 /// Serve a bounded number of TCP peer transport commands and return decoded commands.
 pub fn serve_tcp_peer_transport_commands(
     listener: &TcpListener,
@@ -1431,6 +1476,52 @@ where
     )
 }
 
+/// Respond to a public identity probe or execute a paired peer session on one accepted stream.
+pub fn execute_paired_peer_transport_or_identity_probe_until_closed_with_timeout<P, F>(
+    stream: TcpStream,
+    platform: &P,
+    heartbeat_timeout: Duration,
+    local_peer_document_json: &str,
+    local_device_id: &DeviceId,
+    trusted_peer_lookup: F,
+) -> Result<PeerTransportSessionListenerOutcome, PlatformError>
+where
+    P: PlatformAdapter,
+    F: FnOnce(&DeviceId) -> Result<TrustedPeer<Ed25519PublicKey>, PlatformError>,
+{
+    stream
+        .set_read_timeout(Some(heartbeat_timeout))
+        .map_err(|error| {
+            PlatformError::new(format!(
+                "failed to configure peer session heartbeat timeout: {error}"
+            ))
+        })?;
+    let mut reader = BufReader::new(stream);
+    match read_peer_transport_session_frame(&mut reader)? {
+        PeerTransportSessionFrame::IdentityProbe { protocol } => {
+            protocol_version_from_wire(protocol)?;
+            let response = PeerTransportSessionFrame::IdentityDocument {
+                protocol: PeerTransportProtocolVersion::current(),
+                peer_document_json: normalize_pairing_document_json(local_peer_document_json)?,
+                build_version: DAEMON_VERSION.to_string(),
+            };
+            write_peer_transport_session_frame(reader.get_mut(), &response)?;
+            Ok(PeerTransportSessionListenerOutcome::IdentityProbeResponded)
+        }
+        frame => {
+            let hello = peer_transport_session_hello_from_frame(frame)?;
+            execute_paired_peer_transport_session_stream_from_hello_until_closed(
+                &mut reader,
+                platform,
+                local_device_id,
+                trusted_peer_lookup,
+                hello,
+            )
+            .map(PeerTransportSessionListenerOutcome::SessionExecuted)
+        }
+    }
+}
+
 /// Execute a decoded peer transport session from any buffered stream until EOF.
 pub fn execute_peer_transport_session_stream_until_closed<R, P>(
     reader: &mut R,
@@ -1493,6 +1584,27 @@ where
     F: FnOnce(&DeviceId) -> Result<TrustedPeer<Ed25519PublicKey>, PlatformError>,
 {
     let hello = read_peer_transport_session_hello(reader)?;
+    execute_paired_peer_transport_session_stream_from_hello_until_closed(
+        reader,
+        platform,
+        local_device_id,
+        trusted_peer_lookup,
+        hello,
+    )
+}
+
+fn execute_paired_peer_transport_session_stream_from_hello_until_closed<R, P, F>(
+    reader: &mut R,
+    platform: &P,
+    local_device_id: &DeviceId,
+    trusted_peer_lookup: F,
+    hello: PeerTransportSessionHello,
+) -> Result<PeerTransportSessionExecution, PlatformError>
+where
+    R: BufRead,
+    P: PlatformAdapter,
+    F: FnOnce(&DeviceId) -> Result<TrustedPeer<Ed25519PublicKey>, PlatformError>,
+{
     let trusted_peer = trusted_peer_lookup(&hello.device_id)?;
     let nonce = hello
         .nonce
@@ -1591,6 +1703,24 @@ where
                     needs_release_on_close,
                     PlatformError::new(
                         "peer session received duplicate hello frame after session start",
+                    ),
+                ));
+            }
+            Some(PeerTransportSessionFrame::IdentityProbe { .. }) => {
+                return Err(release_peer_transport_inputs_after_error(
+                    platform,
+                    needs_release_on_close,
+                    PlatformError::new(
+                        "peer session received identity probe frame after session start",
+                    ),
+                ));
+            }
+            Some(PeerTransportSessionFrame::IdentityDocument { .. }) => {
+                return Err(release_peer_transport_inputs_after_error(
+                    platform,
+                    needs_release_on_close,
+                    PlatformError::new(
+                        "peer session received identity document frame after session start",
                     ),
                 ));
             }
@@ -1767,7 +1897,13 @@ fn read_peer_transport_session_hello<R>(
 where
     R: BufRead,
 {
-    match read_peer_transport_session_frame(reader)? {
+    peer_transport_session_hello_from_frame(read_peer_transport_session_frame(reader)?)
+}
+
+fn peer_transport_session_hello_from_frame(
+    frame: PeerTransportSessionFrame,
+) -> Result<PeerTransportSessionHello, PlatformError> {
+    match frame {
         PeerTransportSessionFrame::Hello {
             protocol,
             device_id,
@@ -1784,6 +1920,12 @@ where
                 capabilities,
             })
         }
+        PeerTransportSessionFrame::IdentityProbe { .. } => Err(PlatformError::new(
+            "peer session expected hello frame before identity probe frames",
+        )),
+        PeerTransportSessionFrame::IdentityDocument { .. } => Err(PlatformError::new(
+            "peer session expected hello frame before identity document frames",
+        )),
         PeerTransportSessionFrame::Command { .. } => Err(PlatformError::new(
             "peer session expected hello frame before command frames",
         )),
@@ -1799,12 +1941,57 @@ where
     }
 }
 
+fn read_peer_transport_identity_document<R>(
+    reader: &mut R,
+) -> Result<PeerIdentityProbeResult, PlatformError>
+where
+    R: BufRead,
+{
+    match read_peer_transport_session_frame(reader)? {
+        PeerTransportSessionFrame::IdentityDocument {
+            protocol,
+            peer_document_json,
+            build_version,
+        } => {
+            protocol_version_from_wire(protocol)?;
+            Ok(PeerIdentityProbeResult {
+                peer_document_json: normalize_pairing_document_json(&peer_document_json)?,
+                build_version: build_version.trim().to_string(),
+            })
+        }
+        PeerTransportSessionFrame::IdentityProbe { .. } => Err(PlatformError::new(
+            "peer identity probe expected identity document frame before probe frames",
+        )),
+        PeerTransportSessionFrame::Hello { .. } => Err(PlatformError::new(
+            "peer identity probe expected identity document frame before hello frames",
+        )),
+        PeerTransportSessionFrame::AuthProof { .. } => Err(PlatformError::new(
+            "peer identity probe expected identity document frame before auth proof frames",
+        )),
+        PeerTransportSessionFrame::SessionReady { .. } => Err(PlatformError::new(
+            "peer identity probe expected identity document frame before session ready frames",
+        )),
+        PeerTransportSessionFrame::Command { .. } => Err(PlatformError::new(
+            "peer identity probe expected identity document frame before command frames",
+        )),
+        PeerTransportSessionFrame::Heartbeat { .. } => Err(PlatformError::new(
+            "peer identity probe expected identity document frame before heartbeat frames",
+        )),
+    }
+}
+
 fn read_peer_transport_session_auth_proof<R>(reader: &mut R) -> Result<AuthProof, PlatformError>
 where
     R: BufRead,
 {
     match read_peer_transport_session_frame(reader)? {
         PeerTransportSessionFrame::AuthProof { proof } => Ok(proof),
+        PeerTransportSessionFrame::IdentityProbe { .. } => Err(PlatformError::new(
+            "peer session expected auth proof frame before identity probe frames",
+        )),
+        PeerTransportSessionFrame::IdentityDocument { .. } => Err(PlatformError::new(
+            "peer session expected auth proof frame before identity document frames",
+        )),
         PeerTransportSessionFrame::Hello { .. } => Err(PlatformError::new(
             "peer session received duplicate hello frame before auth proof",
         )),
@@ -1826,6 +2013,12 @@ where
 {
     match read_peer_transport_session_frame(reader)? {
         PeerTransportSessionFrame::SessionReady { ready } => Ok(ready),
+        PeerTransportSessionFrame::IdentityProbe { .. } => Err(PlatformError::new(
+            "peer session expected session ready frame before identity probe frames",
+        )),
+        PeerTransportSessionFrame::IdentityDocument { .. } => Err(PlatformError::new(
+            "peer session expected session ready frame before identity document frames",
+        )),
         PeerTransportSessionFrame::Hello { .. } => Err(PlatformError::new(
             "peer session received duplicate hello frame before session ready",
         )),
@@ -1860,6 +2053,16 @@ where
             PeerTransportSessionFrame::Hello { .. } => {
                 return Err(PlatformError::new(
                     "peer session received duplicate hello frame after session start",
+                ));
+            }
+            PeerTransportSessionFrame::IdentityProbe { .. } => {
+                return Err(PlatformError::new(
+                    "peer session received identity probe frame after session start",
+                ));
+            }
+            PeerTransportSessionFrame::IdentityDocument { .. } => {
+                return Err(PlatformError::new(
+                    "peer session received identity document frame after session start",
                 ));
             }
             PeerTransportSessionFrame::AuthProof { .. } => {
@@ -1987,6 +2190,14 @@ impl PeerTransportMessage {
     rename_all_fields = "camelCase"
 )]
 pub enum PeerTransportSessionFrame {
+    IdentityProbe {
+        protocol: PeerTransportProtocolVersion,
+    },
+    IdentityDocument {
+        protocol: PeerTransportProtocolVersion,
+        peer_document_json: String,
+        build_version: String,
+    },
     Hello {
         protocol: PeerTransportProtocolVersion,
         device_id: String,
@@ -3507,6 +3718,83 @@ pub fn build_peer_session_discovery_candidates_from_shared_peers(
     ))
 }
 
+/// Probe a manually entered peer address and return the matching session candidate.
+pub fn probe_manual_peer_session_candidate(
+    params: &SessionProbeManualCandidateParams,
+    peer_sessions: &ManagedPeerSessionTransport,
+) -> Result<SessionProbeManualCandidateResult, PlatformError> {
+    let address = parse_peer_session_address(&params.address)?;
+    let Some(identity_context) = peer_sessions.discovery_identity_context()? else {
+        return Err(PlatformError::new(
+            "manual peer probe requires identity store context",
+        ));
+    };
+    let probe = probe_peer_identity_document(address)?;
+    let candidate = build_manual_peer_session_discovery_candidate(
+        &identity_context.local_device_id,
+        address,
+        &identity_context.trusted_peers,
+        &probe,
+    )?;
+    let mut result = build_session_discovery_candidates_result(&[candidate]);
+    let candidate = result.candidates.pop().ok_or_else(|| {
+        PlatformError::new("manual peer probe did not produce a session candidate")
+    })?;
+
+    Ok(SessionProbeManualCandidateResult { candidate })
+}
+
+fn build_manual_peer_session_discovery_candidate(
+    local_device_id: &DeviceId,
+    address: SocketAddr,
+    trusted_peers: &[TrustedPeerIdentity],
+    probe: &PeerIdentityProbeResult,
+) -> Result<DiscoverySessionCandidate, PlatformError> {
+    let document: PairingIdentityDocument = serde_json::from_str(&probe.peer_document_json)
+        .map_err(|error| PlatformError::new(format!("failed to decode peer identity: {error}")))?;
+    let peer = document
+        .clone()
+        .into_trusted_peer_identity()
+        .map_err(|error| PlatformError::new(format!("invalid peer identity: {error}")))?;
+    if peer.peer_id() == local_device_id.as_str() {
+        return Err(PlatformError::new(
+            "manual peer probe returned the local identity",
+        ));
+    }
+    let required_capabilities = peer_session_capabilities();
+    if !peer.capabilities().contains(required_capabilities) {
+        return Err(PlatformError::new(format!(
+            "manual peer {} is missing required capabilities",
+            peer.peer_id()
+        )));
+    }
+
+    let trusted_peer = trusted_peers
+        .iter()
+        .find(|trusted_peer| trusted_peer.peer_id() == peer.peer_id());
+    let trusted = trusted_peer.is_some();
+    let display_name = trusted_peer
+        .map(|trusted_peer| trusted_peer.display_name().to_string())
+        .unwrap_or_else(|| peer.display_name().to_string());
+    let fingerprint = trusted_peer
+        .map(|trusted_peer| trusted_peer.fingerprint().to_string())
+        .unwrap_or_else(|| peer.fingerprint().to_string());
+    let capabilities = trusted_peer
+        .map(TrustedPeerIdentity::capabilities)
+        .unwrap_or_else(|| peer.capabilities());
+
+    Ok(DiscoverySessionCandidate {
+        peer_id: peer.peer_id().to_string(),
+        display_name,
+        fingerprint: Some(fingerprint),
+        peer_document_json: (!trusted).then(|| probe.peer_document_json.clone()),
+        trusted,
+        address,
+        build_version: probe.build_version.clone(),
+        capabilities,
+    })
+}
+
 /// Convert discovery candidates into the local IPC result contract.
 pub fn build_session_discovery_candidates_result(
     candidates: &[DiscoverySessionCandidate],
@@ -3877,6 +4165,30 @@ fn handle_ipc_request(
                 }
             }
         }
+        IpcRequest::SessionProbeManualCandidate(request) => {
+            record_daemon_event(
+                logs,
+                DaemonLogLevel::Info,
+                "session.probeManualCandidate",
+                "Manual peer session candidate requested.",
+            );
+            match probe_manual_peer_session_candidate(&request.params, peer_sessions) {
+                Ok(result) => encode_response(&JsonRpcSuccess::new(request.id, result)),
+                Err(error) => {
+                    record_daemon_event(
+                        logs,
+                        DaemonLogLevel::Warn,
+                        "session.probeManualCandidate.failed",
+                        "Manual peer session candidate failed.",
+                    );
+                    encode_platform_error(
+                        request.id,
+                        "manual peer session candidate unavailable",
+                        error,
+                    )
+                }
+            }
+        }
         IpcRequest::SessionDisconnect(request) => {
             match disconnect_peer_session(state, dispatcher, peer_sessions) {
                 Ok(result) => {
@@ -4184,11 +4496,12 @@ mod tests {
         METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
         METHOD_INPUT_RELEASE_ALL, METHOD_PAIRING_ACCEPT, METHOD_PAIRING_START,
         METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES,
-        OsLocalIpcClient, PairingAcceptParams, PairingAcceptResult, PairingRejectParams,
-        PairingRejectResult, PairingStartParams, PairingStartResult, PeerStatus, PermissionsProbe,
-        PermissionsProbeParams, SessionConnectParams, SessionDisconnectResult,
-        SessionDiscoveryCandidatesParams, SessionDiscoveryCandidatesResult, SessionStatus,
-        call_json_rpc, to_json_line,
+        METHOD_SESSION_PROBE_MANUAL_CANDIDATE, OsLocalIpcClient, PairingAcceptParams,
+        PairingAcceptResult, PairingRejectParams, PairingRejectResult, PairingStartParams,
+        PairingStartResult, PeerStatus, PermissionsProbe, PermissionsProbeParams,
+        SessionConnectParams, SessionDisconnectResult, SessionDiscoveryCandidatesParams,
+        SessionDiscoveryCandidatesResult, SessionProbeManualCandidateParams,
+        SessionProbeManualCandidateResult, SessionStatus, call_json_rpc, to_json_line,
     };
     use akraz_platform::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
@@ -4209,21 +4522,23 @@ mod tests {
         ManagedPeerSessionTransport, NoopCoreActionDispatcher, PeerSessionReconnectBackoff,
         PeerTransportCommandExecution, PeerTransportCommandPayload, PeerTransportInputEvent,
         PeerTransportMessage, PeerTransportProtocolVersion, PeerTransportSessionFrame,
-        PowerResumeWatchdog, RuntimeEnvironmentWatchdog, TcpPeerSessionHeartbeatWorker,
-        TcpPeerSessionStreamState, TcpPeerSessionTransport, TcpPeerTransport,
-        TransportCoreActionDispatcher, apply_routed_capture_event_to_state, build_daemon_status,
-        build_daemon_status_with_peer_sessions, build_diagnostics_keyboard_layout,
-        build_diagnostics_screen_topology, build_peer_session_discovery_candidates,
+        PeerTransportSessionListenerOutcome, PowerResumeWatchdog, RuntimeEnvironmentWatchdog,
+        TcpPeerSessionHeartbeatWorker, TcpPeerSessionStreamState, TcpPeerSessionTransport,
+        TcpPeerTransport, TransportCoreActionDispatcher, apply_routed_capture_event_to_state,
+        build_daemon_status, build_daemon_status_with_peer_sessions,
+        build_diagnostics_keyboard_layout, build_diagnostics_screen_topology,
+        build_peer_session_discovery_candidates,
         build_peer_session_discovery_candidates_from_shared_peers, build_permissions_probe,
         build_session_discovery_candidates_result, connect_peer_session, disconnect_peer_session,
         dispatch_input_capture_idle_watchdog_action, drain_capture_events,
         execute_authenticated_peer_transport_session_stream_until_closed,
+        execute_paired_peer_transport_or_identity_probe_until_closed_with_timeout,
         execute_paired_tcp_peer_transport_session_until_closed_with_timeout,
         execute_peer_transport_command, execute_peer_transport_session_stream_until_closed,
         handle_ipc_request_line, input_capture_policy_for_control_mode,
-        inspect_runtime_environment_and_recover, recover_local_control_and_release_inputs,
-        recover_runtime_after_system_resume_and_dispatch, serve_daemon_ipc,
-        serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
+        inspect_runtime_environment_and_recover, probe_peer_identity_document,
+        recover_local_control_and_release_inputs, recover_runtime_after_system_resume_and_dispatch,
+        serve_daemon_ipc, serve_tcp_peer_transport_commands, serve_tcp_peer_transport_session,
         serve_tcp_peer_transport_session_and_execute,
         serve_tcp_peer_transport_session_and_execute_until_closed,
         serve_tcp_peer_transport_session_and_execute_until_closed_with_timeout,
@@ -4601,7 +4916,7 @@ mod tests {
         assert_eq!(status.daemon_version, DAEMON_VERSION);
         assert_eq!(status.mode, ControlModeSnapshot::from(ControlMode::Local));
         assert_eq!(status.protocol.major, 1);
-        assert_eq!(status.protocol.minor, 4);
+        assert_eq!(status.protocol.minor, ProtocolVersion::CURRENT.minor);
         assert!(status.peers.is_empty());
         assert_eq!(
             status.capabilities,
@@ -5147,6 +5462,169 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&identity_store_path);
+    }
+
+    #[test]
+    fn peer_identity_probe_returns_public_pairing_document() {
+        let identity_store_path = unique_identity_store_path("manual-probe-listener");
+        let _ = std::fs::remove_file(&identity_store_path);
+        let identity_store = FileIdentityStore::new(&identity_store_path);
+        let local = identity_store
+            .load_or_create("Linux Laptop")
+            .expect("create local identity store");
+        let expected_document = PairingIdentityDocument::from_device_identity(
+            local.identity(),
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+        let expected_device_id = local.identity().device_id().to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind manual probe loopback listener");
+        let address = listener
+            .local_addr()
+            .expect("manual probe listener address");
+        let platform = FakePlatformAdapter::default();
+        let local_device_id = DeviceId::new(local.identity().device_id());
+        let expected_document_json =
+            serde_json::to_string(&expected_document).expect("expected document JSON");
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept identity probe");
+            execute_paired_peer_transport_or_identity_probe_until_closed_with_timeout(
+                stream,
+                &platform,
+                Duration::from_secs(2),
+                &expected_document_json,
+                &local_device_id,
+                |_| {
+                    Err(PlatformError::new(
+                        "identity probe must not load trusted peers",
+                    ))
+                },
+            )
+        });
+
+        let probe = probe_peer_identity_document(address).expect("manual identity probe");
+        let outcome = server_thread
+            .join()
+            .expect("identity probe server thread")
+            .expect("identity probe served");
+        let document: PairingIdentityDocument =
+            serde_json::from_str(&probe.peer_document_json).expect("decode probe document");
+
+        assert_eq!(
+            outcome,
+            PeerTransportSessionListenerOutcome::IdentityProbeResponded
+        );
+        assert_eq!(document.device_id(), expected_device_id);
+        assert_eq!(document.fingerprint(), expected_document.fingerprint());
+        assert_eq!(probe.build_version, DAEMON_VERSION);
+
+        let _ = std::fs::remove_file(&identity_store_path);
+    }
+
+    #[test]
+    fn daemon_ipc_manual_probe_returns_registerable_candidate() {
+        let local_store_path = unique_identity_store_path("manual-probe-local");
+        let remote_store_path = unique_identity_store_path("manual-probe-remote");
+        let _ = std::fs::remove_file(&local_store_path);
+        let _ = std::fs::remove_file(&remote_store_path);
+        let local_store = FileIdentityStore::new(&local_store_path);
+        local_store
+            .load_or_create("Windows Desktop")
+            .expect("create local identity store");
+        let remote_store = FileIdentityStore::new(&remote_store_path);
+        let remote = remote_store
+            .load_or_create("Linux Laptop")
+            .expect("create remote identity store");
+        let remote_document = PairingIdentityDocument::from_device_identity(
+            remote.identity(),
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+        );
+        let remote_document_json =
+            serde_json::to_string(&remote_document).expect("remote document JSON");
+        let expected_remote_document_json = remote_document_json.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind manual probe loopback listener");
+        let address = listener
+            .local_addr()
+            .expect("manual probe listener address");
+        let platform = FakePlatformAdapter::default();
+        let remote_device_id = DeviceId::new(remote.identity().device_id());
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept identity probe");
+            execute_paired_peer_transport_or_identity_probe_until_closed_with_timeout(
+                stream,
+                &platform,
+                Duration::from_secs(2),
+                &remote_document_json,
+                &remote_device_id,
+                |_| {
+                    Err(PlatformError::new(
+                        "identity probe must not load trusted peers",
+                    ))
+                },
+            )
+        });
+        let state = shared_runtime_state(RuntimeInputState::new());
+        let platform = FakePlatformAdapter::default();
+        let dispatcher = Arc::new(LocalPlatformCoreActionDispatcher::new(
+            platform.clone(),
+            NoopCoreActionDispatcher,
+        ));
+        let server = DaemonIpcServer::from_shared_state_dispatcher_peer_sessions_discovery_and_logs(
+            state,
+            platform,
+            dispatcher,
+            ManagedPeerSessionTransport::with_identity_store(&local_store_path, "Windows Desktop"),
+            SharedDiscoveredPeers::new(),
+            shared_daemon_log_buffer(8),
+        );
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_SESSION_PROBE_MANUAL_CANDIDATE,
+            SessionProbeManualCandidateParams {
+                address: address.to_string(),
+            },
+        );
+        let request_line = to_json_line(&request).expect("manual probe request line");
+
+        let response_line = server
+            .handle_request_line(&request_line)
+            .expect("manual probe response line");
+        let response: JsonRpcSuccess<SessionProbeManualCandidateResult> =
+            serde_json::from_str(&response_line).expect("manual probe success JSON");
+        let outcome = server_thread
+            .join()
+            .expect("identity probe server thread")
+            .expect("identity probe served");
+
+        assert_eq!(
+            outcome,
+            PeerTransportSessionListenerOutcome::IdentityProbeResponded
+        );
+        assert_eq!(response.id, "req_1");
+        assert_eq!(
+            response.result.candidate.peer_id,
+            remote.identity().device_id()
+        );
+        assert_eq!(response.result.candidate.display_name, "Linux Laptop");
+        assert_eq!(
+            response.result.candidate.fingerprint.as_deref(),
+            Some(remote_document.fingerprint())
+        );
+        assert_eq!(
+            response.result.candidate.peer_document_json.as_deref(),
+            Some(expected_remote_document_json.as_str())
+        );
+        assert!(!response.result.candidate.trusted);
+        assert_eq!(response.result.candidate.address, address.to_string());
+        assert_eq!(response.result.candidate.build_version, DAEMON_VERSION);
+        assert_eq!(
+            response.result.candidate.capabilities,
+            CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD
+        );
+
+        let _ = std::fs::remove_file(&local_store_path);
+        let _ = std::fs::remove_file(&remote_store_path);
     }
 
     #[test]
@@ -6059,6 +6537,16 @@ mod tests {
                     Some(PeerTransportSessionFrame::Hello { .. }) => {
                         return Err(PlatformError::new(
                             "test peer received duplicate hello before heartbeat",
+                        ));
+                    }
+                    Some(PeerTransportSessionFrame::IdentityProbe { .. }) => {
+                        return Err(PlatformError::new(
+                            "test peer received identity probe before heartbeat",
+                        ));
+                    }
+                    Some(PeerTransportSessionFrame::IdentityDocument { .. }) => {
+                        return Err(PlatformError::new(
+                            "test peer received identity document before heartbeat",
                         ));
                     }
                     Some(PeerTransportSessionFrame::AuthProof { .. }) => {
@@ -7604,6 +8092,51 @@ mod tests {
         assert_eq!(
             connect_response.error.message,
             "session connect unavailable: managed peer session requires identity store before session.connect"
+        );
+        assert_eq!(peer_sessions.active_session(), Ok(None));
+    }
+
+    #[test]
+    fn daemon_ipc_manual_probe_rejects_without_identity_store_before_network_probe() {
+        let state = shared_runtime_state(RuntimeInputState::new());
+        let platform = FakePlatformAdapter::default();
+        let peer_sessions = ManagedPeerSessionTransport::new();
+        let dispatcher = LocalPlatformCoreActionDispatcher::new(
+            platform.clone(),
+            TransportCoreActionDispatcher::new(peer_sessions.clone()),
+        );
+        let server = DaemonIpcServer::from_shared_state_dispatcher_and_peer_sessions(
+            state,
+            platform,
+            std::sync::Arc::new(dispatcher),
+            peer_sessions.clone(),
+        );
+        let probe_request = JsonRpcRequest::new(
+            "req_probe",
+            METHOD_SESSION_PROBE_MANUAL_CANDIDATE,
+            SessionProbeManualCandidateParams {
+                address: "127.0.0.1:24888".to_string(),
+            },
+        );
+        let probe_line = match to_json_line(&probe_request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected manual probe request serialization: {error}"),
+        };
+
+        let probe_response_line = match server.handle_request_line(&probe_line) {
+            Ok(line) => line,
+            Err(error) => panic!("expected manual probe response: {error}"),
+        };
+        let probe_response: JsonRpcFailure = match serde_json::from_str(&probe_response_line) {
+            Ok(response) => response,
+            Err(error) => panic!("expected manual probe failure JSON: {error}"),
+        };
+
+        assert_eq!(probe_response.id, Some("req_probe".to_string()));
+        assert_eq!(probe_response.error.code, JSONRPC_DAEMON_ERROR);
+        assert_eq!(
+            probe_response.error.message,
+            "manual peer session candidate unavailable: manual peer probe requires identity store context"
         );
         assert_eq!(peer_sessions.active_session(), Ok(None));
     }

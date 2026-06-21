@@ -19,14 +19,16 @@ use akraz_ipc::{
     METHOD_DAEMON_SHUTDOWN, METHOD_DAEMON_STATUS, METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT,
     METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY, METHOD_INPUT_RELEASE_ALL, METHOD_PAIRING_ACCEPT,
     METHOD_PAIRING_REJECT, METHOD_PAIRING_START, METHOD_PERMISSIONS_PROBE, METHOD_SESSION_CONNECT,
-    METHOD_SESSION_DISCONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES, OsLocalIpcClient,
-    PairingAcceptParams, PairingAcceptResult, PairingRejectParams, PairingRejectResult,
-    PairingStartParams, PairingStartResult, PermissionsProbe, PermissionsProbeParams,
-    SessionConnectResult, SessionDisconnectParams, SessionDisconnectResult,
-    SessionDiscoveryCandidatesParams, SessionDiscoveryCandidatesResult,
-    build_diagnostics_latency_histogram, build_diagnostics_runtime_environment,
-    build_diagnostics_snapshot, build_diagnostics_support_bundle_with_previous_crash,
-    call_json_rpc, resolve_current_default_endpoint,
+    METHOD_SESSION_DISCONNECT, METHOD_SESSION_DISCOVERY_CANDIDATES,
+    METHOD_SESSION_PROBE_MANUAL_CANDIDATE, OsLocalIpcClient, PairingAcceptParams,
+    PairingAcceptResult, PairingRejectParams, PairingRejectResult, PairingStartParams,
+    PairingStartResult, PermissionsProbe, PermissionsProbeParams, SessionConnectResult,
+    SessionDisconnectParams, SessionDisconnectResult, SessionDiscoveryCandidatesParams,
+    SessionDiscoveryCandidatesResult, SessionProbeManualCandidateParams,
+    SessionProbeManualCandidateResult, build_diagnostics_latency_histogram,
+    build_diagnostics_runtime_environment, build_diagnostics_snapshot,
+    build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
+    resolve_current_default_endpoint,
 };
 use akraz_protocol::CapabilityFlags;
 use serde::{Deserialize, Serialize};
@@ -96,6 +98,7 @@ fn app_builder(managed: ManagedDaemon) -> tauri::Builder<tauri::Wry> {
             daemon_stop,
             session_connect,
             session_discovery_candidates,
+            session_probe_manual_candidate,
             pairing_start,
             pairing_accept,
             pairing_reject,
@@ -424,6 +427,15 @@ async fn session_discovery_candidates() -> Result<SessionDiscoveryCandidatesResu
 }
 
 #[tauri::command]
+async fn session_probe_manual_candidate(
+    params: SessionProbeManualCandidateOptions,
+) -> Result<SessionProbeManualCandidateResult, String> {
+    tauri::async_runtime::spawn_blocking(move || call_daemon_session_probe_manual_candidate(params))
+        .await
+        .map_err(|error| format!("manual peer probe task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn pairing_start(params: PairingStartOptions) -> Result<PairingStartResult, String> {
     tauri::async_runtime::spawn_blocking(move || call_daemon_pairing_start(params))
         .await
@@ -612,6 +624,12 @@ struct DaemonStartOptions {
 struct SessionConnectOptions {
     peer_id: String,
     local_device_id: String,
+    address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionProbeManualCandidateOptions {
     address: String,
 }
 
@@ -1406,6 +1424,22 @@ fn call_daemon_session_discovery_candidates() -> Result<SessionDiscoveryCandidat
     )
 }
 
+fn call_daemon_session_probe_manual_candidate(
+    params: SessionProbeManualCandidateOptions,
+) -> Result<SessionProbeManualCandidateResult, String> {
+    let params = normalize_session_probe_manual_candidate_options(params)?;
+    let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
+    call_daemon_json_rpc::<SessionProbeManualCandidateResult, _>(
+        &client,
+        &JsonRpcRequest::new(
+            LOCAL_REQUEST_ID,
+            METHOD_SESSION_PROBE_MANUAL_CANDIDATE,
+            params,
+        ),
+        "manual peer probe",
+    )
+}
+
 fn call_daemon_pairing_start(params: PairingStartOptions) -> Result<PairingStartResult, String> {
     let params = normalize_pairing_start_options(params)?;
     let client = build_default_daemon_client().map_err(|error| error.to_user_message())?;
@@ -1827,6 +1861,15 @@ fn normalize_pairing_start_options(
 
     Ok(PairingStartParams {
         peer_document_json: peer_document_json.to_string(),
+    })
+}
+
+fn normalize_session_probe_manual_candidate_options(
+    mut options: SessionProbeManualCandidateOptions,
+) -> Result<SessionProbeManualCandidateParams, String> {
+    options.address = normalize_session_address(&options.address)?.to_string();
+    Ok(SessionProbeManualCandidateParams {
+        address: options.address,
     })
 }
 
@@ -2280,7 +2323,8 @@ mod tests {
         LogicalRectSnapshot, PairingAcceptParams, PairingAcceptResult, PairingRejectParams,
         PairingRejectResult, PairingStartParams, PairingStartResult, PermissionIssue,
         PermissionsProbe, ProtocolVersionSnapshot, SessionConnectResult, SessionDiscoveryCandidate,
-        SessionDiscoveryCandidatesResult, SessionStatus, to_json_line,
+        SessionDiscoveryCandidatesResult, SessionProbeManualCandidateParams,
+        SessionProbeManualCandidateResult, SessionStatus, to_json_line,
     };
 
     use super::{
@@ -2301,11 +2345,11 @@ mod tests {
         list_trusted_identities_from_path, load_layout_from_path, load_settings_from_path,
         normalize_pairing_accept_options, normalize_pairing_reject_options,
         normalize_pairing_start_options, normalize_session_connect_options,
-        parse_daemon_status_response, parse_json_rpc_response,
-        previous_daemon_crash_start_blocked_snapshot, read_previous_daemon_crash_from_path,
-        resolve_env_daemon_executable_from, save_layout_to_path, save_settings_to_path,
-        settings_start_smoke_settings, stop_outcome_without_managed_child,
-        trust_identity_document_from_json,
+        normalize_session_probe_manual_candidate_options, parse_daemon_status_response,
+        parse_json_rpc_response, previous_daemon_crash_start_blocked_snapshot,
+        read_previous_daemon_crash_from_path, resolve_env_daemon_executable_from,
+        save_layout_to_path, save_settings_to_path, settings_start_smoke_settings,
+        stop_outcome_without_managed_child, trust_identity_document_from_json,
     };
 
     fn monitor_snapshots() -> Vec<DiagnosticsMonitorSnapshot> {
@@ -3207,7 +3251,45 @@ mod tests {
     }
 
     #[test]
+    fn parses_session_probe_manual_candidate_success_response() {
+        let result = SessionProbeManualCandidateResult {
+            candidate: SessionDiscoveryCandidate {
+                peer_id: "new-laptop".to_string(),
+                display_name: "New Laptop".to_string(),
+                fingerprint: Some("AKRZ-PAIRABLE".to_string()),
+                peer_document_json: Some(r#"{"kind":"akraz.peerIdentity"}"#.to_string()),
+                trusted: false,
+                address: "127.0.0.1:4455".to_string(),
+                build_version: env!("CARGO_PKG_VERSION").to_string(),
+                capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+            },
+        };
+        let line = match to_json_line(&JsonRpcSuccess::new("tauri", result.clone())) {
+            Ok(line) => line,
+            Err(error) => panic!("expected manual peer probe JSON: {error}"),
+        };
+
+        assert_eq!(
+            parse_json_rpc_response::<SessionProbeManualCandidateResult>(
+                &line,
+                "manual peer probe"
+            ),
+            Ok(result)
+        );
+    }
+
+    #[test]
     fn pairing_options_normalize_values() {
+        assert_eq!(
+            normalize_session_probe_manual_candidate_options(
+                super::SessionProbeManualCandidateOptions {
+                    address: " 127.0.0.1:4455 ".to_string(),
+                }
+            ),
+            Ok(SessionProbeManualCandidateParams {
+                address: "127.0.0.1:4455".to_string(),
+            })
+        );
         assert_eq!(
             normalize_pairing_start_options(super::PairingStartOptions {
                 peer_document_json: " {\"kind\":\"akraz.peerIdentity\"} ".to_string(),
@@ -3238,6 +3320,14 @@ mod tests {
 
     #[test]
     fn pairing_options_reject_invalid_values() {
+        assert_eq!(
+            normalize_session_probe_manual_candidate_options(
+                super::SessionProbeManualCandidateOptions {
+                    address: "localhost".to_string(),
+                }
+            ),
+            Err("address must be an IP address and port.".to_string())
+        );
         assert_eq!(
             normalize_pairing_start_options(super::PairingStartOptions {
                 peer_document_json: " ".to_string(),

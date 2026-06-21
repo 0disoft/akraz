@@ -95,6 +95,9 @@ pub const METHOD_SESSION_CONNECT: &str = "session.connect";
 /// JSON-RPC method for listing discovered peer-session candidates.
 pub const METHOD_SESSION_DISCOVERY_CANDIDATES: &str = "session.discoveryCandidates";
 
+/// JSON-RPC method for probing a manually entered peer-session address.
+pub const METHOD_SESSION_PROBE_MANUAL_CANDIDATE: &str = "session.probeManualCandidate";
+
 /// JSON-RPC method for disconnecting the active peer session transport.
 pub const METHOD_SESSION_DISCONNECT: &str = "session.disconnect";
 
@@ -798,6 +801,7 @@ pub enum IpcRequest {
     PairingReject(JsonRpcRequest<PairingRejectParams>),
     SessionConnect(JsonRpcRequest<SessionConnectParams>),
     SessionDiscoveryCandidates(JsonRpcRequest<SessionDiscoveryCandidatesParams>),
+    SessionProbeManualCandidate(JsonRpcRequest<SessionProbeManualCandidateParams>),
     SessionDisconnect(JsonRpcRequest<SessionDisconnectParams>),
 }
 
@@ -817,6 +821,7 @@ impl IpcRequest {
             Self::PairingReject(request) => &request.id,
             Self::SessionConnect(request) => &request.id,
             Self::SessionDiscoveryCandidates(request) => &request.id,
+            Self::SessionProbeManualCandidate(request) => &request.id,
             Self::SessionDisconnect(request) => &request.id,
         }
     }
@@ -836,6 +841,7 @@ impl IpcRequest {
             Self::PairingReject(request) => &request.method,
             Self::SessionConnect(request) => &request.method,
             Self::SessionDiscoveryCandidates(request) => &request.method,
+            Self::SessionProbeManualCandidate(request) => &request.method,
             Self::SessionDisconnect(request) => &request.method,
         }
     }
@@ -986,6 +992,13 @@ pub struct SessionConnectParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionDiscoveryCandidatesParams {}
+
+/// Params for `session.probeManualCandidate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionProbeManualCandidateParams {
+    pub address: String,
+}
 
 /// Empty params for `session.disconnect`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1414,6 +1427,13 @@ pub struct SessionDiscoveryCandidatesResult {
     pub candidates: Vec<SessionDiscoveryCandidate>,
 }
 
+/// `session.probeManualCandidate` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionProbeManualCandidateResult {
+    pub candidate: SessionDiscoveryCandidate,
+}
+
 /// `session.disconnect` result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1769,6 +1789,9 @@ pub fn parse_request_line(line: &str) -> Result<IpcRequest, JsonRpcFailure> {
         METHOD_SESSION_DISCOVERY_CANDIDATES => {
             parse_typed_request(raw).map(IpcRequest::SessionDiscoveryCandidates)
         }
+        METHOD_SESSION_PROBE_MANUAL_CANDIDATE => {
+            parse_typed_request(raw).map(IpcRequest::SessionProbeManualCandidate)
+        }
         METHOD_SESSION_DISCONNECT => parse_typed_request(raw).map(IpcRequest::SessionDisconnect),
         _ => Err(JsonRpcFailure::new(
             Some(raw.id),
@@ -1828,16 +1851,17 @@ mod tests {
         METHOD_DIAGNOSTICS_KEYBOARD_LAYOUT, METHOD_DIAGNOSTICS_SCREEN_TOPOLOGY,
         METHOD_INPUT_RELEASE_ALL, METHOD_PAIRING_ACCEPT, METHOD_PAIRING_REJECT,
         METHOD_PAIRING_START, METHOD_SESSION_CONNECT, METHOD_SESSION_DISCONNECT,
-        METHOD_SESSION_DISCOVERY_CANDIDATES, OsLocalIpcClient, PairingAcceptParams,
-        PairingAcceptResult, PairingRejectParams, PairingRejectResult, PairingStartParams,
-        PairingStartResult, PeerStatus, PermissionIssue, PermissionsProbe, ProtocolVersionSnapshot,
-        SessionConnectParams, SessionConnectResult, SessionDisconnectParams,
-        SessionDisconnectResult, SessionDiscoveryCandidate, SessionDiscoveryCandidatesParams,
-        SessionDiscoveryCandidatesResult, SessionStatus, build_diagnostics_latency_histogram,
-        build_diagnostics_snapshot, build_diagnostics_support_bundle,
-        build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
-        diagnostics_session_type_from_values, parse_request_line, resolve_default_endpoint,
-        serve_os_local_ipc_once, to_json_line,
+        METHOD_SESSION_DISCOVERY_CANDIDATES, METHOD_SESSION_PROBE_MANUAL_CANDIDATE,
+        OsLocalIpcClient, PairingAcceptParams, PairingAcceptResult, PairingRejectParams,
+        PairingRejectResult, PairingStartParams, PairingStartResult, PeerStatus, PermissionIssue,
+        PermissionsProbe, ProtocolVersionSnapshot, SessionConnectParams, SessionConnectResult,
+        SessionDisconnectParams, SessionDisconnectResult, SessionDiscoveryCandidate,
+        SessionDiscoveryCandidatesParams, SessionDiscoveryCandidatesResult,
+        SessionProbeManualCandidateParams, SessionProbeManualCandidateResult, SessionStatus,
+        build_diagnostics_latency_histogram, build_diagnostics_snapshot,
+        build_diagnostics_support_bundle, build_diagnostics_support_bundle_with_previous_crash,
+        call_json_rpc, diagnostics_session_type_from_values, parse_request_line,
+        resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
     };
     use akraz_protocol::CapabilityFlags;
     use serde_json::json;
@@ -2881,6 +2905,76 @@ mod tests {
                         "buildVersion": CURRENT_TEST_VERSION,
                         "capabilities": 3
                     }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn session_probe_manual_candidate_request_uses_camel_case_contract() {
+        let request = JsonRpcRequest::new(
+            "req_1",
+            METHOD_SESSION_PROBE_MANUAL_CANDIDATE,
+            SessionProbeManualCandidateParams {
+                address: "127.0.0.1:24888".to_string(),
+            },
+        );
+        let line = match to_json_line(&request) {
+            Ok(line) => line,
+            Err(error) => panic!("expected request serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "method": "session.probeManualCandidate",
+                "params": {
+                    "address": "127.0.0.1:24888"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn session_probe_manual_candidate_response_uses_existing_candidate_contract() {
+        let response = JsonRpcSuccess::new(
+            "req_1",
+            SessionProbeManualCandidateResult {
+                candidate: SessionDiscoveryCandidate {
+                    peer_id: "new-laptop".to_string(),
+                    display_name: "New Laptop".to_string(),
+                    fingerprint: Some("AKRZ-PAIRABLE".to_string()),
+                    peer_document_json: Some(r#"{"kind":"akraz.peerIdentity"}"#.to_string()),
+                    trusted: false,
+                    address: "127.0.0.1:24888".to_string(),
+                    build_version: CURRENT_TEST_VERSION.to_string(),
+                    capabilities: CapabilityFlags::POINTER | CapabilityFlags::KEYBOARD,
+                },
+            },
+        );
+        let line = match to_json_line(&response) {
+            Ok(line) => line,
+            Err(error) => panic!("expected response serialization: {error}"),
+        };
+
+        assert_eq!(
+            json_value_or_panic(&line),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req_1",
+                "result": {
+                    "candidate": {
+                        "peerId": "new-laptop",
+                        "displayName": "New Laptop",
+                        "fingerprint": "AKRZ-PAIRABLE",
+                        "peerDocumentJson": "{\"kind\":\"akraz.peerIdentity\"}",
+                        "trusted": false,
+                        "address": "127.0.0.1:24888",
+                        "buildVersion": CURRENT_TEST_VERSION,
+                        "capabilities": 3
+                    }
                 }
             })
         );

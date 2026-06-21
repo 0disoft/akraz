@@ -230,6 +230,7 @@ export interface SessionDiscoveryCandidate {
   displayName: string;
   fingerprint?: string;
   peerDocumentJson?: string;
+  source?: "manualProbe";
   trusted: boolean;
   address: string;
   buildVersion: string;
@@ -238,6 +239,14 @@ export interface SessionDiscoveryCandidate {
 
 export interface SessionDiscoveryCandidatesResult {
   candidates: SessionDiscoveryCandidate[];
+}
+
+export interface SessionProbeManualCandidateParams {
+  address: string;
+}
+
+export interface SessionProbeManualCandidateResult {
+  candidate: SessionDiscoveryCandidate;
 }
 
 export interface SessionDisconnectResult {

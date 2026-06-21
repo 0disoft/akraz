@@ -536,6 +536,13 @@ h3 {
   border-top: 1px solid #e0d4be;
 }
 
+.manual-probe-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
 .connection-candidate-list {
   display: grid;
   gap: 8px;
@@ -713,8 +720,15 @@ h3 {
   gap: 6px;
 }
 
+.manual-probe-row label {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
 .edge-row label span,
-.session-row label span {
+.session-row label span,
+.manual-probe-row label span {
   color: #687280;
   font-size: 0.82rem;
   font-weight: 700;
@@ -724,6 +738,7 @@ h3 {
 .edge-row select,
 .session-row input,
 .session-row select,
+.manual-probe-row input,
 .peer-listen-row input,
 .manual-address-row input,
 .document-field textarea {
@@ -1270,6 +1285,7 @@ h3 {
 
   .edge-row,
   .session-row,
+  .manual-probe-row,
   .manual-address-row,
   .connection-candidate-row,
   .connection-candidate-button {
