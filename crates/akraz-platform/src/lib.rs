@@ -1894,22 +1894,38 @@ impl WindowsInjectedInputState {
 }
 
 /// Adapter used on operating systems that do not have an implementation yet.
-#[cfg(not(windows))]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct UnsupportedPlatformAdapter;
+#[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedPlatformAdapter {
+    session: UnsupportedDesktopSession,
+}
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 impl UnsupportedPlatformAdapter {
     /// Create the unsupported platform adapter.
     pub fn new() -> Self {
-        Self
+        Self {
+            session: detect_unsupported_desktop_session(),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_session(session: UnsupportedDesktopSession) -> Self {
+        Self { session }
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
+impl Default for UnsupportedPlatformAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(not(windows), test))]
 impl PlatformAdapter for UnsupportedPlatformAdapter {
     fn name(&self) -> &'static str {
-        "unsupported"
+        self.session.adapter_name()
     }
 
     fn probe_capabilities(&self) -> Result<PlatformCapabilities, PlatformError> {
@@ -1919,6 +1935,92 @@ impl PlatformAdapter for UnsupportedPlatformAdapter {
     fn release_all(&self) -> Result<(), PlatformError> {
         Ok(())
     }
+}
+
+#[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsupportedDesktopSession {
+    LinuxX11,
+    LinuxWayland,
+    LinuxUnknown,
+    Macos,
+    Other,
+}
+
+#[cfg(any(not(windows), test))]
+impl UnsupportedDesktopSession {
+    fn adapter_name(self) -> &'static str {
+        match self {
+            Self::LinuxX11 => "linux-x11",
+            Self::LinuxWayland => "linux-wayland",
+            Self::LinuxUnknown => "linux-unknown",
+            Self::Macos => "macos-unsupported",
+            Self::Other => "unsupported",
+        }
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn detect_unsupported_desktop_session() -> UnsupportedDesktopSession {
+    let xdg_session_type = std::env::var("XDG_SESSION_TYPE").ok();
+    let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+    let display = std::env::var("DISPLAY").ok();
+
+    detect_unsupported_desktop_session_from_env(
+        std::env::consts::OS,
+        xdg_session_type.as_deref(),
+        wayland_display.as_deref(),
+        display.as_deref(),
+    )
+}
+
+#[cfg(any(not(windows), test))]
+fn detect_unsupported_desktop_session_from_env(
+    target_os: &str,
+    xdg_session_type: Option<&str>,
+    wayland_display: Option<&str>,
+    display: Option<&str>,
+) -> UnsupportedDesktopSession {
+    match target_os {
+        "linux" => detect_linux_desktop_session(xdg_session_type, wayland_display, display),
+        "macos" => UnsupportedDesktopSession::Macos,
+        _ => UnsupportedDesktopSession::Other,
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn detect_linux_desktop_session(
+    xdg_session_type: Option<&str>,
+    wayland_display: Option<&str>,
+    display: Option<&str>,
+) -> UnsupportedDesktopSession {
+    match normalized_env_value(xdg_session_type).as_deref() {
+        Some("wayland") => return UnsupportedDesktopSession::LinuxWayland,
+        Some("x11" | "xorg") => return UnsupportedDesktopSession::LinuxX11,
+        _ => {}
+    }
+
+    if env_value_is_present(wayland_display) {
+        return UnsupportedDesktopSession::LinuxWayland;
+    }
+    if env_value_is_present(display) {
+        return UnsupportedDesktopSession::LinuxX11;
+    }
+
+    UnsupportedDesktopSession::LinuxUnknown
+}
+
+#[cfg(any(not(windows), test))]
+fn normalized_env_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+#[cfg(any(not(windows), test))]
+fn env_value_is_present(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| !value.is_empty())
 }
 
 /// Deterministic platform adapter for core and daemon tests.
@@ -2138,7 +2240,8 @@ mod tests {
     use super::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
         InputCapturePolicy, KeyboardLayoutSnapshot, PlatformAdapter, PlatformCapabilities,
-        PlatformError, runtime_platform_adapter,
+        PlatformError, UnsupportedDesktopSession, UnsupportedPlatformAdapter,
+        detect_unsupported_desktop_session_from_env, runtime_platform_adapter,
     };
 
     #[cfg(windows)]
@@ -2198,6 +2301,88 @@ mod tests {
                 can_inject_keyboard: true,
             }
         );
+    }
+
+    #[test]
+    fn linux_desktop_session_detection_prefers_declared_session_type() {
+        assert_eq!(
+            detect_unsupported_desktop_session_from_env(
+                "linux",
+                Some("wayland"),
+                Some("wayland-0"),
+                Some(":0"),
+            ),
+            UnsupportedDesktopSession::LinuxWayland
+        );
+        assert_eq!(
+            detect_unsupported_desktop_session_from_env(
+                "linux",
+                Some("x11"),
+                Some("wayland-0"),
+                Some(":0"),
+            ),
+            UnsupportedDesktopSession::LinuxX11
+        );
+    }
+
+    #[test]
+    fn linux_desktop_session_detection_uses_display_fallbacks() {
+        assert_eq!(
+            detect_unsupported_desktop_session_from_env("linux", None, Some("wayland-0"), None),
+            UnsupportedDesktopSession::LinuxWayland
+        );
+        assert_eq!(
+            detect_unsupported_desktop_session_from_env("linux", Some(""), None, Some(":0")),
+            UnsupportedDesktopSession::LinuxX11
+        );
+        assert_eq!(
+            detect_unsupported_desktop_session_from_env("linux", Some("tty"), None, None),
+            UnsupportedDesktopSession::LinuxUnknown
+        );
+    }
+
+    #[test]
+    fn unsupported_desktop_sessions_have_stable_adapter_names() {
+        assert_eq!(
+            UnsupportedDesktopSession::LinuxX11.adapter_name(),
+            "linux-x11"
+        );
+        assert_eq!(
+            UnsupportedDesktopSession::LinuxWayland.adapter_name(),
+            "linux-wayland"
+        );
+        assert_eq!(
+            UnsupportedDesktopSession::LinuxUnknown.adapter_name(),
+            "linux-unknown"
+        );
+        assert_eq!(
+            UnsupportedDesktopSession::Macos.adapter_name(),
+            "macos-unsupported"
+        );
+        assert_eq!(
+            UnsupportedDesktopSession::Other.adapter_name(),
+            "unsupported"
+        );
+    }
+
+    #[test]
+    fn unsupported_adapter_reports_session_without_opening_capabilities() {
+        let adapter =
+            UnsupportedPlatformAdapter::from_session(UnsupportedDesktopSession::LinuxWayland);
+
+        assert_eq!(adapter.name(), "linux-wayland");
+        assert_eq!(
+            adapter.probe_capabilities(),
+            Ok(PlatformCapabilities::default())
+        );
+        assert_eq!(
+            match adapter.start_input_capture(InputCaptureConfig::default()) {
+                Ok(_) => panic!("unsupported capture should fail"),
+                Err(error) => error.to_string(),
+            },
+            "linux-wayland input capture is not available",
+        );
+        assert_eq!(adapter.release_all(), Ok(()));
     }
 
     #[test]
@@ -2664,8 +2849,17 @@ mod tests {
 
         if cfg!(windows) {
             assert_eq!(adapter.name(), "windows");
+        } else if cfg!(target_os = "linux") {
+            assert!(matches!(
+                adapter.name(),
+                "linux-x11" | "linux-wayland" | "linux-unknown"
+            ));
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(adapter.name(), "macos-unsupported");
         } else {
             assert_eq!(adapter.name(), "unsupported");
+        }
+        if !cfg!(windows) {
             assert_eq!(
                 adapter.probe_capabilities(),
                 Ok(PlatformCapabilities::default())
