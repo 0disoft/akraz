@@ -1,4 +1,5 @@
 export const WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION = "akraz.windowsMvpQaPlan/v1";
+export const WINDOWS_MVP_QA_SOAK_EVIDENCE_LABEL_PREFIX = "Windows MVP soak report";
 
 const windowsMvpQaCases = [
   {
@@ -442,6 +443,16 @@ export function buildWindowsMvpQaPlan(options = {}) {
 
 export function listWindowsMvpQaCaseIds() {
   return windowsMvpQaCases.map((testCase) => testCase.id);
+}
+
+export function listWindowsMvpSoakEvidenceQaCaseIds() {
+  return windowsMvpQaCases
+    .filter((testCase) =>
+      testCase.evidence.some((label) =>
+        label.startsWith(WINDOWS_MVP_QA_SOAK_EVIDENCE_LABEL_PREFIX),
+      ),
+    )
+    .map((testCase) => testCase.id);
 }
 
 export function parseWindowsMvpQaPlanArgs(args) {

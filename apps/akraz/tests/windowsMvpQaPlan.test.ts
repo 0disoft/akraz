@@ -3,9 +3,11 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 import {
+  WINDOWS_MVP_QA_SOAK_EVIDENCE_LABEL_PREFIX,
   WINDOWS_MVP_QA_PLAN_SCHEMA_VERSION,
   buildWindowsMvpQaPlan,
   listWindowsMvpQaCaseIds,
+  listWindowsMvpSoakEvidenceQaCaseIds,
   parseWindowsMvpQaPlanArgs,
 } from "../scripts/windows-mvp-qa-plan.mjs";
 
@@ -76,6 +78,21 @@ describe("Windows MVP QA plan", () => {
 
     expect(new Set(evidenceIds).size).toBe(evidenceIds.length);
     expect(evidenceIds.every((id) => /^(WIN|I18N|REL)-\d{3}-E\d+$/.test(id))).toBe(true);
+  });
+
+  test("derives soak-backed QA case ids from evidence requirements", () => {
+    const soakEvidenceCaseIds = listWindowsMvpSoakEvidenceQaCaseIds();
+    const plan = buildWindowsMvpQaPlan({ caseIds: soakEvidenceCaseIds });
+
+    expect(soakEvidenceCaseIds).toEqual(["WIN-001", "WIN-002", "WIN-003", "WIN-006", "WIN-008"]);
+    expect(plan.cases.every((testCase) => testCase.id.startsWith("WIN-"))).toBe(true);
+    expect(
+      plan.cases.every((testCase) =>
+        testCase.evidence.some((label) =>
+          label.startsWith(WINDOWS_MVP_QA_SOAK_EVIDENCE_LABEL_PREFIX),
+        ),
+      ),
+    ).toBe(true);
   });
 
   test("filters by case id and rejects unknown case ids", () => {

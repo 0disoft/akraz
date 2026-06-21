@@ -21,6 +21,7 @@ import {
   selectSoakScenarios,
   writeSoakSummaryReportFile,
 } from "../scripts/windows-mvp-soak-report.mjs";
+import { listWindowsMvpSoakEvidenceQaCaseIds } from "../scripts/windows-mvp-qa-plan.mjs";
 
 function runAppPackageScript(scriptName, args) {
   return spawnSync(process.execPath, ["run", scriptName, "--", ...args], {
@@ -258,6 +259,10 @@ describe("Windows MVP soak reporting", () => {
       status: "failed",
       blockers: ["scenarioFailures", "stuckInputSuspicions"],
     });
+  });
+
+  test("keeps supported QA evidence coverage derived from the QA plan", () => {
+    expect(WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS).toEqual(listWindowsMvpSoakEvidenceQaCaseIds());
   });
 
   test("writes soak summaries atomically with a trailing newline", () => {

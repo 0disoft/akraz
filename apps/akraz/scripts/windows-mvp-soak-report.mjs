@@ -10,19 +10,15 @@ import {
 } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 
+import { listWindowsMvpSoakEvidenceQaCaseIds } from "./windows-mvp-qa-plan.mjs";
+
 export const WINDOWS_MVP_SOAK_SCHEMA_VERSION = "akraz.windowsMvpSoak/v1";
 export const SESSION_CONNECT_LIFECYCLE_SMOKE_SCHEMA_VERSION =
   "akraz.sessionConnectLifecycleSmoke/v1";
 export const DEFAULT_DURATION_MS = 120 * 60 * 1000;
 export const DEFAULT_CYCLE_DELAY_MS = 1000;
 export const DEFAULT_SCENARIO_TIMEOUT_MS = 10 * 60 * 1000;
-export const WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS = [
-  "WIN-001",
-  "WIN-002",
-  "WIN-003",
-  "WIN-006",
-  "WIN-008",
-];
+export const WINDOWS_MVP_SOAK_QA_EVIDENCE_CASE_IDS = listWindowsMvpSoakEvidenceQaCaseIds();
 
 export const windowsMvpSoakScenarios = [
   {
