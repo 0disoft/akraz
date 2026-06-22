@@ -26,9 +26,13 @@ const linuxX11CaptureMessage =
   "Linux X11 input capture is disabled for this build; " +
   "XInput2 capture and Xrandr layout probes are required before capture can be enabled.";
 
-const linuxX11InjectionAdapterBlockedMessage =
-  "Linux X11 input injection is disabled for this build; " +
-  "XTEST is available, and pointer, button, scroll, and keyboard injection handlers are required next.";
+const linuxX11InjectionProbeRequiredMessage =
+  "Linux X11 input injection needs an XTEST runtime probe before capabilities can be enabled; " +
+  "run Akraz inside an X11 session with DISPLAY set.";
+
+const linuxX11InjectionPartialMessage =
+  "Linux X11 pointer injection is available through XTEST; " +
+  "button, scroll, and keyboard injection remain disabled until their XTEST mappings are added.";
 
 const linuxX11XtestUnavailableMessage =
   "Linux X11 input injection cannot start because the XTEST extension is not available; " +
@@ -112,8 +116,8 @@ describe("diagnostics capability cards", () => {
             message: linuxX11CaptureMessage,
           },
           {
-            code: "linux_x11_injection_unimplemented",
-            message: linuxX11InjectionAdapterBlockedMessage,
+            code: "linux_x11_injection_xtest_probe_required",
+            message: linuxX11InjectionProbeRequiredMessage,
           },
           {
             code: "capture_pointer_unavailable",
@@ -137,7 +141,45 @@ describe("diagnostics capability cards", () => {
     });
     expect(cards.find((card) => card.id === "inputInjection")).toMatchObject({
       status: "NeedsAction",
-      detail: linuxX11InjectionAdapterBlockedMessage,
+      detail: linuxX11InjectionProbeRequiredMessage,
+    });
+  });
+
+  test("reports Linux X11 partial injection when pointer motion is available", () => {
+    const cards = diagnosticsCards({
+      snapshot: null,
+      permissions: permissionsFixture({
+        adapterName: "linux-x11",
+        capabilities: {
+          canCapturePointer: false,
+          canCaptureKeyboard: false,
+          canInjectPointer: true,
+          canInjectKeyboard: false,
+        },
+        issues: [
+          {
+            code: "linux_x11_capture_unimplemented",
+            message: linuxX11CaptureMessage,
+          },
+          {
+            code: "linux_x11_injection_partial",
+            message: linuxX11InjectionPartialMessage,
+          },
+          {
+            code: "inject_keyboard_unavailable",
+            message: "Keyboard injection is not available.",
+          },
+        ],
+      }),
+      hasLocalIdentity: true,
+      trustedPeerCount: 1,
+      layoutBindingCount: 1,
+      hasScreenTopology: true,
+    });
+
+    expect(cards.find((card) => card.id === "inputInjection")).toMatchObject({
+      status: "NeedsAction",
+      detail: linuxX11InjectionPartialMessage,
     });
   });
 

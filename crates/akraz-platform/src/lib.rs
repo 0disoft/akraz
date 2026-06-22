@@ -10,7 +10,7 @@ use std::time::Duration;
 use akraz_core::{CapturedInputEvent, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize};
 
 #[cfg(all(target_os = "linux", not(test)))]
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_ulong, c_void};
 
 #[cfg(windows)]
 use akraz_core::DEFAULT_PANIC_HOTKEY_KEY;
@@ -1953,11 +1953,24 @@ impl PlatformAdapter for UnsupportedPlatformAdapter {
     }
 
     fn probe_capabilities(&self) -> Result<PlatformCapabilities, PlatformError> {
-        Ok(PlatformCapabilities::default())
+        Ok(match self.session {
+            UnsupportedDesktopSession::LinuxX11 => linux_x11_platform_capabilities(),
+            _ => PlatformCapabilities::default(),
+        })
     }
 
     fn diagnostic_permission_issues(&self) -> Vec<PlatformDiagnosticIssue> {
         self.session.diagnostic_permission_issues()
+    }
+
+    fn inject_input(&self, event: &InjectedInputEvent) -> Result<(), PlatformError> {
+        match self.session {
+            UnsupportedDesktopSession::LinuxX11 => inject_linux_x11_input(event),
+            _ => Err(PlatformError::new(format!(
+                "{} input injection is not available",
+                self.name()
+            ))),
+        }
     }
 
     fn release_all(&self) -> Result<(), PlatformError> {
@@ -2008,13 +2021,35 @@ const LINUX_X11_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
         ),
     },
     PlatformDiagnosticIssue {
-        code: "linux_x11_injection_unimplemented",
+        code: "linux_x11_injection_xtest_probe_required",
         message: concat!(
-            "Linux X11 input injection is disabled for this build; ",
-            "XTEST is available, and pointer, button, scroll, and keyboard injection handlers are required next.",
+            "Linux X11 input injection needs an XTEST runtime probe before capabilities can be enabled; ",
+            "run Akraz inside an X11 session with DISPLAY set.",
         ),
     },
 ];
+
+#[cfg(any(not(windows), test))]
+const LINUX_X11_POINTER_ONLY_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue = PlatformDiagnosticIssue {
+    code: "linux_x11_injection_partial",
+    message: concat!(
+        "Linux X11 pointer injection is available through XTEST; ",
+        "button, scroll, and keyboard injection remain disabled until their XTEST mappings are added.",
+    ),
+};
+
+#[cfg(any(not(windows), test))]
+fn linux_x11_platform_capabilities() -> PlatformCapabilities {
+    #[cfg(all(target_os = "linux", not(test)))]
+    {
+        linux_x11_capabilities_from_xtest_probe(probe_linux_x11_xtest_availability())
+    }
+
+    #[cfg(not(all(target_os = "linux", not(test))))]
+    {
+        PlatformCapabilities::default()
+    }
+}
 
 #[cfg(any(not(windows), test))]
 fn linux_x11_diagnostic_permission_issues() -> Vec<PlatformDiagnosticIssue> {
@@ -2029,7 +2064,7 @@ fn linux_x11_diagnostic_permission_issues() -> Vec<PlatformDiagnosticIssue> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(not(windows), test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinuxX11XtestProbeResult {
     Available,
@@ -2040,7 +2075,19 @@ enum LinuxX11XtestProbeResult {
     ExtensionUnavailable,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(not(windows), test))]
+fn linux_x11_capabilities_from_xtest_probe(
+    result: LinuxX11XtestProbeResult,
+) -> PlatformCapabilities {
+    PlatformCapabilities {
+        can_capture_pointer: false,
+        can_capture_keyboard: false,
+        can_inject_pointer: matches!(result, LinuxX11XtestProbeResult::Available),
+        can_inject_keyboard: false,
+    }
+}
+
+#[cfg(any(not(windows), test))]
 fn linux_x11_diagnostic_issues_from_xtest_probe(
     result: LinuxX11XtestProbeResult,
 ) -> [PlatformDiagnosticIssue; 2] {
@@ -2050,12 +2097,12 @@ fn linux_x11_diagnostic_issues_from_xtest_probe(
     ]
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(not(windows), test))]
 fn linux_x11_injection_diagnostic_issue_from_xtest_probe(
     result: LinuxX11XtestProbeResult,
 ) -> PlatformDiagnosticIssue {
     match result {
-        LinuxX11XtestProbeResult::Available => LINUX_X11_DIAGNOSTIC_ISSUES[1],
+        LinuxX11XtestProbeResult::Available => LINUX_X11_POINTER_ONLY_DIAGNOSTIC_ISSUE,
         LinuxX11XtestProbeResult::DisplayUnavailable => PlatformDiagnosticIssue {
             code: "linux_x11_injection_display_unavailable",
             message: concat!(
@@ -2094,6 +2141,115 @@ fn linux_x11_injection_diagnostic_issue_from_xtest_probe(
     }
 }
 
+#[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxX11PointerInjectionResult {
+    Injected,
+    DisplayUnavailable,
+    X11LibraryUnavailable,
+    XtestLibraryUnavailable,
+    InjectionSymbolUnavailable,
+    ExtensionUnavailable,
+    MotionRequestRejected,
+    RuntimeUnavailable,
+}
+
+#[cfg(any(not(windows), test))]
+fn inject_linux_x11_input(event: &InjectedInputEvent) -> Result<(), PlatformError> {
+    match event {
+        InjectedInputEvent::PointerMoved { delta_x, delta_y } => {
+            send_linux_x11_pointer_motion(*delta_x, *delta_y)
+        }
+        InjectedInputEvent::MouseButton { .. } => Err(PlatformError::new(
+            "Linux X11 mouse button injection requires an XTEST button mapping; pointer motion is the only enabled X11 injection event.",
+        )),
+        InjectedInputEvent::Scroll { .. } => Err(PlatformError::new(
+            "Linux X11 scroll injection requires an XTEST wheel mapping; pointer motion is the only enabled X11 injection event.",
+        )),
+        InjectedInputEvent::Key { .. } => Err(PlatformError::new(
+            "Linux X11 keyboard injection requires an XTEST keyboard mapping; pointer motion is the only enabled X11 injection event.",
+        )),
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn send_linux_x11_pointer_motion(delta_x: i32, delta_y: i32) -> Result<(), PlatformError> {
+    linux_x11_pointer_injection_result_to_platform_result(inject_linux_x11_pointer_motion(
+        delta_x, delta_y,
+    ))
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_x11_pointer_injection_result_to_platform_result(
+    result: LinuxX11PointerInjectionResult,
+) -> Result<(), PlatformError> {
+    match result {
+        LinuxX11PointerInjectionResult::Injected => Ok(()),
+        LinuxX11PointerInjectionResult::DisplayUnavailable => Err(PlatformError::new(
+            "Linux X11 pointer injection cannot open an X display connection; check DISPLAY and X server access.",
+        )),
+        LinuxX11PointerInjectionResult::X11LibraryUnavailable => Err(PlatformError::new(
+            "Linux X11 pointer injection cannot load libX11; install the X11 runtime library.",
+        )),
+        LinuxX11PointerInjectionResult::XtestLibraryUnavailable => Err(PlatformError::new(
+            "Linux X11 pointer injection cannot load libXtst; install the XTEST runtime library.",
+        )),
+        LinuxX11PointerInjectionResult::InjectionSymbolUnavailable => Err(PlatformError::new(
+            "Linux X11 pointer injection cannot load required X11/XTEST symbols; install matching libX11 and libXtst runtime libraries.",
+        )),
+        LinuxX11PointerInjectionResult::ExtensionUnavailable => Err(PlatformError::new(
+            "Linux X11 pointer injection cannot start because the XTEST extension is not available; enable XTEST in the X server.",
+        )),
+        LinuxX11PointerInjectionResult::MotionRequestRejected => Err(PlatformError::new(
+            "Linux X11 pointer injection was rejected by XTEST while sending relative motion.",
+        )),
+        LinuxX11PointerInjectionResult::RuntimeUnavailable => Err(PlatformError::new(
+            "Linux X11 pointer injection can only run in a Linux X11 runtime with XTEST available.",
+        )),
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn inject_linux_x11_pointer_motion(delta_x: i32, delta_y: i32) -> LinuxX11PointerInjectionResult {
+    let symbols = match LinuxX11XtestInjectionSymbols::load() {
+        Ok(symbols) => symbols,
+        Err(result) => return result,
+    };
+
+    let Some(display) = LinuxX11Display::open(symbols.open_display, symbols.close_display) else {
+        return LinuxX11PointerInjectionResult::DisplayUnavailable;
+    };
+
+    if !linux_x11_xtest_extension_available(display.as_ptr(), symbols.query_extension) {
+        return LinuxX11PointerInjectionResult::ExtensionUnavailable;
+    }
+
+    // SAFETY: display is live, the function pointer came from libXtst, and CurrentTime is 0.
+    let sent = unsafe {
+        (symbols.fake_relative_motion_event)(
+            display.as_ptr(),
+            delta_x as c_int,
+            delta_y as c_int,
+            0,
+        ) != 0
+    };
+    if !sent {
+        return LinuxX11PointerInjectionResult::MotionRequestRejected;
+    }
+
+    // SAFETY: display is live and the function pointer came from libX11.
+    unsafe {
+        (symbols.flush)(display.as_ptr());
+    }
+
+    LinuxX11PointerInjectionResult::Injected
+}
+
+#[cfg(all(any(not(windows), test), not(all(target_os = "linux", not(test)))))]
+fn inject_linux_x11_pointer_motion(_delta_x: i32, _delta_y: i32) -> LinuxX11PointerInjectionResult {
+    LinuxX11PointerInjectionResult::RuntimeUnavailable
+}
+
 #[cfg(all(target_os = "linux", not(test)))]
 type XOpenDisplayFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 #[cfg(all(target_os = "linux", not(test)))]
@@ -2101,6 +2257,11 @@ type XCloseDisplayFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 #[cfg(all(target_os = "linux", not(test)))]
 type XTestQueryExtensionFn =
     unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int, *mut c_int, *mut c_int) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
+type XTestFakeRelativeMotionEventFn =
+    unsafe extern "C" fn(*mut c_void, c_int, c_int, c_ulong) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
+type XFlushFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 
 #[cfg(all(target_os = "linux", not(test)))]
 #[link(name = "dl")]
@@ -2149,48 +2310,176 @@ impl Drop for LinuxDynamicLibrary {
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
-fn probe_linux_x11_xtest_availability() -> LinuxX11XtestProbeResult {
-    let Some(x11) = LinuxDynamicLibrary::open_any(&[&b"libX11.so.6\0"[..], &b"libX11.so\0"[..]])
-    else {
-        return LinuxX11XtestProbeResult::X11LibraryUnavailable;
-    };
-    let Some(xtst) = LinuxDynamicLibrary::open_any(&[&b"libXtst.so.6\0"[..], &b"libXtst.so\0"[..]])
-    else {
-        return LinuxX11XtestProbeResult::XtestLibraryUnavailable;
-    };
+struct LinuxX11XtestProbeSymbols {
+    _x11: LinuxDynamicLibrary,
+    _xtst: LinuxDynamicLibrary,
+    open_display: XOpenDisplayFn,
+    close_display: XCloseDisplayFn,
+    query_extension: XTestQueryExtensionFn,
+}
 
-    let Some(open_display_ptr) = x11.symbol_ptr(b"XOpenDisplay\0") else {
-        return LinuxX11XtestProbeResult::ProbeSymbolUnavailable;
-    };
-    let Some(close_display_ptr) = x11.symbol_ptr(b"XCloseDisplay\0") else {
-        return LinuxX11XtestProbeResult::ProbeSymbolUnavailable;
-    };
-    let Some(query_extension_ptr) = xtst.symbol_ptr(b"XTestQueryExtension\0") else {
-        return LinuxX11XtestProbeResult::ProbeSymbolUnavailable;
-    };
+#[cfg(all(target_os = "linux", not(test)))]
+impl LinuxX11XtestProbeSymbols {
+    fn load() -> Result<Self, LinuxX11XtestProbeResult> {
+        let Some(x11) =
+            LinuxDynamicLibrary::open_any(&[&b"libX11.so.6\0"[..], &b"libX11.so\0"[..]])
+        else {
+            return Err(LinuxX11XtestProbeResult::X11LibraryUnavailable);
+        };
+        let Some(xtst) =
+            LinuxDynamicLibrary::open_any(&[&b"libXtst.so.6\0"[..], &b"libXtst.so\0"[..]])
+        else {
+            return Err(LinuxX11XtestProbeResult::XtestLibraryUnavailable);
+        };
 
-    // SAFETY: symbols are loaded from libX11/libXtst and matched to their documented C ABIs.
-    let open_display =
-        unsafe { std::mem::transmute::<*mut c_void, XOpenDisplayFn>(open_display_ptr) };
-    // SAFETY: symbols are loaded from libX11/libXtst and matched to their documented C ABIs.
-    let close_display =
-        unsafe { std::mem::transmute::<*mut c_void, XCloseDisplayFn>(close_display_ptr) };
-    // SAFETY: symbols are loaded from libX11/libXtst and matched to their documented C ABIs.
-    let query_extension =
-        unsafe { std::mem::transmute::<*mut c_void, XTestQueryExtensionFn>(query_extension_ptr) };
+        let Some(open_display_ptr) = x11.symbol_ptr(b"XOpenDisplay\0") else {
+            return Err(LinuxX11XtestProbeResult::ProbeSymbolUnavailable);
+        };
+        let Some(close_display_ptr) = x11.symbol_ptr(b"XCloseDisplay\0") else {
+            return Err(LinuxX11XtestProbeResult::ProbeSymbolUnavailable);
+        };
+        let Some(query_extension_ptr) = xtst.symbol_ptr(b"XTestQueryExtension\0") else {
+            return Err(LinuxX11XtestProbeResult::ProbeSymbolUnavailable);
+        };
 
-    // SAFETY: null display name asks Xlib to use DISPLAY; Xlib returns null on failure.
-    let display = unsafe { open_display(std::ptr::null()) };
-    if display.is_null() {
-        return LinuxX11XtestProbeResult::DisplayUnavailable;
+        // SAFETY: symbols are loaded from libX11/libXtst and matched to their documented C ABIs.
+        let open_display =
+            unsafe { std::mem::transmute::<*mut c_void, XOpenDisplayFn>(open_display_ptr) };
+        // SAFETY: symbols are loaded from libX11/libXtst and matched to their documented C ABIs.
+        let close_display =
+            unsafe { std::mem::transmute::<*mut c_void, XCloseDisplayFn>(close_display_ptr) };
+        // SAFETY: symbols are loaded from libX11/libXtst and matched to their documented C ABIs.
+        let query_extension = unsafe {
+            std::mem::transmute::<*mut c_void, XTestQueryExtensionFn>(query_extension_ptr)
+        };
+
+        Ok(Self {
+            _x11: x11,
+            _xtst: xtst,
+            open_display,
+            close_display,
+            query_extension,
+        })
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+struct LinuxX11XtestInjectionSymbols {
+    _x11: LinuxDynamicLibrary,
+    _xtst: LinuxDynamicLibrary,
+    open_display: XOpenDisplayFn,
+    close_display: XCloseDisplayFn,
+    query_extension: XTestQueryExtensionFn,
+    fake_relative_motion_event: XTestFakeRelativeMotionEventFn,
+    flush: XFlushFn,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl LinuxX11XtestInjectionSymbols {
+    fn load() -> Result<Self, LinuxX11PointerInjectionResult> {
+        let Some(x11) =
+            LinuxDynamicLibrary::open_any(&[&b"libX11.so.6\0"[..], &b"libX11.so\0"[..]])
+        else {
+            return Err(LinuxX11PointerInjectionResult::X11LibraryUnavailable);
+        };
+        let Some(xtst) =
+            LinuxDynamicLibrary::open_any(&[&b"libXtst.so.6\0"[..], &b"libXtst.so\0"[..]])
+        else {
+            return Err(LinuxX11PointerInjectionResult::XtestLibraryUnavailable);
+        };
+
+        let Some(open_display_ptr) = x11.symbol_ptr(b"XOpenDisplay\0") else {
+            return Err(LinuxX11PointerInjectionResult::InjectionSymbolUnavailable);
+        };
+        let Some(close_display_ptr) = x11.symbol_ptr(b"XCloseDisplay\0") else {
+            return Err(LinuxX11PointerInjectionResult::InjectionSymbolUnavailable);
+        };
+        let Some(query_extension_ptr) = xtst.symbol_ptr(b"XTestQueryExtension\0") else {
+            return Err(LinuxX11PointerInjectionResult::InjectionSymbolUnavailable);
+        };
+        let Some(fake_relative_motion_event_ptr) =
+            xtst.symbol_ptr(b"XTestFakeRelativeMotionEvent\0")
+        else {
+            return Err(LinuxX11PointerInjectionResult::InjectionSymbolUnavailable);
+        };
+        let Some(flush_ptr) = x11.symbol_ptr(b"XFlush\0") else {
+            return Err(LinuxX11PointerInjectionResult::InjectionSymbolUnavailable);
+        };
+
+        // SAFETY: symbols are loaded from libX11/libXtst and matched to their documented C ABIs.
+        let open_display =
+            unsafe { std::mem::transmute::<*mut c_void, XOpenDisplayFn>(open_display_ptr) };
+        // SAFETY: symbols are loaded from libX11/libXtst and matched to their documented C ABIs.
+        let close_display =
+            unsafe { std::mem::transmute::<*mut c_void, XCloseDisplayFn>(close_display_ptr) };
+        // SAFETY: symbols are loaded from libX11/libXtst and matched to their documented C ABIs.
+        let query_extension = unsafe {
+            std::mem::transmute::<*mut c_void, XTestQueryExtensionFn>(query_extension_ptr)
+        };
+        // SAFETY: symbols are loaded from libXtst and matched to the documented C ABI.
+        let fake_relative_motion_event = unsafe {
+            std::mem::transmute::<*mut c_void, XTestFakeRelativeMotionEventFn>(
+                fake_relative_motion_event_ptr,
+            )
+        };
+        // SAFETY: symbols are loaded from libX11 and matched to the documented C ABI.
+        let flush = unsafe { std::mem::transmute::<*mut c_void, XFlushFn>(flush_ptr) };
+
+        Ok(Self {
+            _x11: x11,
+            _xtst: xtst,
+            open_display,
+            close_display,
+            query_extension,
+            fake_relative_motion_event,
+            flush,
+        })
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+struct LinuxX11Display {
+    display: *mut c_void,
+    close_display: XCloseDisplayFn,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl LinuxX11Display {
+    fn open(open_display: XOpenDisplayFn, close_display: XCloseDisplayFn) -> Option<Self> {
+        // SAFETY: null display name asks Xlib to use DISPLAY; Xlib returns null on failure.
+        let display = unsafe { open_display(std::ptr::null()) };
+        (!display.is_null()).then_some(Self {
+            display,
+            close_display,
+        })
     }
 
+    fn as_ptr(&self) -> *mut c_void {
+        self.display
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl Drop for LinuxX11Display {
+    fn drop(&mut self) {
+        // SAFETY: display was opened by XOpenDisplay and is closed exactly once in Drop.
+        unsafe {
+            (self.close_display)(self.display);
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn linux_x11_xtest_extension_available(
+    display: *mut c_void,
+    query_extension: XTestQueryExtensionFn,
+) -> bool {
     let mut event_base = 0;
     let mut error_base = 0;
     let mut major_version = 0;
     let mut minor_version = 0;
     // SAFETY: display is a live Xlib display and the output pointers reference stack integers.
-    let available = unsafe {
+    unsafe {
         query_extension(
             display,
             &mut event_base,
@@ -2198,13 +2487,21 @@ fn probe_linux_x11_xtest_availability() -> LinuxX11XtestProbeResult {
             &mut major_version,
             &mut minor_version,
         ) != 0
-    };
-    // SAFETY: display was opened by XOpenDisplay above and is closed exactly once.
-    unsafe {
-        close_display(display);
     }
+}
 
-    if available {
+#[cfg(all(target_os = "linux", not(test)))]
+fn probe_linux_x11_xtest_availability() -> LinuxX11XtestProbeResult {
+    let symbols = match LinuxX11XtestProbeSymbols::load() {
+        Ok(symbols) => symbols,
+        Err(result) => return result,
+    };
+
+    let Some(display) = LinuxX11Display::open(symbols.open_display, symbols.close_display) else {
+        return LinuxX11XtestProbeResult::DisplayUnavailable;
+    };
+
+    if linux_x11_xtest_extension_available(display.as_ptr(), symbols.query_extension) {
         LinuxX11XtestProbeResult::Available
     } else {
         LinuxX11XtestProbeResult::ExtensionUnavailable
@@ -2529,19 +2826,19 @@ mod tests {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     use std::time::Duration;
 
-    #[cfg(windows)]
-    use akraz_core::MouseButton;
     use akraz_core::{
         CapturedInputEvent, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize,
-        PhysicalKey, PressState,
+        MouseButton, PhysicalKey, PressState,
     };
 
     use super::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
-        InputCapturePolicy, KeyboardLayoutSnapshot, LinuxX11XtestProbeResult, PlatformAdapter,
-        PlatformCapabilities, PlatformError, UnsupportedDesktopSession, UnsupportedPlatformAdapter,
-        detect_unsupported_desktop_session_from_env, linux_x11_diagnostic_issues_from_xtest_probe,
-        runtime_platform_adapter,
+        InputCapturePolicy, KeyboardLayoutSnapshot, LinuxX11PointerInjectionResult,
+        LinuxX11XtestProbeResult, PlatformAdapter, PlatformCapabilities, PlatformError,
+        UnsupportedDesktopSession, UnsupportedPlatformAdapter,
+        detect_unsupported_desktop_session_from_env, inject_linux_x11_input,
+        linux_x11_capabilities_from_xtest_probe, linux_x11_diagnostic_issues_from_xtest_probe,
+        linux_x11_pointer_injection_result_to_platform_result, runtime_platform_adapter,
     };
 
     #[cfg(windows)]
@@ -2700,12 +2997,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "linux_x11_capture_unimplemented",
-                "linux_x11_injection_unimplemented",
+                "linux_x11_injection_xtest_probe_required",
             ]
         );
         assert!(linux_x11_issues[0].message.contains("XInput2 capture"));
         assert!(linux_x11_issues[0].message.contains("Xrandr layout probes"));
-        assert!(linux_x11_issues[1].message.contains("XTEST is available"));
+        assert!(linux_x11_issues[1].message.contains("XTEST runtime probe"));
         assert_eq!(
             linux_unknown
                 .diagnostic_permission_issues()
@@ -2724,8 +3021,12 @@ mod tests {
         let available =
             linux_x11_diagnostic_issues_from_xtest_probe(LinuxX11XtestProbeResult::Available);
 
-        assert_eq!(available[1].code, "linux_x11_injection_unimplemented");
-        assert!(available[1].message.contains("XTEST is available"));
+        assert_eq!(available[1].code, "linux_x11_injection_partial");
+        assert!(
+            available[1]
+                .message
+                .contains("pointer injection is available")
+        );
 
         let missing_display = linux_x11_diagnostic_issues_from_xtest_probe(
             LinuxX11XtestProbeResult::DisplayUnavailable,
@@ -2780,6 +3081,104 @@ mod tests {
             "linux_x11_injection_xtest_unavailable",
         );
         assert!(missing_extension[1].message.contains("XTEST extension"));
+    }
+
+    #[test]
+    fn linux_x11_capabilities_enable_only_pointer_injection_when_xtest_is_available() {
+        assert_eq!(
+            linux_x11_capabilities_from_xtest_probe(LinuxX11XtestProbeResult::Available),
+            PlatformCapabilities {
+                can_capture_pointer: false,
+                can_capture_keyboard: false,
+                can_inject_pointer: true,
+                can_inject_keyboard: false,
+            }
+        );
+        assert_eq!(
+            linux_x11_capabilities_from_xtest_probe(LinuxX11XtestProbeResult::ExtensionUnavailable),
+            PlatformCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn linux_x11_pointer_injection_result_reports_actionable_errors() {
+        assert_eq!(
+            linux_x11_pointer_injection_result_to_platform_result(
+                LinuxX11PointerInjectionResult::Injected
+            ),
+            Ok(())
+        );
+
+        let display_error = linux_x11_pointer_injection_result_to_platform_result(
+            LinuxX11PointerInjectionResult::DisplayUnavailable,
+        )
+        .expect_err("missing display should be reported");
+        assert!(display_error.to_string().contains("DISPLAY"));
+
+        let x11_library_error = linux_x11_pointer_injection_result_to_platform_result(
+            LinuxX11PointerInjectionResult::X11LibraryUnavailable,
+        )
+        .expect_err("missing libX11 should be reported");
+        assert!(x11_library_error.to_string().contains("libX11"));
+
+        let xtest_library_error = linux_x11_pointer_injection_result_to_platform_result(
+            LinuxX11PointerInjectionResult::XtestLibraryUnavailable,
+        )
+        .expect_err("missing libXtst should be reported");
+        assert!(xtest_library_error.to_string().contains("libXtst"));
+
+        let symbol_error = linux_x11_pointer_injection_result_to_platform_result(
+            LinuxX11PointerInjectionResult::InjectionSymbolUnavailable,
+        )
+        .expect_err("missing symbols should be reported");
+        assert!(
+            symbol_error
+                .to_string()
+                .contains("required X11/XTEST symbols")
+        );
+
+        let extension_error = linux_x11_pointer_injection_result_to_platform_result(
+            LinuxX11PointerInjectionResult::ExtensionUnavailable,
+        )
+        .expect_err("missing XTEST extension should be reported");
+        assert!(extension_error.to_string().contains("XTEST extension"));
+
+        let rejected_error = linux_x11_pointer_injection_result_to_platform_result(
+            LinuxX11PointerInjectionResult::MotionRequestRejected,
+        )
+        .expect_err("rejected motion should be reported");
+        assert!(rejected_error.to_string().contains("relative motion"));
+    }
+
+    #[test]
+    fn linux_x11_input_routes_pointer_motion_and_rejects_other_events() {
+        let pointer_error = inject_linux_x11_input(&InjectedInputEvent::PointerMoved {
+            delta_x: 3,
+            delta_y: -2,
+        })
+        .expect_err("test builds cannot open a runtime X11 display");
+        assert!(pointer_error.to_string().contains("Linux X11 runtime"));
+
+        let button_error = inject_linux_x11_input(&InjectedInputEvent::MouseButton {
+            button: MouseButton::Left,
+            state: PressState::Pressed,
+        })
+        .expect_err("button injection should be gated");
+        assert!(button_error.to_string().contains("XTEST button mapping"));
+
+        let scroll_error = inject_linux_x11_input(&InjectedInputEvent::Scroll {
+            delta_x: 0,
+            delta_y: -120,
+        })
+        .expect_err("scroll injection should be gated");
+        assert!(scroll_error.to_string().contains("XTEST wheel mapping"));
+
+        let key_error = inject_linux_x11_input(&InjectedInputEvent::Key {
+            key: PhysicalKey::LeftShift,
+            state: PressState::Pressed,
+        })
+        .expect_err("keyboard injection should be gated");
+        assert!(key_error.to_string().contains("XTEST keyboard mapping"));
     }
 
     #[test]
