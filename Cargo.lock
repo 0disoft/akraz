@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "akraz-app"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "akraz-identity",
  "akraz-ipc",
@@ -33,11 +33,11 @@ dependencies = [
 
 [[package]]
 name = "akraz-core"
-version = "0.18.0"
+version = "0.18.1"
 
 [[package]]
 name = "akraz-daemon"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "akraz-core",
  "akraz-discovery",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "akraz-discovery"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "akraz-identity",
  "akraz-protocol",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "akraz-identity"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "akraz-protocol",
  "blake3",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "akraz-ipc"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "akraz-core",
  "akraz-platform",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "akraz-platform"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "akraz-core",
  "windows-sys 0.60.2",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "akraz-protocol"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "akrazctl"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "akraz-identity",
  "akraz-ipc",

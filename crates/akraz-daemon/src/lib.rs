@@ -40,7 +40,7 @@ use akraz_ipc::{
 };
 use akraz_platform::{
     DesktopGeometry, InputCaptureConfig, InputCapturePolicy, InputCaptureSession, PlatformAdapter,
-    PlatformCapabilities, PlatformError,
+    PlatformCapabilities, PlatformDiagnosticIssue, PlatformError,
 };
 use akraz_protocol::{
     AuthProof, AuthTranscript, CapabilityFlags, HANDSHAKE_NONCE_LEN, PeerRole, ProtocolVersion,
@@ -4559,6 +4559,7 @@ pub fn build_permissions_probe(
     let capabilities = platform.probe_capabilities()?;
     let mut issues = Vec::new();
 
+    push_platform_diagnostic_issues(&mut issues, platform.diagnostic_permission_issues());
     push_missing_capability_issue(
         &mut issues,
         capabilities.can_capture_pointer,
@@ -4589,6 +4590,18 @@ pub fn build_permissions_probe(
         capabilities: IpcPlatformCapabilities::from(capabilities),
         issues,
     })
+}
+
+fn push_platform_diagnostic_issues(
+    issues: &mut Vec<PermissionIssue>,
+    diagnostic_issues: impl IntoIterator<Item = PlatformDiagnosticIssue>,
+) {
+    for issue in diagnostic_issues {
+        issues.push(PermissionIssue {
+            code: issue.code.to_string(),
+            message: issue.message.to_string(),
+        });
+    }
 }
 
 fn push_missing_capability_issue(
@@ -4648,7 +4661,7 @@ mod tests {
     use akraz_platform::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
         InputCapturePolicy, KeyboardLayoutSnapshot, PlatformAdapter, PlatformCapabilities,
-        PlatformError,
+        PlatformDiagnosticIssue, PlatformError,
     };
     use akraz_protocol::{
         AuthTranscript, CapabilityFlags, HANDSHAKE_NONCE_LEN, PeerRole, ProtocolVersion,
@@ -5784,6 +5797,60 @@ mod tests {
         assert_eq!(probe.issues.len(), 2);
         assert_eq!(probe.issues[0].code, "capture_keyboard_unavailable");
         assert_eq!(probe.issues[1].code, "inject_keyboard_unavailable");
+    }
+
+    #[test]
+    fn permissions_probe_prefers_platform_diagnostic_issues() {
+        struct DiagnosticPlatformAdapter;
+
+        impl PlatformAdapter for DiagnosticPlatformAdapter {
+            fn name(&self) -> &'static str {
+                "linux-x11"
+            }
+
+            fn probe_capabilities(&self) -> Result<PlatformCapabilities, PlatformError> {
+                Ok(PlatformCapabilities::default())
+            }
+
+            fn diagnostic_permission_issues(&self) -> Vec<PlatformDiagnosticIssue> {
+                vec![
+                    PlatformDiagnosticIssue {
+                        code: "linux_x11_capture_unimplemented",
+                        message: concat!(
+                            "Linux X11 input capture is not implemented yet; ",
+                            "XInput2 capture and Xrandr layout probes are required before ",
+                            "capture can be enabled."
+                        ),
+                    },
+                    PlatformDiagnosticIssue {
+                        code: "linux_x11_injection_unimplemented",
+                        message: concat!(
+                            "Linux X11 input injection is not implemented yet; ",
+                            "XTEST availability must be verified before injection can be ",
+                            "enabled."
+                        ),
+                    },
+                ]
+            }
+
+            fn release_all(&self) -> Result<(), PlatformError> {
+                Ok(())
+            }
+        }
+
+        let probe = build_permissions_probe(&DiagnosticPlatformAdapter)
+            .expect("expected permissions probe");
+
+        assert_eq!(probe.adapter_name, "linux-x11");
+        assert_eq!(
+            probe.capabilities,
+            IpcPlatformCapabilities::from(PlatformCapabilities::default())
+        );
+        assert_eq!(probe.issues.len(), 6);
+        assert_eq!(probe.issues[0].code, "linux_x11_capture_unimplemented");
+        assert_eq!(probe.issues[1].code, "linux_x11_injection_unimplemented");
+        assert_eq!(probe.issues[2].code, "capture_pointer_unavailable");
+        assert_eq!(probe.issues[5].code, "inject_keyboard_unavailable");
     }
 
     #[test]

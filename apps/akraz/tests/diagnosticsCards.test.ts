@@ -83,6 +83,56 @@ describe("diagnostics capability cards", () => {
     });
   });
 
+  test("prefers Linux X11 diagnostic issues over generic missing capability text", () => {
+    const cards = diagnosticsCards({
+      snapshot: null,
+      permissions: permissionsFixture({
+        adapterName: "linux-x11",
+        capabilities: {
+          canCapturePointer: false,
+          canCaptureKeyboard: false,
+          canInjectPointer: false,
+          canInjectKeyboard: false,
+        },
+        issues: [
+          {
+            code: "linux_x11_capture_unimplemented",
+            message:
+              "Linux X11 input capture is not implemented yet; XInput2 capture and Xrandr layout probes are required before capture can be enabled.",
+          },
+          {
+            code: "linux_x11_injection_unimplemented",
+            message:
+              "Linux X11 input injection is not implemented yet; XTEST availability must be verified before injection can be enabled.",
+          },
+          {
+            code: "capture_pointer_unavailable",
+            message: "Pointer capture is not available.",
+          },
+          {
+            code: "inject_pointer_unavailable",
+            message: "Pointer injection is not available.",
+          },
+        ],
+      }),
+      hasLocalIdentity: true,
+      trustedPeerCount: 1,
+      layoutBindingCount: 1,
+      hasScreenTopology: true,
+    });
+
+    expect(cards.find((card) => card.id === "inputCapture")).toMatchObject({
+      status: "NeedsAction",
+      detail:
+        "Linux X11 input capture is not implemented yet; XInput2 capture and Xrandr layout probes are required before capture can be enabled.",
+    });
+    expect(cards.find((card) => card.id === "inputInjection")).toMatchObject({
+      status: "NeedsAction",
+      detail:
+        "Linux X11 input injection is not implemented yet; XTEST availability must be verified before injection can be enabled.",
+    });
+  });
+
   test("derives pairing and layout readiness from current owners", () => {
     const cards = diagnosticsCards({
       snapshot: null,

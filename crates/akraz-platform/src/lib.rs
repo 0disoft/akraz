@@ -90,6 +90,13 @@ pub struct PlatformCapabilities {
     pub can_inject_keyboard: bool,
 }
 
+/// Stable diagnostic issue exposed by platform permission probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformDiagnosticIssue {
+    pub code: &'static str,
+    pub message: &'static str,
+}
+
 /// Local desktop geometry facts reported by a platform adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopGeometry {
@@ -315,6 +322,11 @@ pub trait PlatformAdapter {
     /// Probe platform input capabilities.
     fn probe_capabilities(&self) -> Result<PlatformCapabilities, PlatformError>;
 
+    /// Return platform-specific permission diagnostics that explain unavailable capabilities.
+    fn diagnostic_permission_issues(&self) -> Vec<PlatformDiagnosticIssue> {
+        Vec::new()
+    }
+
     /// Read current desktop geometry used by input routing.
     fn read_desktop_geometry(&self) -> Result<DesktopGeometry, PlatformError> {
         Err(PlatformError::new(format!(
@@ -379,6 +391,15 @@ impl PlatformAdapter for RuntimePlatformAdapter {
             Self::Windows(adapter) => adapter.probe_capabilities(),
             #[cfg(not(windows))]
             Self::Unsupported(adapter) => adapter.probe_capabilities(),
+        }
+    }
+
+    fn diagnostic_permission_issues(&self) -> Vec<PlatformDiagnosticIssue> {
+        match self {
+            #[cfg(windows)]
+            Self::Windows(adapter) => adapter.diagnostic_permission_issues(),
+            #[cfg(not(windows))]
+            Self::Unsupported(adapter) => adapter.diagnostic_permission_issues(),
         }
     }
 
@@ -1932,6 +1953,10 @@ impl PlatformAdapter for UnsupportedPlatformAdapter {
         Ok(PlatformCapabilities::default())
     }
 
+    fn diagnostic_permission_issues(&self) -> Vec<PlatformDiagnosticIssue> {
+        self.session.diagnostic_permission_issues().to_vec()
+    }
+
     fn release_all(&self) -> Result<(), PlatformError> {
         Ok(())
     }
@@ -1958,7 +1983,77 @@ impl UnsupportedDesktopSession {
             Self::Other => "unsupported",
         }
     }
+
+    fn diagnostic_permission_issues(self) -> &'static [PlatformDiagnosticIssue] {
+        match self {
+            Self::LinuxX11 => &LINUX_X11_DIAGNOSTIC_ISSUES,
+            Self::LinuxWayland => &LINUX_WAYLAND_DIAGNOSTIC_ISSUES,
+            Self::LinuxUnknown => &LINUX_UNKNOWN_DIAGNOSTIC_ISSUES,
+            Self::Macos => &MACOS_DIAGNOSTIC_ISSUES,
+            Self::Other => &UNSUPPORTED_PLATFORM_DIAGNOSTIC_ISSUES,
+        }
+    }
 }
+
+#[cfg(any(not(windows), test))]
+const LINUX_X11_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
+    PlatformDiagnosticIssue {
+        code: "linux_x11_capture_unimplemented",
+        message: "Linux X11 input capture is not implemented yet; XInput2 capture and Xrandr layout probes are required before capture can be enabled.",
+    },
+    PlatformDiagnosticIssue {
+        code: "linux_x11_injection_unimplemented",
+        message: "Linux X11 input injection is not implemented yet; XTEST availability must be verified before injection can be enabled.",
+    },
+];
+
+#[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
+    PlatformDiagnosticIssue {
+        code: "linux_wayland_capture_unimplemented",
+        message: "Linux Wayland input capture is not implemented yet; portal and compositor support must be verified before capture can be enabled.",
+    },
+    PlatformDiagnosticIssue {
+        code: "linux_wayland_injection_unimplemented",
+        message: "Linux Wayland input injection is not implemented yet; portal and compositor support must be verified before injection can be enabled.",
+    },
+];
+
+#[cfg(any(not(windows), test))]
+const LINUX_UNKNOWN_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
+    PlatformDiagnosticIssue {
+        code: "linux_session_capture_unknown",
+        message: "Linux desktop session could not be detected; set XDG_SESSION_TYPE, DISPLAY, or WAYLAND_DISPLAY before checking capture support.",
+    },
+    PlatformDiagnosticIssue {
+        code: "linux_session_injection_unknown",
+        message: "Linux desktop session could not be detected; set XDG_SESSION_TYPE, DISPLAY, or WAYLAND_DISPLAY before checking injection support.",
+    },
+];
+
+#[cfg(any(not(windows), test))]
+const MACOS_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
+    PlatformDiagnosticIssue {
+        code: "macos_capture_unimplemented",
+        message: "macOS input capture is not implemented yet; Accessibility permission and CGEventTap probes are required before capture can be enabled.",
+    },
+    PlatformDiagnosticIssue {
+        code: "macos_injection_unimplemented",
+        message: "macOS input injection is not implemented yet; Accessibility permission and CGEventPost probes are required before injection can be enabled.",
+    },
+];
+
+#[cfg(any(not(windows), test))]
+const UNSUPPORTED_PLATFORM_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
+    PlatformDiagnosticIssue {
+        code: "platform_capture_unimplemented",
+        message: "This platform does not have an input capture adapter yet.",
+    },
+    PlatformDiagnosticIssue {
+        code: "platform_injection_unimplemented",
+        message: "This platform does not have an input injection adapter yet.",
+    },
+];
 
 #[cfg(any(not(windows), test))]
 fn detect_unsupported_desktop_session() -> UnsupportedDesktopSession {
@@ -2383,6 +2478,40 @@ mod tests {
             "linux-wayland input capture is not available",
         );
         assert_eq!(adapter.release_all(), Ok(()));
+    }
+
+    #[test]
+    fn unsupported_adapter_reports_session_permission_diagnostics() {
+        let linux_x11 =
+            UnsupportedPlatformAdapter::from_session(UnsupportedDesktopSession::LinuxX11);
+        let linux_unknown =
+            UnsupportedPlatformAdapter::from_session(UnsupportedDesktopSession::LinuxUnknown);
+        let linux_x11_issues = linux_x11.diagnostic_permission_issues();
+
+        assert_eq!(
+            linux_x11_issues
+                .iter()
+                .map(|issue| issue.code)
+                .collect::<Vec<_>>(),
+            vec![
+                "linux_x11_capture_unimplemented",
+                "linux_x11_injection_unimplemented",
+            ]
+        );
+        assert!(linux_x11_issues[0].message.contains("XInput2 capture"));
+        assert!(linux_x11_issues[0].message.contains("Xrandr layout probes"));
+        assert!(linux_x11_issues[1].message.contains("XTEST availability"));
+        assert_eq!(
+            linux_unknown
+                .diagnostic_permission_issues()
+                .iter()
+                .map(|issue| issue.code)
+                .collect::<Vec<_>>(),
+            vec![
+                "linux_session_capture_unknown",
+                "linux_session_injection_unknown",
+            ]
+        );
     }
 
     #[test]
