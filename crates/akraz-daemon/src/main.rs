@@ -7,13 +7,13 @@ use std::net::{SocketAddr, TcpListener};
 use std::panic::{self, PanicHookInfo};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use akraz_core::{
-    CapturedInputEvent, CoreAction, DEFAULT_PANIC_HOTKEY_KEY, DeviceId, EdgeCrossing,
+    CapturedInputEvent, ControlMode, CoreAction, DEFAULT_PANIC_HOTKEY_KEY, DeviceId, EdgeCrossing,
     InjectedInputEvent, LogicalPoint, MouseButton, PeerId, PhysicalKey, PressState, RuntimeEvent,
     RuntimeInputState, ScreenEdge, ScreenEdgeBinding, SessionId,
 };
@@ -63,6 +63,7 @@ fn main() -> ExitCode {
         Ok(DaemonCommand::PeerSessionSmoke) => run_peer_session_smoke(),
         Ok(DaemonCommand::PeerSessionExecutorSmoke) => run_peer_session_executor_smoke(),
         Ok(DaemonCommand::RemoteControlLoopbackSmoke) => run_remote_control_loopback_smoke(),
+        Ok(DaemonCommand::RuntimeRecoverySmoke) => run_runtime_recovery_smoke(),
         Ok(DaemonCommand::Serve(options)) => run_daemon(options),
         Err(error) => {
             eprintln!("{error}");
@@ -793,6 +794,25 @@ fn run_remote_control_loopback_smoke() -> ExitCode {
     }
 }
 
+fn run_runtime_recovery_smoke() -> ExitCode {
+    match build_runtime_recovery_smoke_report() {
+        Ok(report) => match serde_json::to_string(&report) {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("failed to encode runtime recovery smoke report: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("runtime recovery smoke failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn build_loopback_transport_smoke_report()
 -> Result<LoopbackTransportSmokeReport, akraz_platform::PlatformError> {
     let transport = LoopbackPeerTransport::new();
@@ -995,6 +1015,119 @@ fn build_remote_control_loopback_smoke_report()
     ))
 }
 
+fn build_runtime_recovery_smoke_report() -> Result<RuntimeRecoverySmokeReport, PlatformError> {
+    Ok(RuntimeRecoverySmokeReport {
+        daemon_version: env!("CARGO_PKG_VERSION"),
+        system_resume: build_system_resume_recovery_smoke_scenario()?,
+        input_capture_idle_watchdog: build_input_capture_idle_watchdog_smoke_scenario()?,
+    })
+}
+
+fn build_system_resume_recovery_smoke_scenario()
+-> Result<SystemResumeRecoverySmokeScenario, PlatformError> {
+    let mut state = remote_control_loopback_smoke_remote_state()?;
+    let platform = FakePlatformAdapter::default();
+    let transport = LoopbackPeerTransport::new();
+    let dispatcher = LocalPlatformCoreActionDispatcher::new(
+        platform.clone(),
+        TransportCoreActionDispatcher::new(transport.clone()),
+    );
+    let actions = state
+        .apply_event(RuntimeEvent::SystemResumed)
+        .map_err(|error| {
+            PlatformError::new(format!(
+                "failed to apply system resume smoke recovery: {error}"
+            ))
+        })?;
+
+    dispatcher.dispatch_core_actions(&actions)?;
+
+    let remote_commands = transport.snapshot()?;
+    let final_mode = state.mode();
+    let remote_release_all_commands = remote_commands
+        .iter()
+        .filter(|command| matches!(command, DaemonTransportCommand::ReleaseAllInputs))
+        .count() as u64;
+    let remote_stop_session_commands = remote_commands
+        .iter()
+        .filter(|command| matches!(command, DaemonTransportCommand::StopRemoteSession { .. }))
+        .count() as u64;
+
+    Ok(SystemResumeRecoverySmokeScenario {
+        recovered: final_mode == ControlMode::Local
+            && platform.release_all_count()? == 1
+            && remote_release_all_commands == 1
+            && remote_stop_session_commands == 1,
+        final_mode: control_mode_name(final_mode),
+        core_actions: actions.iter().map(core_action_name).collect(),
+        local_release_all_count: platform.release_all_count()?,
+        remote_release_all_commands,
+        remote_stop_session_commands,
+    })
+}
+
+fn build_input_capture_idle_watchdog_smoke_scenario()
+-> Result<InputCaptureIdleWatchdogSmokeScenario, PlatformError> {
+    let state = shared_runtime_state(RuntimeInputState::new());
+    let platform = FakePlatformAdapter::default().with_open_input_capture();
+    let dispatcher = RecordingSmokeCoreActionDispatcher::default();
+    let logs = shared_daemon_log_buffer(8);
+    let worker = start_monitored_daemon_input_capture_with_edge_bindings_dispatcher_and_logs(
+        state,
+        &platform,
+        DaemonInputCaptureConfig {
+            input_capture: InputCaptureConfig {
+                event_buffer_capacity: 8,
+            },
+            drain_batch_size: 8,
+            idle_poll_interval: Duration::from_millis(1),
+        },
+        Vec::new(),
+        dispatcher.clone(),
+        logs.clone(),
+    )?;
+
+    for _ in 0..100 {
+        let actions = dispatcher.snapshot()?;
+        let log_events = daemon_log_event_names(&logs)?;
+        if actions.contains(&CoreAction::InputCaptureIdle)
+            && log_events.iter().any(|event| event == "input.capture.idle")
+        {
+            worker.stop()?;
+            return Ok(InputCaptureIdleWatchdogSmokeScenario {
+                recovered: true,
+                dispatched_actions: actions.iter().map(core_action_name).collect(),
+                log_events,
+            });
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let actions = dispatcher.snapshot()?;
+    let log_events = daemon_log_event_names(&logs)?;
+    worker.stop()?;
+
+    Ok(InputCaptureIdleWatchdogSmokeScenario {
+        recovered: false,
+        dispatched_actions: actions.iter().map(core_action_name).collect(),
+        log_events,
+    })
+}
+
+fn daemon_log_event_names(
+    logs: &akraz_daemon::SharedDaemonLogBuffer,
+) -> Result<Vec<String>, PlatformError> {
+    logs.lock()
+        .map_err(|_| PlatformError::new("runtime recovery smoke logs are unavailable"))
+        .map(|buffer| {
+            buffer
+                .tail(8)
+                .iter()
+                .map(|entry| entry.event.clone())
+                .collect()
+        })
+}
+
 fn loopback_transport_smoke_actions() -> [CoreAction; 4] {
     let crossing = EdgeCrossing {
         peer_id: PeerId::new("loopback-peer"),
@@ -1139,6 +1272,58 @@ struct RemoteControlLoopbackSmokeReport {
     injected_inputs: Vec<LoopbackTransportSmokeInputEvent>,
     release_all_count: u64,
     local_release_all_count: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeRecoverySmokeReport {
+    daemon_version: &'static str,
+    system_resume: SystemResumeRecoverySmokeScenario,
+    input_capture_idle_watchdog: InputCaptureIdleWatchdogSmokeScenario,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SystemResumeRecoverySmokeScenario {
+    recovered: bool,
+    final_mode: &'static str,
+    core_actions: Vec<&'static str>,
+    local_release_all_count: u64,
+    remote_release_all_commands: u64,
+    remote_stop_session_commands: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct InputCaptureIdleWatchdogSmokeScenario {
+    recovered: bool,
+    dispatched_actions: Vec<&'static str>,
+    log_events: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RecordingSmokeCoreActionDispatcher {
+    actions: Arc<Mutex<Vec<CoreAction>>>,
+}
+
+impl RecordingSmokeCoreActionDispatcher {
+    fn snapshot(&self) -> Result<Vec<CoreAction>, PlatformError> {
+        self.actions
+            .lock()
+            .map_err(|_| PlatformError::new("runtime recovery smoke action log is unavailable"))
+            .map(|actions| actions.clone())
+    }
+}
+
+impl CoreActionDispatcher for RecordingSmokeCoreActionDispatcher {
+    fn dispatch_core_actions(&self, actions: &[CoreAction]) -> Result<(), PlatformError> {
+        self.actions
+            .lock()
+            .map_err(|_| PlatformError::new("runtime recovery smoke action log is unavailable"))?
+            .extend_from_slice(actions);
+
+        Ok(())
+    }
 }
 
 impl PeerSessionSmokeReport {
@@ -1446,6 +1631,27 @@ fn mouse_button_name(button: MouseButton) -> String {
     }
 }
 
+fn control_mode_name(mode: ControlMode) -> &'static str {
+    match mode {
+        ControlMode::Local => "Local",
+        ControlMode::EnteringRemote => "EnteringRemote",
+        ControlMode::Remote => "Remote",
+        ControlMode::LeavingRemote => "LeavingRemote",
+        ControlMode::Suspended => "Suspended",
+    }
+}
+
+fn core_action_name(action: &CoreAction) -> &'static str {
+    match action {
+        CoreAction::InputCaptureIdle => "inputCaptureIdle",
+        CoreAction::ReleaseLocalInputs => "releaseLocalInputs",
+        CoreAction::ReleaseAllInputs => "releaseAllInputs",
+        CoreAction::StartRemoteSession { .. } => "startRemoteSession",
+        CoreAction::ForwardInput { .. } => "forwardInput",
+        CoreAction::StopRemoteSession { .. } => "stopRemoteSession",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 enum DaemonCommand {
@@ -1457,6 +1663,7 @@ enum DaemonCommand {
     PeerSessionSmoke,
     PeerSessionExecutorSmoke,
     RemoteControlLoopbackSmoke,
+    RuntimeRecoverySmoke,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1503,6 +1710,9 @@ where
         }
         "--akraz-smoke-remote-control-loopback" => {
             reject_trailing_args(args, DaemonCommand::RemoteControlLoopbackSmoke)
+        }
+        "--akraz-smoke-runtime-recovery" => {
+            reject_trailing_args(args, DaemonCommand::RuntimeRecoverySmoke)
         }
         "--serve" => parse_serve_options(args),
         argument
@@ -1845,9 +2055,10 @@ mod tests {
         LoopbackTransportSmokeInputEvent, ServeOptions, ServePeerSessionOptions,
         build_daemon_crash_marker, build_loopback_transport_smoke_report,
         build_peer_session_executor_smoke_report, build_peer_session_smoke_report,
-        build_remote_control_loopback_smoke_report, build_tcp_transport_smoke_report,
-        current_unix_millis, format_daemon_ipc_error, panic_payload_class, parse_daemon_command,
-        peer_listener_discovery_addresses, write_daemon_crash_marker_file,
+        build_remote_control_loopback_smoke_report, build_runtime_recovery_smoke_report,
+        build_tcp_transport_smoke_report, current_unix_millis, format_daemon_ipc_error,
+        panic_payload_class, parse_daemon_command, peer_listener_discovery_addresses,
+        write_daemon_crash_marker_file,
     };
 
     fn unique_crash_marker_path(label: &str) -> PathBuf {
@@ -2233,6 +2444,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_hidden_runtime_recovery_smoke_command() {
+        assert_eq!(
+            parse_daemon_command(["--akraz-smoke-runtime-recovery"].map(String::from)),
+            Ok(DaemonCommand::RuntimeRecoverySmoke)
+        );
+        assert_eq!(
+            parse_daemon_command(["--akraz-smoke-runtime-recovery", "--once"].map(String::from)),
+            Err(DaemonUsageError::UnknownArgument("--once".to_string()))
+        );
+    }
+
+    #[test]
     fn loopback_transport_smoke_report_covers_transport_commands() {
         let report =
             build_loopback_transport_smoke_report().expect("loopback transport smoke report");
@@ -2446,6 +2669,39 @@ mod tests {
                 key: "code:14".to_string(),
                 state: "pressed",
             }
+        );
+    }
+
+    #[test]
+    fn runtime_recovery_smoke_report_covers_resume_and_capture_watchdog() {
+        let report = build_runtime_recovery_smoke_report().expect("runtime recovery smoke report");
+
+        assert_eq!(report.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert!(report.system_resume.recovered);
+        assert_eq!(report.system_resume.final_mode, "Local");
+        assert_eq!(
+            report.system_resume.core_actions,
+            vec![
+                "releaseLocalInputs",
+                "releaseAllInputs",
+                "stopRemoteSession"
+            ]
+        );
+        assert_eq!(report.system_resume.local_release_all_count, 1);
+        assert_eq!(report.system_resume.remote_release_all_commands, 1);
+        assert_eq!(report.system_resume.remote_stop_session_commands, 1);
+        assert!(report.input_capture_idle_watchdog.recovered);
+        assert!(
+            report
+                .input_capture_idle_watchdog
+                .dispatched_actions
+                .contains(&"inputCaptureIdle")
+        );
+        assert!(
+            report
+                .input_capture_idle_watchdog
+                .log_events
+                .contains(&"input.capture.idle".to_string())
         );
     }
 

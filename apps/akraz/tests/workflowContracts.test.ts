@@ -51,6 +51,7 @@ describe("GitHub Actions workflow contracts", () => {
     expect(report.workflowScripts).toContain("release:windows-mvp-evidence-sources");
     expect(report.workflowScripts).toContain("release:windows-mvp-resolved-evidence");
     expect(report.workflowScripts).toContain("smoke:windows-mvp-soak");
+    expect(report.workflowScripts).toContain("smoke:runtime-recovery");
     expect(
       report.checks.find((check) => check.id === "workspaceAppScript:smoke:tcp-transport"),
     ).toMatchObject({

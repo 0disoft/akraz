@@ -110,11 +110,7 @@ try {
   const disconnectedResponse = disconnectSession();
   activeSession = false;
   disconnectCount += 1;
-  assertSessionDisconnected(
-    disconnectedResponse,
-    sourceIdentity.deviceId,
-    targetIdentity.deviceId,
-  );
+  assertSessionDisconnected(disconnectedResponse, sourceIdentity.deviceId, targetIdentity.deviceId);
 
   const afterDisconnect = runCtlJsonRpc(["status", "--endpoint", sourceEndpoint]);
   assertStatusMode(afterDisconnect, "Local", "source disconnected status");

@@ -488,6 +488,8 @@ function sanitizeSoakMetrics(metrics) {
     scenarioPasses: safeMetric(metrics?.scenarioPasses),
     scenarioFailures: safeMetric(metrics?.scenarioFailures),
     scenarioTimeouts: safeMetric(metrics?.scenarioTimeouts),
+    runtimeResumeRecoveries: safeMetric(metrics?.runtimeResumeRecoveries),
+    inputCaptureIdleWatchdogRecoveries: safeMetric(metrics?.inputCaptureIdleWatchdogRecoveries),
     stuckInputSuspicions: safeMetric(metrics?.stuckInputSuspicions),
     finalPeerLeaks: safeMetric(metrics?.finalPeerLeaks),
   };

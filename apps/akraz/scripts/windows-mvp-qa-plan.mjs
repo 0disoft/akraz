@@ -147,7 +147,7 @@ const windowsMvpQaCases = [
     ],
     evidence: [
       "Diagnostics support bundle after resume",
-      "Windows MVP soak report with reconnect evidence and stuckInputSuspicions equal to 0",
+      "Windows MVP soak report with runtimeResumeRecoveries greater than 0 and stuckInputSuspicions equal to 0",
     ],
   },
   {
@@ -220,7 +220,7 @@ const windowsMvpQaCases = [
     evidence: [
       "Diagnostics support bundle after input burst",
       "Manual local-input-leak pass note",
-      "Windows MVP soak report with scenarioFailures equal to 0",
+      "Windows MVP soak report with inputCaptureIdleWatchdogRecoveries greater than 0 and scenarioFailures equal to 0",
     ],
   },
   {

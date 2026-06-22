@@ -128,6 +128,8 @@ function passingSoakReport(overrides = {}) {
       releaseAllCommands: 0,
       releaseAllOutcomes: 1,
       platformReleaseAllCalls: 1,
+      runtimeResumeRecoveries: 1,
+      inputCaptureIdleWatchdogRecoveries: 1,
       sessionConnects: 1,
       sessionDisconnects: 1,
       sessionReconnects: 1,

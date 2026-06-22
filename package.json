@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.17.3",
+  "version": "0.18.0",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -32,6 +32,7 @@
     "smoke:peer-session": "bun run --cwd apps/akraz smoke:peer-session",
     "smoke:peer-session-executor": "bun run --cwd apps/akraz smoke:peer-session-executor",
     "smoke:remote-control-loopback": "bun run --cwd apps/akraz smoke:remote-control-loopback",
+    "smoke:runtime-recovery": "bun run --cwd apps/akraz smoke:runtime-recovery",
     "smoke:signing-preflight": "bun run --cwd apps/akraz smoke:signing-preflight",
     "smoke:updater-config-preflight": "bun run --cwd apps/akraz smoke:updater-config-preflight",
     "smoke:windows-mvp-release-bundle": "bun run --cwd apps/akraz smoke:windows-mvp-release-bundle",

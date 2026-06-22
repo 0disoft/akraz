@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.17.3",
+  "version": "0.18.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,6 +27,7 @@
     "smoke:peer-session": "bun scripts/smoke-peer-session.mjs",
     "smoke:peer-session-executor": "bun scripts/smoke-peer-session-executor.mjs",
     "smoke:remote-control-loopback": "bun scripts/smoke-remote-control-loopback.mjs",
+    "smoke:runtime-recovery": "bun scripts/smoke-runtime-recovery.mjs",
     "smoke:signing-preflight": "bun scripts/smoke-signing-preflight.mjs --expect-missing",
     "smoke:updater-config-preflight": "bun scripts/smoke-updater-config-preflight.mjs --expect-missing",
     "smoke:windows-mvp-release-bundle": "bun scripts/smoke-windows-mvp-release-bundle.mjs",

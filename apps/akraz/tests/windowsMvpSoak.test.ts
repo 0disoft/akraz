@@ -69,6 +69,7 @@ describe("Windows MVP soak reporting", () => {
       "peer-session",
       "peer-session-executor",
       "remote-control-loopback",
+      "runtime-recovery",
       "tcp-transport",
       "session-connect-lifecycle",
     ]);
@@ -147,6 +148,17 @@ describe("Windows MVP soak reporting", () => {
     );
     mergeSoakMetrics(
       merged,
+      collectScenarioMetrics("runtime-recovery", {
+        systemResume: {
+          recovered: true,
+        },
+        inputCaptureIdleWatchdog: {
+          recovered: true,
+        },
+      }),
+    );
+    mergeSoakMetrics(
+      merged,
       collectScenarioMetrics("session-connect-lifecycle", {
         schemaVersion: SESSION_CONNECT_LIFECYCLE_SMOKE_SCHEMA_VERSION,
         connected: true,
@@ -163,6 +175,8 @@ describe("Windows MVP soak reporting", () => {
     expect(merged.injectedInputEvents).toBe(1);
     expect(merged.releaseAllOutcomes).toBe(2);
     expect(merged.platformReleaseAllCalls).toBe(1);
+    expect(merged.runtimeResumeRecoveries).toBe(1);
+    expect(merged.inputCaptureIdleWatchdogRecoveries).toBe(1);
     expect(merged.sessionConnects).toBe(2);
     expect(merged.sessionDisconnects).toBe(2);
     expect(merged.sessionReconnects).toBe(1);
@@ -221,6 +235,8 @@ describe("Windows MVP soak reporting", () => {
       injectedInputEvents: 2,
       releaseAllOutcomes: 2,
       platformReleaseAllCalls: 1,
+      runtimeResumeRecoveries: 1,
+      inputCaptureIdleWatchdogRecoveries: 1,
       sessionConnects: 1,
       sessionDisconnects: 1,
       sessionReconnects: 1,
@@ -242,6 +258,8 @@ describe("Windows MVP soak reporting", () => {
         "remoteInputMissing",
         "releaseSignalMissing",
         "sessionReconnectMissing",
+        "runtimeResumeRecoveryMissing",
+        "inputCaptureIdleWatchdogMissing",
       ],
     });
 

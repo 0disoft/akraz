@@ -38,6 +38,10 @@ export const windowsMvpSoakScenarios = [
     script: "smoke-remote-control-loopback.mjs",
   },
   {
+    name: "runtime-recovery",
+    script: "smoke-runtime-recovery.mjs",
+  },
+  {
     name: "tcp-transport",
     script: "smoke-tcp-transport.mjs",
   },
@@ -130,6 +134,8 @@ export function createEmptySoakMetrics() {
     releaseAllCommands: 0,
     releaseAllOutcomes: 0,
     platformReleaseAllCalls: 0,
+    runtimeResumeRecoveries: 0,
+    inputCaptureIdleWatchdogRecoveries: 0,
     sessionConnects: 0,
     sessionDisconnects: 0,
     sessionReconnects: 0,
@@ -209,6 +215,12 @@ export function collectScenarioMetrics(scenarioName, report) {
     if (Number.isSafeInteger(report.finalPeerCount) && report.finalPeerCount > 0) {
       metrics.finalPeerLeaks += report.finalPeerCount;
     }
+  }
+  if (report.systemResume?.recovered === true) {
+    metrics.runtimeResumeRecoveries += 1;
+  }
+  if (report.inputCaptureIdleWatchdog?.recovered === true) {
+    metrics.inputCaptureIdleWatchdogRecoveries += 1;
   }
 
   metrics.stuckInputSuspicions = countStuckInputSuspicions(metrics);
@@ -312,6 +324,12 @@ export function buildSoakQaEvidence(metrics, failures = []) {
   }
   if (metrics.sessionReconnects <= 0) {
     blockers.push("sessionReconnectMissing");
+  }
+  if (metrics.runtimeResumeRecoveries <= 0) {
+    blockers.push("runtimeResumeRecoveryMissing");
+  }
+  if (metrics.inputCaptureIdleWatchdogRecoveries <= 0) {
+    blockers.push("inputCaptureIdleWatchdogMissing");
   }
 
   return {
