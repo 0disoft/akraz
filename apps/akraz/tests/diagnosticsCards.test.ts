@@ -31,8 +31,8 @@ const linuxX11InjectionProbeRequiredMessage =
   "run Akraz inside an X11 session with DISPLAY set.";
 
 const linuxX11InjectionPartialMessage =
-  "Linux X11 pointer injection is available through XTEST; " +
-  "button, scroll, and keyboard injection remain disabled until their XTEST mappings are added.";
+  "Linux X11 pointer, button, and scroll injection are available through XTEST; " +
+  "keyboard injection remains disabled until its XTEST mapping is added.";
 
 const linuxX11XtestUnavailableMessage =
   "Linux X11 input injection cannot start because the XTEST extension is not available; " +
@@ -145,7 +145,7 @@ describe("diagnostics capability cards", () => {
     });
   });
 
-  test("reports Linux X11 partial injection when pointer motion is available", () => {
+  test("reports Linux X11 partial injection when pointer, button, and scroll are available", () => {
     const cards = diagnosticsCards({
       snapshot: null,
       permissions: permissionsFixture({
