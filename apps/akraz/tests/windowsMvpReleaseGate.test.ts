@@ -130,6 +130,7 @@ function passingSoakReport(overrides = {}) {
       platformReleaseAllCalls: 1,
       sessionConnects: 1,
       sessionDisconnects: 1,
+      sessionReconnects: 1,
       finalPeerLeaks: 0,
       stuckInputSuspicions: 0,
     },

@@ -150,17 +150,22 @@ describe("Windows MVP soak reporting", () => {
       collectScenarioMetrics("session-connect-lifecycle", {
         schemaVersion: SESSION_CONNECT_LIFECYCLE_SMOKE_SCHEMA_VERSION,
         connected: true,
+        reconnected: true,
         disconnected: true,
+        connectCount: 2,
+        disconnectCount: 2,
+        inputReleaseAllCount: 1,
         finalPeerCount: 0,
       }),
     );
 
     expect(merged.forwardedInputOutcomes).toBe(1);
     expect(merged.injectedInputEvents).toBe(1);
-    expect(merged.releaseAllOutcomes).toBe(1);
+    expect(merged.releaseAllOutcomes).toBe(2);
     expect(merged.platformReleaseAllCalls).toBe(1);
-    expect(merged.sessionConnects).toBe(1);
-    expect(merged.sessionDisconnects).toBe(1);
+    expect(merged.sessionConnects).toBe(2);
+    expect(merged.sessionDisconnects).toBe(2);
+    expect(merged.sessionReconnects).toBe(1);
     expect(merged.stuckInputSuspicions).toBe(0);
   });
 
@@ -218,6 +223,7 @@ describe("Windows MVP soak reporting", () => {
       platformReleaseAllCalls: 1,
       sessionConnects: 1,
       sessionDisconnects: 1,
+      sessionReconnects: 1,
     };
 
     expect(buildSoakQaEvidence(passingMetrics)).toEqual({
@@ -235,6 +241,7 @@ describe("Windows MVP soak reporting", () => {
         "remoteSessionStopMissing",
         "remoteInputMissing",
         "releaseSignalMissing",
+        "sessionReconnectMissing",
       ],
     });
 

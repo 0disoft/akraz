@@ -38,7 +38,7 @@ const windowsMvpQaCases = [
       "Screen topology diagnostics and saved edge binding snapshot",
       "Manual target pointer, click, drag, scroll, and keyboard pass note without typed content",
       "Manual source local-input-leak pass note",
-      "Windows MVP soak report with remote input and release QA evidence passing",
+      "Windows MVP soak report with remote input, reconnect, and release QA evidence passing",
     ],
   },
   {
@@ -74,7 +74,7 @@ const windowsMvpQaCases = [
     evidence: [
       "Diagnostics support bundle after reconnect",
       "Manual target button-state pass note",
-      "Windows MVP soak report with stuckInputSuspicions equal to 0",
+      "Windows MVP soak report with reconnect evidence and stuckInputSuspicions equal to 0",
     ],
   },
   {
@@ -111,7 +111,7 @@ const windowsMvpQaCases = [
     evidence: [
       "Diagnostics support bundle after modifier recovery",
       "Input release result",
-      "Windows MVP soak report with stuckInputSuspicions equal to 0",
+      "Windows MVP soak report with reconnect evidence and stuckInputSuspicions equal to 0",
     ],
   },
   {
@@ -147,7 +147,7 @@ const windowsMvpQaCases = [
     ],
     evidence: [
       "Diagnostics support bundle after resume",
-      "Windows MVP soak report with stuckInputSuspicions equal to 0",
+      "Windows MVP soak report with reconnect evidence and stuckInputSuspicions equal to 0",
     ],
   },
   {

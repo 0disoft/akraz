@@ -132,6 +132,7 @@ export function createEmptySoakMetrics() {
     platformReleaseAllCalls: 0,
     sessionConnects: 0,
     sessionDisconnects: 0,
+    sessionReconnects: 0,
     finalPeerLeaks: 0,
     stuckInputSuspicions: 0,
   };
@@ -185,12 +186,25 @@ export function collectScenarioMetrics(scenarioName, report) {
   if (Number.isSafeInteger(report.releaseAllCount) && report.releaseAllCount > 0) {
     metrics.platformReleaseAllCalls += report.releaseAllCount;
   }
+  if (Number.isSafeInteger(report.inputReleaseAllCount) && report.inputReleaseAllCount > 0) {
+    metrics.releaseAllOutcomes += report.inputReleaseAllCount;
+  }
   if (report.schemaVersion === SESSION_CONNECT_LIFECYCLE_SMOKE_SCHEMA_VERSION) {
-    if (report.connected === true) {
-      metrics.sessionConnects += 1;
-    }
-    if (report.disconnected === true) {
-      metrics.sessionDisconnects += 1;
+    const connectCount = Number.isSafeInteger(report.connectCount)
+      ? report.connectCount
+      : report.connected === true
+        ? 1
+        : 0;
+    const disconnectCount = Number.isSafeInteger(report.disconnectCount)
+      ? report.disconnectCount
+      : report.disconnected === true
+        ? 1
+        : 0;
+
+    metrics.sessionConnects += connectCount;
+    metrics.sessionDisconnects += disconnectCount;
+    if (report.reconnected === true || connectCount > 1) {
+      metrics.sessionReconnects += Math.max(1, connectCount - 1);
     }
     if (Number.isSafeInteger(report.finalPeerCount) && report.finalPeerCount > 0) {
       metrics.finalPeerLeaks += report.finalPeerCount;
@@ -295,6 +309,9 @@ export function buildSoakQaEvidence(metrics, failures = []) {
   }
   if (releaseSignals <= 0) {
     blockers.push("releaseSignalMissing");
+  }
+  if (metrics.sessionReconnects <= 0) {
+    blockers.push("sessionReconnectMissing");
   }
 
   return {
