@@ -153,7 +153,7 @@ version = "0.4.69"
     expect(result.status).toBe(0);
     expect(report.ready).toBe(true);
     expect(report.schemaVersion).toBe("akraz.releaseMetadata/v1");
-    expect(report.expectedVersion).toBe("0.18.1");
+    expect(report.expectedVersion).toBe("0.18.2");
     expect(report.checks.every((check) => check.status === "pass")).toBe(true);
   });
 });
