@@ -24,7 +24,7 @@ function permissionsFixture(overrides: Partial<PermissionsProbe> = {}): Permissi
 
 const linuxX11CaptureMessage =
   "Linux X11 input capture is disabled for this build; " +
-  "XInput2 capture and Xrandr layout probes are required before capture can be enabled.";
+  "XInput2 capture is required before capture can be enabled.";
 
 const linuxX11InjectionProbeRequiredMessage =
   "Linux X11 input injection needs an XTEST runtime probe before capabilities can be enabled; " +

@@ -1969,6 +1969,16 @@ impl PlatformAdapter for UnsupportedPlatformAdapter {
         self.session.diagnostic_permission_issues()
     }
 
+    fn read_desktop_geometry(&self) -> Result<DesktopGeometry, PlatformError> {
+        match self.session {
+            UnsupportedDesktopSession::LinuxX11 => read_linux_x11_desktop_geometry(),
+            _ => Err(PlatformError::new(format!(
+                "{} desktop geometry is not available",
+                self.name()
+            ))),
+        }
+    }
+
     fn inject_input(&self, event: &InjectedInputEvent) -> Result<(), PlatformError> {
         match self.session {
             UnsupportedDesktopSession::LinuxX11 => {
@@ -2030,7 +2040,7 @@ const LINUX_X11_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
         code: "linux_x11_capture_unimplemented",
         message: concat!(
             "Linux X11 input capture is disabled for this build; ",
-            "XInput2 capture and Xrandr layout probes are required before capture can be enabled.",
+            "XInput2 capture is required before capture can be enabled.",
         ),
     },
     PlatformDiagnosticIssue {
@@ -2087,6 +2097,31 @@ enum LinuxX11XtestProbeResult {
     XtestLibraryUnavailable,
     ProbeSymbolUnavailable,
     ExtensionUnavailable,
+}
+
+#[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinuxX11DesktopGeometryProbeResult {
+    Geometry(DesktopGeometry),
+    DisplayUnavailable,
+    X11LibraryUnavailable,
+    XrandrLibraryUnavailable,
+    GeometrySymbolUnavailable,
+    PointerUnavailable,
+    MonitorQueryFailed,
+    EmptyMonitorSet,
+    PointerOutsideMonitorLayout,
+    RuntimeUnavailable,
+}
+
+#[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxX11MonitorSnapshot {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    primary: bool,
 }
 
 #[cfg(any(not(windows), test))]
@@ -2390,6 +2425,120 @@ fn linux_x11_input_injection_result_to_platform_result(
     }
 }
 
+#[cfg(any(not(windows), test))]
+fn read_linux_x11_desktop_geometry() -> Result<DesktopGeometry, PlatformError> {
+    linux_x11_desktop_geometry_result_to_platform_result(probe_linux_x11_desktop_geometry())
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_x11_desktop_geometry_result_to_platform_result(
+    result: LinuxX11DesktopGeometryProbeResult,
+) -> Result<DesktopGeometry, PlatformError> {
+    match result {
+        LinuxX11DesktopGeometryProbeResult::Geometry(geometry) => Ok(geometry),
+        LinuxX11DesktopGeometryProbeResult::DisplayUnavailable => Err(PlatformError::new(
+            "Linux X11 desktop geometry cannot open an X display connection; check DISPLAY and X server access.",
+        )),
+        LinuxX11DesktopGeometryProbeResult::X11LibraryUnavailable => Err(PlatformError::new(
+            "Linux X11 desktop geometry cannot load libX11; install the X11 runtime library.",
+        )),
+        LinuxX11DesktopGeometryProbeResult::XrandrLibraryUnavailable => Err(PlatformError::new(
+            "Linux X11 desktop geometry cannot load libXrandr; install the Xrandr runtime library.",
+        )),
+        LinuxX11DesktopGeometryProbeResult::GeometrySymbolUnavailable => Err(PlatformError::new(
+            "Linux X11 desktop geometry cannot load required X11/Xrandr symbols; install matching libX11 and libXrandr runtime libraries.",
+        )),
+        LinuxX11DesktopGeometryProbeResult::PointerUnavailable => Err(PlatformError::new(
+            "Linux X11 desktop geometry cannot read the pointer position from the X root window.",
+        )),
+        LinuxX11DesktopGeometryProbeResult::MonitorQueryFailed => Err(PlatformError::new(
+            "Linux X11 desktop geometry cannot query active Xrandr monitors.",
+        )),
+        LinuxX11DesktopGeometryProbeResult::EmptyMonitorSet => Err(PlatformError::new(
+            "Linux X11 desktop geometry found no active Xrandr monitor bounds.",
+        )),
+        LinuxX11DesktopGeometryProbeResult::PointerOutsideMonitorLayout => Err(PlatformError::new(
+            "Linux X11 desktop geometry pointer position is outside the active Xrandr monitor layout.",
+        )),
+        LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable => Err(PlatformError::new(
+            "Linux X11 desktop geometry can only run in a Linux X11 runtime with Xrandr available.",
+        )),
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_x11_desktop_geometry_from_snapshots(
+    pointer_position: LogicalPoint,
+    snapshots: &[LinuxX11MonitorSnapshot],
+) -> LinuxX11DesktopGeometryProbeResult {
+    let mut monitors = Vec::new();
+    for snapshot in snapshots {
+        let bounds = LogicalRect {
+            origin: LogicalPoint {
+                x: snapshot.x,
+                y: snapshot.y,
+            },
+            size: LogicalSize {
+                width: snapshot.width,
+                height: snapshot.height,
+            },
+        };
+        if !bounds.is_valid() {
+            continue;
+        }
+
+        monitors.push(DesktopMonitor {
+            id: format!("xrandr-monitor-{}", monitors.len()),
+            bounds,
+            scale_factor_percent: None,
+            is_primary: snapshot.primary,
+        });
+    }
+
+    if monitors.is_empty() {
+        return LinuxX11DesktopGeometryProbeResult::EmptyMonitorSet;
+    }
+
+    let virtual_screen_bounds = union_logical_rects(monitors.iter().map(|monitor| monitor.bounds));
+    if !virtual_screen_bounds.contains(pointer_position) {
+        return LinuxX11DesktopGeometryProbeResult::PointerOutsideMonitorLayout;
+    }
+
+    LinuxX11DesktopGeometryProbeResult::Geometry(DesktopGeometry {
+        pointer_position,
+        virtual_screen_bounds,
+        monitors,
+    })
+}
+
+#[cfg(any(not(windows), test))]
+fn union_logical_rects(rects: impl IntoIterator<Item = LogicalRect>) -> LogicalRect {
+    let mut rects = rects.into_iter();
+    let Some(first) = rects.next() else {
+        return LogicalRect::default();
+    };
+
+    let mut left = first.left();
+    let mut top = first.top();
+    let mut right = first.right();
+    let mut bottom = first.bottom();
+
+    for rect in rects {
+        left = left.min(rect.left());
+        top = top.min(rect.top());
+        right = right.max(rect.right());
+        bottom = bottom.max(rect.bottom());
+    }
+
+    LogicalRect {
+        origin: LogicalPoint { x: left, y: top },
+        size: LogicalSize {
+            width: right.saturating_sub(left),
+            height: bottom.saturating_sub(top),
+        },
+    }
+}
+
 #[cfg(all(target_os = "linux", not(test)))]
 fn inject_linux_x11_pointer_motion(delta_x: i32, delta_y: i32) -> LinuxX11InputInjectionResult {
     inject_linux_x11_with_xtest(|display, symbols| {
@@ -2605,6 +2754,41 @@ type XTestFakeKeyEventFn = unsafe extern "C" fn(*mut c_void, c_uint, c_int, c_ul
 type XKeysymToKeycodeFn = unsafe extern "C" fn(*mut c_void, c_ulong) -> c_uchar;
 #[cfg(all(target_os = "linux", not(test)))]
 type XFlushFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
+type XDefaultRootWindowFn = unsafe extern "C" fn(*mut c_void) -> c_ulong;
+#[cfg(all(target_os = "linux", not(test)))]
+type XQueryPointerFn = unsafe extern "C" fn(
+    *mut c_void,
+    c_ulong,
+    *mut c_ulong,
+    *mut c_ulong,
+    *mut c_int,
+    *mut c_int,
+    *mut c_int,
+    *mut c_int,
+    *mut c_uint,
+) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
+type XRRGetMonitorsFn =
+    unsafe extern "C" fn(*mut c_void, c_ulong, c_int, *mut c_int) -> *mut XRRMonitorInfo;
+#[cfg(all(target_os = "linux", not(test)))]
+type XRRFreeMonitorsFn = unsafe extern "C" fn(*mut XRRMonitorInfo);
+
+#[cfg(all(target_os = "linux", not(test)))]
+#[repr(C)]
+struct XRRMonitorInfo {
+    _name: c_ulong,
+    primary: c_int,
+    _automatic: c_int,
+    _noutput: c_int,
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+    _mwidth: c_int,
+    _mheight: c_int,
+    _outputs: *mut c_ulong,
+}
 
 #[cfg(all(target_os = "linux", not(test)))]
 #[link(name = "dl")]
@@ -2822,6 +3006,84 @@ impl LinuxX11XtestInjectionSymbols {
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
+struct LinuxX11XrandrGeometrySymbols {
+    _x11: LinuxDynamicLibrary,
+    _xrandr: LinuxDynamicLibrary,
+    open_display: XOpenDisplayFn,
+    close_display: XCloseDisplayFn,
+    default_root_window: XDefaultRootWindowFn,
+    query_pointer: XQueryPointerFn,
+    get_monitors: XRRGetMonitorsFn,
+    free_monitors: XRRFreeMonitorsFn,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl LinuxX11XrandrGeometrySymbols {
+    fn load() -> Result<Self, LinuxX11DesktopGeometryProbeResult> {
+        let Some(x11) =
+            LinuxDynamicLibrary::open_any(&[&b"libX11.so.6\0"[..], &b"libX11.so\0"[..]])
+        else {
+            return Err(LinuxX11DesktopGeometryProbeResult::X11LibraryUnavailable);
+        };
+        let Some(xrandr) =
+            LinuxDynamicLibrary::open_any(&[&b"libXrandr.so.2\0"[..], &b"libXrandr.so\0"[..]])
+        else {
+            return Err(LinuxX11DesktopGeometryProbeResult::XrandrLibraryUnavailable);
+        };
+
+        let Some(open_display_ptr) = x11.symbol_ptr(b"XOpenDisplay\0") else {
+            return Err(LinuxX11DesktopGeometryProbeResult::GeometrySymbolUnavailable);
+        };
+        let Some(close_display_ptr) = x11.symbol_ptr(b"XCloseDisplay\0") else {
+            return Err(LinuxX11DesktopGeometryProbeResult::GeometrySymbolUnavailable);
+        };
+        let Some(default_root_window_ptr) = x11.symbol_ptr(b"XDefaultRootWindow\0") else {
+            return Err(LinuxX11DesktopGeometryProbeResult::GeometrySymbolUnavailable);
+        };
+        let Some(query_pointer_ptr) = x11.symbol_ptr(b"XQueryPointer\0") else {
+            return Err(LinuxX11DesktopGeometryProbeResult::GeometrySymbolUnavailable);
+        };
+        let Some(get_monitors_ptr) = xrandr.symbol_ptr(b"XRRGetMonitors\0") else {
+            return Err(LinuxX11DesktopGeometryProbeResult::GeometrySymbolUnavailable);
+        };
+        let Some(free_monitors_ptr) = xrandr.symbol_ptr(b"XRRFreeMonitors\0") else {
+            return Err(LinuxX11DesktopGeometryProbeResult::GeometrySymbolUnavailable);
+        };
+
+        // SAFETY: symbols are loaded from libX11 and matched to their documented C ABIs.
+        let open_display =
+            unsafe { std::mem::transmute::<*mut c_void, XOpenDisplayFn>(open_display_ptr) };
+        // SAFETY: symbols are loaded from libX11 and matched to their documented C ABIs.
+        let close_display =
+            unsafe { std::mem::transmute::<*mut c_void, XCloseDisplayFn>(close_display_ptr) };
+        // SAFETY: symbols are loaded from libX11 and matched to their documented C ABIs.
+        let default_root_window = unsafe {
+            std::mem::transmute::<*mut c_void, XDefaultRootWindowFn>(default_root_window_ptr)
+        };
+        // SAFETY: symbols are loaded from libX11 and matched to their documented C ABIs.
+        let query_pointer =
+            unsafe { std::mem::transmute::<*mut c_void, XQueryPointerFn>(query_pointer_ptr) };
+        // SAFETY: symbols are loaded from libXrandr and matched to their documented C ABIs.
+        let get_monitors =
+            unsafe { std::mem::transmute::<*mut c_void, XRRGetMonitorsFn>(get_monitors_ptr) };
+        // SAFETY: symbols are loaded from libXrandr and matched to their documented C ABIs.
+        let free_monitors =
+            unsafe { std::mem::transmute::<*mut c_void, XRRFreeMonitorsFn>(free_monitors_ptr) };
+
+        Ok(Self {
+            _x11: x11,
+            _xrandr: xrandr,
+            open_display,
+            close_display,
+            default_root_window,
+            query_pointer,
+            get_monitors,
+            free_monitors,
+        })
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
 struct LinuxX11Display {
     display: *mut c_void,
     close_display: XCloseDisplayFn,
@@ -2889,6 +3151,137 @@ fn probe_linux_x11_xtest_availability() -> LinuxX11XtestProbeResult {
         LinuxX11XtestProbeResult::Available
     } else {
         LinuxX11XtestProbeResult::ExtensionUnavailable
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn probe_linux_x11_desktop_geometry() -> LinuxX11DesktopGeometryProbeResult {
+    let symbols = match LinuxX11XrandrGeometrySymbols::load() {
+        Ok(symbols) => symbols,
+        Err(result) => return result,
+    };
+
+    let Some(display) = LinuxX11Display::open(symbols.open_display, symbols.close_display) else {
+        return LinuxX11DesktopGeometryProbeResult::DisplayUnavailable;
+    };
+
+    // SAFETY: display is live and the function pointer came from libX11.
+    let root_window = unsafe { (symbols.default_root_window)(display.as_ptr()) };
+    let Some(pointer_position) =
+        read_linux_x11_pointer_position(display.as_ptr(), root_window, symbols.query_pointer)
+    else {
+        return LinuxX11DesktopGeometryProbeResult::PointerUnavailable;
+    };
+
+    let monitor_snapshots = match read_linux_x11_xrandr_monitor_snapshots(
+        display.as_ptr(),
+        root_window,
+        symbols.get_monitors,
+        symbols.free_monitors,
+    ) {
+        Ok(snapshots) => snapshots,
+        Err(result) => return result,
+    };
+
+    linux_x11_desktop_geometry_from_snapshots(pointer_position, &monitor_snapshots)
+}
+
+#[cfg(all(any(not(windows), test), not(all(target_os = "linux", not(test)))))]
+fn probe_linux_x11_desktop_geometry() -> LinuxX11DesktopGeometryProbeResult {
+    LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn read_linux_x11_pointer_position(
+    display: *mut c_void,
+    root_window: c_ulong,
+    query_pointer: XQueryPointerFn,
+) -> Option<LogicalPoint> {
+    let mut root_return = 0;
+    let mut child_return = 0;
+    let mut root_x = 0;
+    let mut root_y = 0;
+    let mut window_x = 0;
+    let mut window_y = 0;
+    let mut mask_return = 0;
+
+    // SAFETY: display is live, root_window belongs to it, and all output pointers reference stack values.
+    let ok = unsafe {
+        query_pointer(
+            display,
+            root_window,
+            &mut root_return,
+            &mut child_return,
+            &mut root_x,
+            &mut root_y,
+            &mut window_x,
+            &mut window_y,
+            &mut mask_return,
+        )
+    };
+
+    (ok != 0).then_some(LogicalPoint {
+        x: root_x,
+        y: root_y,
+    })
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn read_linux_x11_xrandr_monitor_snapshots(
+    display: *mut c_void,
+    root_window: c_ulong,
+    get_monitors: XRRGetMonitorsFn,
+    free_monitors: XRRFreeMonitorsFn,
+) -> Result<Vec<LinuxX11MonitorSnapshot>, LinuxX11DesktopGeometryProbeResult> {
+    let mut monitor_count = 0;
+    // SAFETY: display is live, root_window belongs to it, and monitor_count is a valid out pointer.
+    let monitors =
+        unsafe { get_monitors(display, root_window, 1, &mut monitor_count as *mut c_int) };
+    if monitors.is_null() || monitor_count <= 0 {
+        return Err(LinuxX11DesktopGeometryProbeResult::MonitorQueryFailed);
+    }
+
+    let monitors = LinuxX11MonitorInfoList {
+        monitors,
+        len: monitor_count as usize,
+        free_monitors,
+    };
+
+    Ok(monitors
+        .as_slice()
+        .iter()
+        .map(|monitor| LinuxX11MonitorSnapshot {
+            x: monitor.x,
+            y: monitor.y,
+            width: monitor.width,
+            height: monitor.height,
+            primary: monitor.primary != 0,
+        })
+        .collect())
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+struct LinuxX11MonitorInfoList {
+    monitors: *mut XRRMonitorInfo,
+    len: usize,
+    free_monitors: XRRFreeMonitorsFn,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl LinuxX11MonitorInfoList {
+    fn as_slice(&self) -> &[XRRMonitorInfo] {
+        // SAFETY: XRRGetMonitors returned a non-null array with len entries and self owns it until Drop.
+        unsafe { std::slice::from_raw_parts(self.monitors, self.len) }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl Drop for LinuxX11MonitorInfoList {
+    fn drop(&mut self) {
+        // SAFETY: monitors was allocated by XRRGetMonitors and is freed exactly once in Drop.
+        unsafe {
+            (self.free_monitors)(self.monitors);
+        }
     }
 }
 
@@ -3218,11 +3611,14 @@ mod tests {
     use super::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
         InputCapturePolicy, KeyboardLayoutSnapshot, LinuxX11ButtonEvent,
-        LinuxX11InjectedInputState, LinuxX11InputInjectionResult, LinuxX11Key, LinuxX11KeyEvent,
+        LinuxX11DesktopGeometryProbeResult, LinuxX11InjectedInputState,
+        LinuxX11InputInjectionResult, LinuxX11Key, LinuxX11KeyEvent, LinuxX11MonitorSnapshot,
         LinuxX11PressedInput, LinuxX11XtestProbeResult, PlatformAdapter, PlatformCapabilities,
         PlatformError, UnsupportedDesktopSession, UnsupportedPlatformAdapter,
         detect_unsupported_desktop_session_from_env, inject_linux_x11_input,
-        linux_x11_capabilities_from_xtest_probe, linux_x11_diagnostic_issues_from_xtest_probe,
+        linux_x11_capabilities_from_xtest_probe, linux_x11_desktop_geometry_from_snapshots,
+        linux_x11_desktop_geometry_result_to_platform_result,
+        linux_x11_diagnostic_issues_from_xtest_probe,
         linux_x11_input_injection_result_to_platform_result, linux_x11_key_event,
         linux_x11_mouse_button_number, linux_x11_scroll_button_events, runtime_platform_adapter,
     };
@@ -3387,7 +3783,7 @@ mod tests {
             ]
         );
         assert!(linux_x11_issues[0].message.contains("XInput2 capture"));
-        assert!(linux_x11_issues[0].message.contains("Xrandr layout probes"));
+        assert!(!linux_x11_issues[0].message.contains("Xrandr layout probes"));
         assert!(linux_x11_issues[1].message.contains("XTEST runtime probe"));
         assert_eq!(
             linux_unknown
@@ -3483,6 +3879,212 @@ mod tests {
         assert_eq!(
             linux_x11_capabilities_from_xtest_probe(LinuxX11XtestProbeResult::ExtensionUnavailable),
             PlatformCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn linux_x11_desktop_geometry_unions_xrandr_monitors_with_negative_origins() {
+        let result = linux_x11_desktop_geometry_from_snapshots(
+            LogicalPoint { x: 16, y: 12 },
+            &[
+                LinuxX11MonitorSnapshot {
+                    x: -1280,
+                    y: 120,
+                    width: 1280,
+                    height: 720,
+                    primary: false,
+                },
+                LinuxX11MonitorSnapshot {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    primary: true,
+                },
+            ],
+        );
+
+        assert_eq!(
+            result,
+            LinuxX11DesktopGeometryProbeResult::Geometry(DesktopGeometry {
+                pointer_position: LogicalPoint { x: 16, y: 12 },
+                virtual_screen_bounds: LogicalRect {
+                    origin: LogicalPoint { x: -1280, y: 0 },
+                    size: LogicalSize {
+                        width: 3200,
+                        height: 1080,
+                    },
+                },
+                monitors: vec![
+                    DesktopMonitor {
+                        id: "xrandr-monitor-0".to_string(),
+                        bounds: LogicalRect {
+                            origin: LogicalPoint { x: -1280, y: 120 },
+                            size: LogicalSize {
+                                width: 1280,
+                                height: 720,
+                            },
+                        },
+                        scale_factor_percent: None,
+                        is_primary: false,
+                    },
+                    DesktopMonitor {
+                        id: "xrandr-monitor-1".to_string(),
+                        bounds: LogicalRect {
+                            origin: LogicalPoint { x: 0, y: 0 },
+                            size: LogicalSize {
+                                width: 1920,
+                                height: 1080,
+                            },
+                        },
+                        scale_factor_percent: None,
+                        is_primary: true,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn linux_x11_desktop_geometry_skips_invalid_xrandr_monitors() {
+        let result = linux_x11_desktop_geometry_from_snapshots(
+            LogicalPoint { x: 10, y: 10 },
+            &[
+                LinuxX11MonitorSnapshot {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 1080,
+                    primary: true,
+                },
+                LinuxX11MonitorSnapshot {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    primary: false,
+                },
+            ],
+        );
+
+        let LinuxX11DesktopGeometryProbeResult::Geometry(geometry) = result else {
+            panic!("expected geometry from valid monitor");
+        };
+
+        assert_eq!(geometry.monitors.len(), 1);
+        assert_eq!(geometry.monitors[0].id, "xrandr-monitor-0");
+        assert_eq!(geometry.virtual_screen_bounds, geometry.monitors[0].bounds);
+    }
+
+    #[test]
+    fn linux_x11_desktop_geometry_rejects_empty_or_mismatched_layouts() {
+        assert_eq!(
+            linux_x11_desktop_geometry_from_snapshots(LogicalPoint { x: 0, y: 0 }, &[]),
+            LinuxX11DesktopGeometryProbeResult::EmptyMonitorSet
+        );
+        assert_eq!(
+            linux_x11_desktop_geometry_from_snapshots(
+                LogicalPoint { x: 5000, y: 5000 },
+                &[LinuxX11MonitorSnapshot {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    primary: true,
+                }]
+            ),
+            LinuxX11DesktopGeometryProbeResult::PointerOutsideMonitorLayout
+        );
+    }
+
+    #[test]
+    fn linux_x11_desktop_geometry_result_reports_actionable_errors() {
+        let geometry = DesktopGeometry {
+            pointer_position: LogicalPoint { x: 1, y: 1 },
+            virtual_screen_bounds: LogicalRect {
+                origin: LogicalPoint { x: 0, y: 0 },
+                size: LogicalSize {
+                    width: 100,
+                    height: 100,
+                },
+            },
+            monitors: Vec::new(),
+        };
+        assert_eq!(
+            linux_x11_desktop_geometry_result_to_platform_result(
+                LinuxX11DesktopGeometryProbeResult::Geometry(geometry.clone())
+            ),
+            Ok(geometry)
+        );
+
+        let display_error = linux_x11_desktop_geometry_result_to_platform_result(
+            LinuxX11DesktopGeometryProbeResult::DisplayUnavailable,
+        )
+        .expect_err("missing display should be reported");
+        assert!(display_error.to_string().contains("DISPLAY"));
+
+        let x11_error = linux_x11_desktop_geometry_result_to_platform_result(
+            LinuxX11DesktopGeometryProbeResult::X11LibraryUnavailable,
+        )
+        .expect_err("missing X11 library should be reported");
+        assert!(x11_error.to_string().contains("libX11"));
+
+        let xrandr_error = linux_x11_desktop_geometry_result_to_platform_result(
+            LinuxX11DesktopGeometryProbeResult::XrandrLibraryUnavailable,
+        )
+        .expect_err("missing Xrandr library should be reported");
+        assert!(xrandr_error.to_string().contains("libXrandr"));
+
+        let symbol_error = linux_x11_desktop_geometry_result_to_platform_result(
+            LinuxX11DesktopGeometryProbeResult::GeometrySymbolUnavailable,
+        )
+        .expect_err("missing symbols should be reported");
+        assert!(
+            symbol_error
+                .to_string()
+                .contains("required X11/Xrandr symbols")
+        );
+
+        let pointer_unavailable_error = linux_x11_desktop_geometry_result_to_platform_result(
+            LinuxX11DesktopGeometryProbeResult::PointerUnavailable,
+        )
+        .expect_err("missing pointer position should be reported");
+        assert!(
+            pointer_unavailable_error
+                .to_string()
+                .contains("pointer position")
+        );
+
+        let monitor_query_error = linux_x11_desktop_geometry_result_to_platform_result(
+            LinuxX11DesktopGeometryProbeResult::MonitorQueryFailed,
+        )
+        .expect_err("monitor query failure should be reported");
+        assert!(monitor_query_error.to_string().contains("Xrandr monitors"));
+
+        let pointer_error = linux_x11_desktop_geometry_result_to_platform_result(
+            LinuxX11DesktopGeometryProbeResult::PointerOutsideMonitorLayout,
+        )
+        .expect_err("pointer mismatch should be reported");
+        assert!(pointer_error.to_string().contains("outside"));
+    }
+
+    #[test]
+    fn linux_x11_adapter_routes_desktop_geometry_to_runtime_probe() {
+        let linux_x11 =
+            UnsupportedPlatformAdapter::from_session(UnsupportedDesktopSession::LinuxX11);
+        let linux_wayland =
+            UnsupportedPlatformAdapter::from_session(UnsupportedDesktopSession::LinuxWayland);
+
+        let linux_x11_error = linux_x11
+            .read_desktop_geometry()
+            .expect_err("test builds cannot open a runtime X11 display");
+        assert!(linux_x11_error.to_string().contains("Linux X11 runtime"));
+        assert_eq!(
+            linux_wayland
+                .read_desktop_geometry()
+                .expect_err("wayland geometry is not implemented")
+                .to_string(),
+            "linux-wayland desktop geometry is not available"
         );
     }
 
