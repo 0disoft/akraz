@@ -30,9 +30,9 @@ const linuxX11InjectionProbeRequiredMessage =
   "Linux X11 input injection needs an XTEST runtime probe before capabilities can be enabled; " +
   "run Akraz inside an X11 session with DISPLAY set.";
 
-const linuxX11InjectionPartialMessage =
-  "Linux X11 pointer, button, and scroll injection are available through XTEST; " +
-  "keyboard injection remains disabled until its XTEST mapping is added.";
+const linuxX11InjectionAvailableMessage =
+  "Linux X11 pointer, button, scroll, and keyboard injection are available through XTEST; " +
+  "physical key codes use the Xorg evdev keycode offset.";
 
 const linuxX11XtestUnavailableMessage =
   "Linux X11 input injection cannot start because the XTEST extension is not available; " +
@@ -145,7 +145,7 @@ describe("diagnostics capability cards", () => {
     });
   });
 
-  test("reports Linux X11 partial injection when pointer, button, and scroll are available", () => {
+  test("reports Linux X11 injection ready when XTEST input capabilities are available", () => {
     const cards = diagnosticsCards({
       snapshot: null,
       permissions: permissionsFixture({
@@ -154,7 +154,7 @@ describe("diagnostics capability cards", () => {
           canCapturePointer: false,
           canCaptureKeyboard: false,
           canInjectPointer: true,
-          canInjectKeyboard: false,
+          canInjectKeyboard: true,
         },
         issues: [
           {
@@ -162,12 +162,8 @@ describe("diagnostics capability cards", () => {
             message: linuxX11CaptureMessage,
           },
           {
-            code: "linux_x11_injection_partial",
-            message: linuxX11InjectionPartialMessage,
-          },
-          {
-            code: "inject_keyboard_unavailable",
-            message: "Keyboard injection is not available.",
+            code: "linux_x11_injection_xtest_available",
+            message: linuxX11InjectionAvailableMessage,
           },
         ],
       }),
@@ -178,8 +174,8 @@ describe("diagnostics capability cards", () => {
     });
 
     expect(cards.find((card) => card.id === "inputInjection")).toMatchObject({
-      status: "NeedsAction",
-      detail: linuxX11InjectionPartialMessage,
+      status: "OK",
+      detail: "상대 기기에 마우스와 키보드 입력을 전달할 준비가 됐어.",
     });
   });
 

@@ -9,16 +9,14 @@ use std::time::Duration;
 
 use akraz_core::{
     CapturedInputEvent, InjectedInputEvent, LogicalPoint, LogicalRect, LogicalSize, MouseButton,
-    PressState,
+    PhysicalKey, PressState,
 };
 
 #[cfg(all(target_os = "linux", not(test)))]
-use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+use std::ffi::{c_char, c_int, c_uchar, c_uint, c_ulong, c_void};
 
 #[cfg(windows)]
 use akraz_core::DEFAULT_PANIC_HOTKEY_KEY;
-#[cfg(windows)]
-use akraz_core::PhysicalKey;
 
 #[cfg(windows)]
 use std::collections::BTreeSet;
@@ -2045,12 +2043,12 @@ const LINUX_X11_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
 ];
 
 #[cfg(any(not(windows), test))]
-const LINUX_X11_POINTER_BUTTON_SCROLL_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+const LINUX_X11_XTEST_INJECTION_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
     PlatformDiagnosticIssue {
-        code: "linux_x11_injection_partial",
+        code: "linux_x11_injection_xtest_available",
         message: concat!(
-            "Linux X11 pointer, button, and scroll injection are available through XTEST; ",
-            "keyboard injection remains disabled until its XTEST mapping is added.",
+            "Linux X11 pointer, button, scroll, and keyboard injection are available through XTEST; ",
+            "physical key codes use the Xorg evdev keycode offset.",
         ),
     };
 
@@ -2099,7 +2097,7 @@ fn linux_x11_capabilities_from_xtest_probe(
         can_capture_pointer: false,
         can_capture_keyboard: false,
         can_inject_pointer: matches!(result, LinuxX11XtestProbeResult::Available),
-        can_inject_keyboard: false,
+        can_inject_keyboard: matches!(result, LinuxX11XtestProbeResult::Available),
     }
 }
 
@@ -2118,7 +2116,7 @@ fn linux_x11_injection_diagnostic_issue_from_xtest_probe(
     result: LinuxX11XtestProbeResult,
 ) -> PlatformDiagnosticIssue {
     match result {
-        LinuxX11XtestProbeResult::Available => LINUX_X11_POINTER_BUTTON_SCROLL_DIAGNOSTIC_ISSUE,
+        LinuxX11XtestProbeResult::Available => LINUX_X11_XTEST_INJECTION_DIAGNOSTIC_ISSUE,
         LinuxX11XtestProbeResult::DisplayUnavailable => PlatformDiagnosticIssue {
             code: "linux_x11_injection_display_unavailable",
             message: concat!(
@@ -2178,25 +2176,75 @@ struct LinuxX11ButtonEvent {
 }
 
 #[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxX11Key {
+    Keycode(u32),
+    Keysym(u64),
+}
+
+#[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxX11KeyEvent {
+    key: LinuxX11Key,
+    pressed: bool,
+}
+
+#[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxX11PressedInput {
+    Key(PhysicalKey),
+    MouseButton(MouseButton),
+}
+
+#[cfg(any(not(windows), test))]
 #[derive(Debug, Default)]
 struct LinuxX11InjectedInputState {
+    pressed_keys: Vec<PhysicalKey>,
     pressed_buttons: Vec<MouseButton>,
+    press_order: Vec<LinuxX11PressedInput>,
 }
 
 #[cfg(any(not(windows), test))]
 impl LinuxX11InjectedInputState {
-    fn mark_pressed(&mut self, button: MouseButton) {
-        if !self.pressed_buttons.contains(&button) {
-            self.pressed_buttons.push(button);
+    fn mark_pressed(&mut self, input: LinuxX11PressedInput) {
+        let inserted = match input {
+            LinuxX11PressedInput::Key(key) => {
+                if self.pressed_keys.contains(&key) {
+                    false
+                } else {
+                    self.pressed_keys.push(key);
+                    true
+                }
+            }
+            LinuxX11PressedInput::MouseButton(button) => {
+                if self.pressed_buttons.contains(&button) {
+                    false
+                } else {
+                    self.pressed_buttons.push(button);
+                    true
+                }
+            }
+        };
+
+        if inserted {
+            self.press_order.push(input);
         }
     }
 
-    fn mark_released(&mut self, button: MouseButton) {
-        self.pressed_buttons.retain(|pressed| *pressed != button);
+    fn mark_released(&mut self, input: LinuxX11PressedInput) {
+        match input {
+            LinuxX11PressedInput::Key(key) => {
+                self.pressed_keys.retain(|pressed| *pressed != key);
+            }
+            LinuxX11PressedInput::MouseButton(button) => {
+                self.pressed_buttons.retain(|pressed| *pressed != button);
+            }
+        }
+        self.press_order.retain(|pressed| *pressed != input);
     }
 
-    fn release_sequence(&self) -> Vec<MouseButton> {
-        self.pressed_buttons.iter().rev().copied().collect()
+    fn release_sequence(&self) -> Vec<LinuxX11PressedInput> {
+        self.press_order.iter().rev().copied().collect()
     }
 }
 
@@ -2211,14 +2259,19 @@ fn inject_linux_x11_input(
         }
         InjectedInputEvent::MouseButton { button, state } => {
             send_linux_x11_mouse_button(*button, *state)?;
-            update_linux_x11_injected_state(injected_state, *button, *state)
+            update_linux_x11_injected_state(
+                injected_state,
+                LinuxX11PressedInput::MouseButton(*button),
+                *state,
+            )
         }
         InjectedInputEvent::Scroll { delta_x, delta_y } => {
             send_linux_x11_scroll(*delta_x, *delta_y)
         }
-        InjectedInputEvent::Key { .. } => Err(PlatformError::new(
-            "Linux X11 keyboard injection requires an XTEST keyboard mapping; pointer, button, and scroll injection are enabled through XTEST.",
-        )),
+        InjectedInputEvent::Key { key, state } => {
+            send_linux_x11_keyboard_key(*key, *state)?;
+            update_linux_x11_injected_state(injected_state, LinuxX11PressedInput::Key(*key), *state)
+        }
     }
 }
 
@@ -2243,6 +2296,18 @@ fn send_linux_x11_mouse_button(
 }
 
 #[cfg(any(not(windows), test))]
+fn send_linux_x11_keyboard_key(
+    key: PhysicalKey,
+    press_state: PressState,
+) -> Result<(), PlatformError> {
+    let event = linux_x11_key_event(key, press_state)?;
+    linux_x11_input_injection_result_to_platform_result(
+        inject_linux_x11_key_event(event),
+        "Linux X11 keyboard injection was rejected by XTEST while sending key events.",
+    )
+}
+
+#[cfg(any(not(windows), test))]
 fn send_linux_x11_scroll(delta_x: i32, delta_y: i32) -> Result<(), PlatformError> {
     let events = linux_x11_scroll_button_events(delta_x, delta_y);
     if events.is_empty() {
@@ -2263,9 +2328,16 @@ fn release_all_linux_x11_inputs(
         .lock()
         .map_err(|_| PlatformError::new("Linux X11 injected input state lock was poisoned"))?;
 
-    for button in state.release_sequence() {
-        send_linux_x11_mouse_button(button, PressState::Released)?;
-        state.mark_released(button);
+    for input in state.release_sequence() {
+        match input {
+            LinuxX11PressedInput::Key(key) => {
+                send_linux_x11_keyboard_key(key, PressState::Released)
+            }
+            LinuxX11PressedInput::MouseButton(button) => {
+                send_linux_x11_mouse_button(button, PressState::Released)
+            }
+        }?;
+        state.mark_released(input);
     }
 
     Ok(())
@@ -2274,7 +2346,7 @@ fn release_all_linux_x11_inputs(
 #[cfg(any(not(windows), test))]
 fn update_linux_x11_injected_state(
     injected_state: &Mutex<LinuxX11InjectedInputState>,
-    button: MouseButton,
+    input: LinuxX11PressedInput,
     press_state: PressState,
 ) -> Result<(), PlatformError> {
     let mut state = injected_state
@@ -2282,8 +2354,8 @@ fn update_linux_x11_injected_state(
         .map_err(|_| PlatformError::new("Linux X11 injected input state lock was poisoned"))?;
 
     match press_state {
-        PressState::Pressed => state.mark_pressed(button),
-        PressState::Released => state.mark_released(button),
+        PressState::Pressed => state.mark_pressed(input),
+        PressState::Released => state.mark_released(input),
     }
 
     Ok(())
@@ -2341,6 +2413,26 @@ fn inject_linux_x11_button_events(events: &[LinuxX11ButtonEvent]) -> LinuxX11Inp
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
+fn inject_linux_x11_key_event(event: LinuxX11KeyEvent) -> LinuxX11InputInjectionResult {
+    inject_linux_x11_with_xtest(|display, symbols| {
+        let keycode = match event.key {
+            LinuxX11Key::Keycode(keycode) => keycode as c_uint,
+            LinuxX11Key::Keysym(keysym) => {
+                // SAFETY: display is live and the function pointer came from libX11.
+                let keycode = unsafe { (symbols.keysym_to_keycode)(display, keysym as c_ulong) };
+                if keycode == 0 {
+                    return false;
+                }
+                keycode as c_uint
+            }
+        };
+        let pressed = if event.pressed { 1 } else { 0 };
+        // SAFETY: display is live, the function pointer came from libXtst, and CurrentTime is 0.
+        unsafe { (symbols.fake_key_event)(display, keycode, pressed, 0) != 0 }
+    })
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
 fn inject_linux_x11_with_xtest(
     sender: impl FnOnce(*mut c_void, &LinuxX11XtestInjectionSymbols) -> bool,
 ) -> LinuxX11InputInjectionResult {
@@ -2379,6 +2471,11 @@ fn inject_linux_x11_button_events(_events: &[LinuxX11ButtonEvent]) -> LinuxX11In
     LinuxX11InputInjectionResult::RuntimeUnavailable
 }
 
+#[cfg(all(any(not(windows), test), not(all(target_os = "linux", not(test)))))]
+fn inject_linux_x11_key_event(_event: LinuxX11KeyEvent) -> LinuxX11InputInjectionResult {
+    LinuxX11InputInjectionResult::RuntimeUnavailable
+}
+
 #[cfg(any(not(windows), test))]
 fn linux_x11_mouse_button_number(button: MouseButton) -> Result<u32, PlatformError> {
     match button {
@@ -2399,6 +2496,48 @@ fn linux_x11_button_event(button: u32, press_state: PressState) -> LinuxX11Butto
         button,
         pressed: press_state == PressState::Pressed,
     }
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_x11_key_event(
+    key: PhysicalKey,
+    press_state: PressState,
+) -> Result<LinuxX11KeyEvent, PlatformError> {
+    Ok(LinuxX11KeyEvent {
+        key: linux_x11_key_from_physical_key(key)?,
+        pressed: press_state == PressState::Pressed,
+    })
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_x11_key_from_physical_key(key: PhysicalKey) -> Result<LinuxX11Key, PlatformError> {
+    match key {
+        PhysicalKey::LeftShift => Ok(LinuxX11Key::Keysym(0xffe1)),
+        PhysicalKey::RightShift => Ok(LinuxX11Key::Keysym(0xffe2)),
+        PhysicalKey::LeftControl => Ok(LinuxX11Key::Keysym(0xffe3)),
+        PhysicalKey::RightControl => Ok(LinuxX11Key::Keysym(0xffe4)),
+        PhysicalKey::LeftAlt => Ok(LinuxX11Key::Keysym(0xffe9)),
+        PhysicalKey::RightAlt => Ok(LinuxX11Key::Keysym(0xffea)),
+        PhysicalKey::LeftMeta => Ok(LinuxX11Key::Keysym(0xffeb)),
+        PhysicalKey::RightMeta => Ok(LinuxX11Key::Keysym(0xffec)),
+        PhysicalKey::Code(code) => linux_x11_keycode_from_physical_code(code),
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_x11_keycode_from_physical_code(code: u16) -> Result<LinuxX11Key, PlatformError> {
+    const XORG_EVDEV_KEYCODE_OFFSET: u16 = 8;
+    const X11_MAX_KEYCODE: u16 = u8::MAX as u16;
+
+    if code == 0 || code.saturating_add(XORG_EVDEV_KEYCODE_OFFSET) > X11_MAX_KEYCODE {
+        return Err(PlatformError::new(
+            "unsupported Linux X11 physical key code for injection",
+        ));
+    }
+
+    Ok(LinuxX11Key::Keycode(
+        (code + XORG_EVDEV_KEYCODE_OFFSET) as u32,
+    ))
 }
 
 #[cfg(any(not(windows), test))]
@@ -2460,6 +2599,10 @@ type XTestFakeRelativeMotionEventFn =
     unsafe extern "C" fn(*mut c_void, c_int, c_int, c_ulong) -> c_int;
 #[cfg(all(target_os = "linux", not(test)))]
 type XTestFakeButtonEventFn = unsafe extern "C" fn(*mut c_void, c_uint, c_int, c_ulong) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
+type XTestFakeKeyEventFn = unsafe extern "C" fn(*mut c_void, c_uint, c_int, c_ulong) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
+type XKeysymToKeycodeFn = unsafe extern "C" fn(*mut c_void, c_ulong) -> c_uchar;
 #[cfg(all(target_os = "linux", not(test)))]
 type XFlushFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 
@@ -2541,6 +2684,21 @@ impl LinuxX11XtestProbeSymbols {
         let Some(query_extension_ptr) = xtst.symbol_ptr(b"XTestQueryExtension\0") else {
             return Err(LinuxX11XtestProbeResult::ProbeSymbolUnavailable);
         };
+        if x11.symbol_ptr(b"XKeysymToKeycode\0").is_none() {
+            return Err(LinuxX11XtestProbeResult::ProbeSymbolUnavailable);
+        }
+        if x11.symbol_ptr(b"XFlush\0").is_none() {
+            return Err(LinuxX11XtestProbeResult::ProbeSymbolUnavailable);
+        }
+        if xtst.symbol_ptr(b"XTestFakeRelativeMotionEvent\0").is_none() {
+            return Err(LinuxX11XtestProbeResult::ProbeSymbolUnavailable);
+        }
+        if xtst.symbol_ptr(b"XTestFakeButtonEvent\0").is_none() {
+            return Err(LinuxX11XtestProbeResult::ProbeSymbolUnavailable);
+        }
+        if xtst.symbol_ptr(b"XTestFakeKeyEvent\0").is_none() {
+            return Err(LinuxX11XtestProbeResult::ProbeSymbolUnavailable);
+        }
 
         // SAFETY: symbols are loaded from libX11/libXtst and matched to their documented C ABIs.
         let open_display =
@@ -2572,6 +2730,8 @@ struct LinuxX11XtestInjectionSymbols {
     query_extension: XTestQueryExtensionFn,
     fake_relative_motion_event: XTestFakeRelativeMotionEventFn,
     fake_button_event: XTestFakeButtonEventFn,
+    fake_key_event: XTestFakeKeyEventFn,
+    keysym_to_keycode: XKeysymToKeycodeFn,
     flush: XFlushFn,
 }
 
@@ -2606,6 +2766,12 @@ impl LinuxX11XtestInjectionSymbols {
         let Some(fake_button_event_ptr) = xtst.symbol_ptr(b"XTestFakeButtonEvent\0") else {
             return Err(LinuxX11InputInjectionResult::InjectionSymbolUnavailable);
         };
+        let Some(fake_key_event_ptr) = xtst.symbol_ptr(b"XTestFakeKeyEvent\0") else {
+            return Err(LinuxX11InputInjectionResult::InjectionSymbolUnavailable);
+        };
+        let Some(keysym_to_keycode_ptr) = x11.symbol_ptr(b"XKeysymToKeycode\0") else {
+            return Err(LinuxX11InputInjectionResult::InjectionSymbolUnavailable);
+        };
         let Some(flush_ptr) = x11.symbol_ptr(b"XFlush\0") else {
             return Err(LinuxX11InputInjectionResult::InjectionSymbolUnavailable);
         };
@@ -2630,6 +2796,13 @@ impl LinuxX11XtestInjectionSymbols {
         let fake_button_event = unsafe {
             std::mem::transmute::<*mut c_void, XTestFakeButtonEventFn>(fake_button_event_ptr)
         };
+        // SAFETY: symbols are loaded from libXtst and matched to the documented C ABI.
+        let fake_key_event =
+            unsafe { std::mem::transmute::<*mut c_void, XTestFakeKeyEventFn>(fake_key_event_ptr) };
+        // SAFETY: symbols are loaded from libX11 and matched to the documented C ABI.
+        let keysym_to_keycode = unsafe {
+            std::mem::transmute::<*mut c_void, XKeysymToKeycodeFn>(keysym_to_keycode_ptr)
+        };
         // SAFETY: symbols are loaded from libX11 and matched to the documented C ABI.
         let flush = unsafe { std::mem::transmute::<*mut c_void, XFlushFn>(flush_ptr) };
 
@@ -2641,6 +2814,8 @@ impl LinuxX11XtestInjectionSymbols {
             query_extension,
             fake_relative_motion_event,
             fake_button_event,
+            fake_key_event,
+            keysym_to_keycode,
             flush,
         })
     }
@@ -3043,13 +3218,13 @@ mod tests {
     use super::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
         InputCapturePolicy, KeyboardLayoutSnapshot, LinuxX11ButtonEvent,
-        LinuxX11InjectedInputState, LinuxX11InputInjectionResult, LinuxX11XtestProbeResult,
-        PlatformAdapter, PlatformCapabilities, PlatformError, UnsupportedDesktopSession,
-        UnsupportedPlatformAdapter, detect_unsupported_desktop_session_from_env,
-        inject_linux_x11_input, linux_x11_capabilities_from_xtest_probe,
-        linux_x11_diagnostic_issues_from_xtest_probe,
-        linux_x11_input_injection_result_to_platform_result, linux_x11_mouse_button_number,
-        linux_x11_scroll_button_events, runtime_platform_adapter,
+        LinuxX11InjectedInputState, LinuxX11InputInjectionResult, LinuxX11Key, LinuxX11KeyEvent,
+        LinuxX11PressedInput, LinuxX11XtestProbeResult, PlatformAdapter, PlatformCapabilities,
+        PlatformError, UnsupportedDesktopSession, UnsupportedPlatformAdapter,
+        detect_unsupported_desktop_session_from_env, inject_linux_x11_input,
+        linux_x11_capabilities_from_xtest_probe, linux_x11_diagnostic_issues_from_xtest_probe,
+        linux_x11_input_injection_result_to_platform_result, linux_x11_key_event,
+        linux_x11_mouse_button_number, linux_x11_scroll_button_events, runtime_platform_adapter,
     };
 
     #[cfg(windows)]
@@ -3232,11 +3407,11 @@ mod tests {
         let available =
             linux_x11_diagnostic_issues_from_xtest_probe(LinuxX11XtestProbeResult::Available);
 
-        assert_eq!(available[1].code, "linux_x11_injection_partial");
+        assert_eq!(available[1].code, "linux_x11_injection_xtest_available");
         assert!(
             available[1]
                 .message
-                .contains("pointer, button, and scroll injection are available")
+                .contains("pointer, button, scroll, and keyboard injection are available")
         );
 
         let missing_display = linux_x11_diagnostic_issues_from_xtest_probe(
@@ -3295,14 +3470,14 @@ mod tests {
     }
 
     #[test]
-    fn linux_x11_capabilities_enable_only_pointer_injection_when_xtest_is_available() {
+    fn linux_x11_capabilities_enable_input_injection_when_xtest_is_available() {
         assert_eq!(
             linux_x11_capabilities_from_xtest_probe(LinuxX11XtestProbeResult::Available),
             PlatformCapabilities {
                 can_capture_pointer: false,
                 can_capture_keyboard: false,
                 can_inject_pointer: true,
-                can_inject_keyboard: false,
+                can_inject_keyboard: true,
             }
         );
         assert_eq!(
@@ -3451,25 +3626,70 @@ mod tests {
     }
 
     #[test]
-    fn linux_x11_injected_button_state_tracks_release_order() {
-        let mut state = LinuxX11InjectedInputState::default();
-
-        state.mark_pressed(MouseButton::Left);
-        state.mark_pressed(MouseButton::Right);
-        state.mark_pressed(MouseButton::Left);
-
+    fn linux_x11_key_events_map_modifiers_and_xorg_evdev_codes() {
         assert_eq!(
-            state.release_sequence(),
-            vec![MouseButton::Right, MouseButton::Left]
+            linux_x11_key_event(PhysicalKey::LeftShift, PressState::Pressed),
+            Ok(LinuxX11KeyEvent {
+                key: LinuxX11Key::Keysym(0xffe1),
+                pressed: true,
+            })
+        );
+        assert_eq!(
+            linux_x11_key_event(PhysicalKey::RightMeta, PressState::Released),
+            Ok(LinuxX11KeyEvent {
+                key: LinuxX11Key::Keysym(0xffec),
+                pressed: false,
+            })
+        );
+        assert_eq!(
+            linux_x11_key_event(PhysicalKey::Code(44), PressState::Pressed),
+            Ok(LinuxX11KeyEvent {
+                key: LinuxX11Key::Keycode(52),
+                pressed: true,
+            })
         );
 
-        state.mark_released(MouseButton::Right);
+        let zero_error = linux_x11_key_event(PhysicalKey::Code(0), PressState::Pressed)
+            .expect_err("zero physical key code should not be injected");
+        assert!(
+            zero_error
+                .to_string()
+                .contains("unsupported Linux X11 physical key code")
+        );
 
-        assert_eq!(state.release_sequence(), vec![MouseButton::Left]);
+        let overflow_error = linux_x11_key_event(PhysicalKey::Code(248), PressState::Pressed)
+            .expect_err("X11 keycodes cannot exceed u8::MAX");
+        assert!(
+            overflow_error
+                .to_string()
+                .contains("unsupported Linux X11 physical key code")
+        );
     }
 
     #[test]
-    fn linux_x11_input_routes_pointer_button_scroll_and_rejects_keyboard() {
+    fn linux_x11_injected_input_state_tracks_release_order() {
+        let mut state = LinuxX11InjectedInputState::default();
+        let shift = LinuxX11PressedInput::Key(PhysicalKey::LeftShift);
+        let left_button = LinuxX11PressedInput::MouseButton(MouseButton::Left);
+        let right_button = LinuxX11PressedInput::MouseButton(MouseButton::Right);
+
+        state.mark_pressed(shift);
+        state.mark_pressed(left_button);
+        state.mark_pressed(right_button);
+        state.mark_pressed(shift);
+
+        assert_eq!(
+            state.release_sequence(),
+            vec![right_button, left_button, shift]
+        );
+
+        state.mark_released(left_button);
+
+        assert_eq!(state.release_sequence(), vec![right_button, shift]);
+    }
+
+    #[test]
+    fn linux_x11_input_routes_pointer_button_scroll_and_keyboard() {
         let injected_state = std::sync::Mutex::new(LinuxX11InjectedInputState::default());
         let pointer_error = inject_linux_x11_input(
             &injected_state,
@@ -3518,12 +3738,26 @@ mod tests {
         let key_error = inject_linux_x11_input(
             &injected_state,
             &InjectedInputEvent::Key {
-                key: PhysicalKey::LeftShift,
+                key: PhysicalKey::Code(44),
                 state: PressState::Pressed,
             },
         )
-        .expect_err("keyboard injection should be gated");
-        assert!(key_error.to_string().contains("XTEST keyboard mapping"));
+        .expect_err("test builds cannot open a runtime X11 display");
+        assert!(key_error.to_string().contains("Linux X11 runtime"));
+
+        let unsupported_key_error = inject_linux_x11_input(
+            &injected_state,
+            &InjectedInputEvent::Key {
+                key: PhysicalKey::Code(248),
+                state: PressState::Pressed,
+            },
+        )
+        .expect_err("out-of-range physical key code should be rejected before runtime injection");
+        assert!(
+            unsupported_key_error
+                .to_string()
+                .contains("unsupported Linux X11 physical key code")
+        );
     }
 
     #[test]
