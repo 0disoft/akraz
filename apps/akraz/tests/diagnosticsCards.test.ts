@@ -48,6 +48,12 @@ const linuxWaylandInputCapturePortalMessage =
 const linuxWaylandRemoteDesktopPortalMessage =
   "Linux Wayland input injection needs an xdg-desktop-portal RemoteDesktop probe before capabilities can be enabled.";
 
+const linuxWaylandCaptureSessionBusMessage =
+  "Linux Wayland input capture needs a D-Bus session bus before xdg-desktop-portal InputCapture can be probed.";
+
+const linuxWaylandInjectionSessionBusMessage =
+  "Linux Wayland input injection needs a D-Bus session bus before xdg-desktop-portal RemoteDesktop can be probed.";
+
 describe("diagnostics capability cards", () => {
   test("keeps the user-facing card order stable", () => {
     const cards = diagnosticsCards({
@@ -299,6 +305,52 @@ describe("diagnostics capability cards", () => {
     expect(cards.find((card) => card.id === "inputInjection")).toMatchObject({
       status: "NeedsAction",
       detail: linuxWaylandRemoteDesktopPortalMessage,
+    });
+  });
+
+  test("shows Linux Wayland session bus diagnostics before generic missing capability text", () => {
+    const cards = diagnosticsCards({
+      snapshot: null,
+      permissions: permissionsFixture({
+        adapterName: "linux-wayland",
+        capabilities: {
+          canCapturePointer: false,
+          canCaptureKeyboard: false,
+          canInjectPointer: false,
+          canInjectKeyboard: false,
+        },
+        issues: [
+          {
+            code: "linux_wayland_capture_session_bus_unavailable",
+            message: linuxWaylandCaptureSessionBusMessage,
+          },
+          {
+            code: "linux_wayland_injection_session_bus_unavailable",
+            message: linuxWaylandInjectionSessionBusMessage,
+          },
+          {
+            code: "capture_pointer_unavailable",
+            message: "Pointer capture is not available.",
+          },
+          {
+            code: "inject_pointer_unavailable",
+            message: "Pointer injection is not available.",
+          },
+        ],
+      }),
+      hasLocalIdentity: true,
+      trustedPeerCount: 1,
+      layoutBindingCount: 1,
+      hasScreenTopology: true,
+    });
+
+    expect(cards.find((card) => card.id === "inputCapture")).toMatchObject({
+      status: "NeedsAction",
+      detail: linuxWaylandCaptureSessionBusMessage,
+    });
+    expect(cards.find((card) => card.id === "inputInjection")).toMatchObject({
+      status: "NeedsAction",
+      detail: linuxWaylandInjectionSessionBusMessage,
     });
   });
 

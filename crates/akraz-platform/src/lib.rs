@@ -14,6 +14,8 @@ use akraz_core::{
 
 #[cfg(all(target_os = "linux", not(test)))]
 use std::ffi::{c_char, c_double, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
+#[cfg(all(target_os = "linux", not(test)))]
+use std::os::unix::fs::FileTypeExt;
 
 #[cfg(windows)]
 use akraz_core::DEFAULT_PANIC_HOTKEY_KEY;
@@ -2112,6 +2114,37 @@ impl LinuxWaylandDesktop {
                     "before deciding whether GNOME or KDE portal support applies.",
                 ),
             },
+        }
+    }
+
+    fn supports_portal_runtime_probes(self) -> bool {
+        matches!(self, Self::Gnome | Self::Kde)
+    }
+}
+
+#[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxWaylandSessionBusProbeResult {
+    AddressAvailable,
+    RuntimeDirFallbackAvailable,
+    Missing,
+    UnsupportedAddress,
+    RuntimeUnavailable,
+}
+
+#[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxWaylandRuntimeProbe {
+    desktop: LinuxWaylandDesktop,
+    session_bus: LinuxWaylandSessionBusProbeResult,
+}
+
+#[cfg(any(not(windows), test))]
+impl LinuxWaylandRuntimeProbe {
+    fn new(desktop: LinuxWaylandDesktop, session_bus: LinuxWaylandSessionBusProbeResult) -> Self {
+        Self {
+            desktop,
+            session_bus,
         }
     }
 }
@@ -4434,12 +4467,72 @@ const LINUX_WAYLAND_REMOTE_DESKTOP_PORTAL_DIAGNOSTIC_ISSUE: PlatformDiagnosticIs
     };
 
 #[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_INJECTION_SESSION_BUS_UNAVAILABLE_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_wayland_injection_session_bus_unavailable",
+        message: concat!(
+            "Linux Wayland input injection needs a D-Bus session bus before ",
+            "xdg-desktop-portal RemoteDesktop can be probed.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_INJECTION_SESSION_BUS_UNSUPPORTED_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_wayland_injection_session_bus_unsupported",
+        message: concat!(
+            "Linux Wayland input injection found an unsupported DBUS_SESSION_BUS_ADDRESS; ",
+            "use a user-session Unix D-Bus bus before probing RemoteDesktop.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_INJECTION_COMPOSITOR_UNVERIFIED_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_wayland_injection_compositor_unverified",
+        message: concat!(
+            "Linux Wayland input injection is only ready for GNOME/KDE portal probes; ",
+            "this compositor must stay disabled until support is verified.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
 const LINUX_WAYLAND_INPUT_CAPTURE_PORTAL_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
     PlatformDiagnosticIssue {
         code: "linux_wayland_capture_input_capture_portal_probe_required",
         message: concat!(
             "Linux Wayland input capture needs an xdg-desktop-portal InputCapture probe ",
             "before capture can be enabled.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_CAPTURE_SESSION_BUS_UNAVAILABLE_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_wayland_capture_session_bus_unavailable",
+        message: concat!(
+            "Linux Wayland input capture needs a D-Bus session bus before ",
+            "xdg-desktop-portal InputCapture can be probed.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_CAPTURE_SESSION_BUS_UNSUPPORTED_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_wayland_capture_session_bus_unsupported",
+        message: concat!(
+            "Linux Wayland input capture found an unsupported DBUS_SESSION_BUS_ADDRESS; ",
+            "use a user-session Unix D-Bus bus before probing InputCapture.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_CAPTURE_COMPOSITOR_UNVERIFIED_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_wayland_capture_compositor_unverified",
+        message: concat!(
+            "Linux Wayland input capture is only ready for GNOME/KDE portal probes; ",
+            "this compositor must stay disabled until support is verified.",
         ),
     };
 
@@ -4453,15 +4546,186 @@ const LINUX_WAYLAND_LIBEI_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue = PlatformDi
 };
 
 #[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_LIBEI_SESSION_BUS_UNAVAILABLE_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_wayland_libei_session_bus_unavailable",
+        message: concat!(
+            "Linux Wayland remote input needs a D-Bus session bus before libei transport ",
+            "can be negotiated through the portal.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_LIBEI_SESSION_BUS_UNSUPPORTED_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_wayland_libei_session_bus_unsupported",
+        message: concat!(
+            "Linux Wayland remote input found an unsupported DBUS_SESSION_BUS_ADDRESS; ",
+            "use a user-session Unix D-Bus bus before probing libei transport.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_LIBEI_COMPOSITOR_UNVERIFIED_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_wayland_libei_compositor_unverified",
+        message: concat!(
+            "Linux Wayland libei transport is only ready for GNOME/KDE portal probes; ",
+            "this compositor must stay disabled until support is verified.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
 fn linux_wayland_diagnostic_permission_issues(
     desktop: LinuxWaylandDesktop,
 ) -> Vec<PlatformDiagnosticIssue> {
+    linux_wayland_diagnostic_issues_from_probe(linux_wayland_runtime_probe(desktop))
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_wayland_diagnostic_issues_from_probe(
+    probe: LinuxWaylandRuntimeProbe,
+) -> Vec<PlatformDiagnosticIssue> {
     vec![
-        LINUX_WAYLAND_INPUT_CAPTURE_PORTAL_DIAGNOSTIC_ISSUE,
-        LINUX_WAYLAND_REMOTE_DESKTOP_PORTAL_DIAGNOSTIC_ISSUE,
-        LINUX_WAYLAND_LIBEI_DIAGNOSTIC_ISSUE,
-        desktop.diagnostic_issue(),
+        linux_wayland_capture_diagnostic_issue_from_probe(probe),
+        linux_wayland_injection_diagnostic_issue_from_probe(probe),
+        linux_wayland_libei_diagnostic_issue_from_probe(probe),
+        probe.desktop.diagnostic_issue(),
     ]
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_wayland_capture_diagnostic_issue_from_probe(
+    probe: LinuxWaylandRuntimeProbe,
+) -> PlatformDiagnosticIssue {
+    if !probe.desktop.supports_portal_runtime_probes() {
+        return LINUX_WAYLAND_CAPTURE_COMPOSITOR_UNVERIFIED_DIAGNOSTIC_ISSUE;
+    }
+
+    match probe.session_bus {
+        LinuxWaylandSessionBusProbeResult::AddressAvailable
+        | LinuxWaylandSessionBusProbeResult::RuntimeDirFallbackAvailable => {
+            LINUX_WAYLAND_INPUT_CAPTURE_PORTAL_DIAGNOSTIC_ISSUE
+        }
+        LinuxWaylandSessionBusProbeResult::Missing => {
+            LINUX_WAYLAND_CAPTURE_SESSION_BUS_UNAVAILABLE_DIAGNOSTIC_ISSUE
+        }
+        LinuxWaylandSessionBusProbeResult::UnsupportedAddress => {
+            LINUX_WAYLAND_CAPTURE_SESSION_BUS_UNSUPPORTED_DIAGNOSTIC_ISSUE
+        }
+        LinuxWaylandSessionBusProbeResult::RuntimeUnavailable => {
+            LINUX_WAYLAND_INPUT_CAPTURE_PORTAL_DIAGNOSTIC_ISSUE
+        }
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_wayland_injection_diagnostic_issue_from_probe(
+    probe: LinuxWaylandRuntimeProbe,
+) -> PlatformDiagnosticIssue {
+    if !probe.desktop.supports_portal_runtime_probes() {
+        return LINUX_WAYLAND_INJECTION_COMPOSITOR_UNVERIFIED_DIAGNOSTIC_ISSUE;
+    }
+
+    match probe.session_bus {
+        LinuxWaylandSessionBusProbeResult::AddressAvailable
+        | LinuxWaylandSessionBusProbeResult::RuntimeDirFallbackAvailable => {
+            LINUX_WAYLAND_REMOTE_DESKTOP_PORTAL_DIAGNOSTIC_ISSUE
+        }
+        LinuxWaylandSessionBusProbeResult::Missing => {
+            LINUX_WAYLAND_INJECTION_SESSION_BUS_UNAVAILABLE_DIAGNOSTIC_ISSUE
+        }
+        LinuxWaylandSessionBusProbeResult::UnsupportedAddress => {
+            LINUX_WAYLAND_INJECTION_SESSION_BUS_UNSUPPORTED_DIAGNOSTIC_ISSUE
+        }
+        LinuxWaylandSessionBusProbeResult::RuntimeUnavailable => {
+            LINUX_WAYLAND_REMOTE_DESKTOP_PORTAL_DIAGNOSTIC_ISSUE
+        }
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_wayland_libei_diagnostic_issue_from_probe(
+    probe: LinuxWaylandRuntimeProbe,
+) -> PlatformDiagnosticIssue {
+    if !probe.desktop.supports_portal_runtime_probes() {
+        return LINUX_WAYLAND_LIBEI_COMPOSITOR_UNVERIFIED_DIAGNOSTIC_ISSUE;
+    }
+
+    match probe.session_bus {
+        LinuxWaylandSessionBusProbeResult::AddressAvailable
+        | LinuxWaylandSessionBusProbeResult::RuntimeDirFallbackAvailable => {
+            LINUX_WAYLAND_LIBEI_DIAGNOSTIC_ISSUE
+        }
+        LinuxWaylandSessionBusProbeResult::Missing => {
+            LINUX_WAYLAND_LIBEI_SESSION_BUS_UNAVAILABLE_DIAGNOSTIC_ISSUE
+        }
+        LinuxWaylandSessionBusProbeResult::UnsupportedAddress => {
+            LINUX_WAYLAND_LIBEI_SESSION_BUS_UNSUPPORTED_DIAGNOSTIC_ISSUE
+        }
+        LinuxWaylandSessionBusProbeResult::RuntimeUnavailable => {
+            LINUX_WAYLAND_LIBEI_DIAGNOSTIC_ISSUE
+        }
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_wayland_runtime_probe(desktop: LinuxWaylandDesktop) -> LinuxWaylandRuntimeProbe {
+    #[cfg(all(target_os = "linux", not(test)))]
+    {
+        let dbus_session_bus_address = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+        let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+        LinuxWaylandRuntimeProbe::new(
+            desktop,
+            linux_wayland_session_bus_probe_from_env(
+                dbus_session_bus_address.as_deref(),
+                xdg_runtime_dir.as_deref(),
+                linux_wayland_runtime_dir_bus_is_available(xdg_runtime_dir.as_deref()),
+            ),
+        )
+    }
+
+    #[cfg(not(all(target_os = "linux", not(test))))]
+    {
+        LinuxWaylandRuntimeProbe::new(
+            desktop,
+            LinuxWaylandSessionBusProbeResult::RuntimeUnavailable,
+        )
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_wayland_session_bus_probe_from_env(
+    dbus_session_bus_address: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+    xdg_runtime_dir_bus_available: bool,
+) -> LinuxWaylandSessionBusProbeResult {
+    if let Some(address) = normalized_env_value(dbus_session_bus_address) {
+        if address.starts_with("unix:") {
+            return LinuxWaylandSessionBusProbeResult::AddressAvailable;
+        }
+        return LinuxWaylandSessionBusProbeResult::UnsupportedAddress;
+    }
+
+    if env_value_is_present(xdg_runtime_dir) && xdg_runtime_dir_bus_available {
+        return LinuxWaylandSessionBusProbeResult::RuntimeDirFallbackAvailable;
+    }
+
+    LinuxWaylandSessionBusProbeResult::Missing
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn linux_wayland_runtime_dir_bus_is_available(xdg_runtime_dir: Option<&str>) -> bool {
+    let Some(runtime_dir) = xdg_runtime_dir
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    std::fs::metadata(std::path::Path::new(runtime_dir).join("bus"))
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
 }
 
 #[cfg(any(not(windows), test))]
@@ -4792,14 +5056,15 @@ mod tests {
 
     use super::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
-        InputCapturePolicy, KeyboardLayoutSnapshot, LinuxWaylandDesktop, LinuxX11ButtonEvent,
-        LinuxX11DesktopGeometryProbeResult, LinuxX11InjectedInputState,
-        LinuxX11InputInjectionResult, LinuxX11Key, LinuxX11KeyEvent, LinuxX11MonitorSnapshot,
-        LinuxX11PressedInput, LinuxX11RawInputEvent, LinuxX11Xinput2ProbeResult,
-        LinuxX11XtestProbeResult, PlatformAdapter, PlatformCapabilities, PlatformError,
-        UnsupportedDesktopSession, UnsupportedPlatformAdapter,
+        InputCapturePolicy, KeyboardLayoutSnapshot, LinuxWaylandDesktop, LinuxWaylandRuntimeProbe,
+        LinuxWaylandSessionBusProbeResult, LinuxX11ButtonEvent, LinuxX11DesktopGeometryProbeResult,
+        LinuxX11InjectedInputState, LinuxX11InputInjectionResult, LinuxX11Key, LinuxX11KeyEvent,
+        LinuxX11MonitorSnapshot, LinuxX11PressedInput, LinuxX11RawInputEvent,
+        LinuxX11Xinput2ProbeResult, LinuxX11XtestProbeResult, PlatformAdapter,
+        PlatformCapabilities, PlatformError, UnsupportedDesktopSession, UnsupportedPlatformAdapter,
         captured_events_from_linux_x11_raw_input, detect_unsupported_desktop_session_from_env,
-        inject_linux_x11_input, linux_x11_capabilities_from_probes,
+        inject_linux_x11_input, linux_wayland_diagnostic_issues_from_probe,
+        linux_wayland_session_bus_probe_from_env, linux_x11_capabilities_from_probes,
         linux_x11_desktop_geometry_from_snapshots,
         linux_x11_desktop_geometry_result_to_platform_result,
         linux_x11_diagnostic_issues_from_probes, linux_x11_diagnostic_issues_from_xtest_probe,
@@ -4937,6 +5202,91 @@ mod tests {
         assert_eq!(
             LinuxWaylandDesktop::from_env_value(Some("")),
             LinuxWaylandDesktop::Unknown
+        );
+    }
+
+    #[test]
+    fn linux_wayland_session_bus_detection_classifies_probe_preconditions() {
+        assert_eq!(
+            linux_wayland_session_bus_probe_from_env(
+                Some("unix:path=/run/user/1000/bus"),
+                None,
+                false,
+            ),
+            LinuxWaylandSessionBusProbeResult::AddressAvailable
+        );
+        assert_eq!(
+            linux_wayland_session_bus_probe_from_env(Some("tcp:host=127.0.0.1"), None, false),
+            LinuxWaylandSessionBusProbeResult::UnsupportedAddress
+        );
+        assert_eq!(
+            linux_wayland_session_bus_probe_from_env(None, Some("/run/user/1000"), true),
+            LinuxWaylandSessionBusProbeResult::RuntimeDirFallbackAvailable
+        );
+        assert_eq!(
+            linux_wayland_session_bus_probe_from_env(None, Some("/run/user/1000"), false),
+            LinuxWaylandSessionBusProbeResult::Missing
+        );
+        assert_eq!(
+            linux_wayland_session_bus_probe_from_env(Some(""), None, false),
+            LinuxWaylandSessionBusProbeResult::Missing
+        );
+    }
+
+    #[test]
+    fn linux_wayland_diagnostics_report_portal_preflight_state() {
+        let gnome_missing_bus =
+            linux_wayland_diagnostic_issues_from_probe(LinuxWaylandRuntimeProbe::new(
+                LinuxWaylandDesktop::Gnome,
+                LinuxWaylandSessionBusProbeResult::Missing,
+            ));
+        let kde_unsupported_bus =
+            linux_wayland_diagnostic_issues_from_probe(LinuxWaylandRuntimeProbe::new(
+                LinuxWaylandDesktop::Kde,
+                LinuxWaylandSessionBusProbeResult::UnsupportedAddress,
+            ));
+        let unsupported_compositor =
+            linux_wayland_diagnostic_issues_from_probe(LinuxWaylandRuntimeProbe::new(
+                LinuxWaylandDesktop::Other,
+                LinuxWaylandSessionBusProbeResult::AddressAvailable,
+            ));
+
+        assert_eq!(
+            gnome_missing_bus
+                .iter()
+                .map(|issue| issue.code)
+                .collect::<Vec<_>>(),
+            vec![
+                "linux_wayland_capture_session_bus_unavailable",
+                "linux_wayland_injection_session_bus_unavailable",
+                "linux_wayland_libei_session_bus_unavailable",
+                "linux_wayland_compositor_gnome_detected",
+            ]
+        );
+        assert!(gnome_missing_bus[0].message.contains("D-Bus session bus"));
+        assert_eq!(
+            kde_unsupported_bus
+                .iter()
+                .map(|issue| issue.code)
+                .collect::<Vec<_>>(),
+            vec![
+                "linux_wayland_capture_session_bus_unsupported",
+                "linux_wayland_injection_session_bus_unsupported",
+                "linux_wayland_libei_session_bus_unsupported",
+                "linux_wayland_compositor_kde_detected",
+            ]
+        );
+        assert_eq!(
+            unsupported_compositor
+                .iter()
+                .map(|issue| issue.code)
+                .collect::<Vec<_>>(),
+            vec![
+                "linux_wayland_capture_compositor_unverified",
+                "linux_wayland_injection_compositor_unverified",
+                "linux_wayland_libei_compositor_unverified",
+                "linux_wayland_compositor_unsupported",
+            ]
         );
     }
 
