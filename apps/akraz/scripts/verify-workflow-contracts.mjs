@@ -185,6 +185,10 @@ const RELEASE_WORKFLOW_INPUT_ENVIRONMENT = [
 ];
 const WORKSPACE_DELEGATED_APP_SCRIPTS = [
   "build",
+  "qa:linux-x11-plan",
+  "qa:linux-x11-report",
+  "qa:linux-x11-report-template",
+  "qa:linux-x11-report-update",
   "qa:windows-mvp-plan",
   "qa:windows-mvp-report",
   "qa:windows-mvp-report-template",
@@ -221,6 +225,10 @@ const EXPECTED_APP_PACKAGE_SCRIPTS = {
   check: "svelte-check --tsconfig ./tsconfig.json",
   "prepare:sidecar": "bun scripts/prepare-sidecar.mjs",
   "prepare:sidecar:release": "bun scripts/prepare-sidecar.mjs --release",
+  "qa:linux-x11-plan": "bun scripts/linux-x11-qa-plan.mjs",
+  "qa:linux-x11-report": "bun scripts/linux-x11-qa-report.mjs",
+  "qa:linux-x11-report-template": "bun scripts/linux-x11-qa-report.mjs --template",
+  "qa:linux-x11-report-update": "bun scripts/linux-x11-qa-report.mjs --update-result",
   "qa:windows-mvp-plan": "bun scripts/windows-mvp-qa-plan.mjs",
   "qa:windows-mvp-report": "bun scripts/windows-mvp-qa-report.mjs",
   "qa:windows-mvp-report-template": "bun scripts/windows-mvp-qa-report.mjs --template",

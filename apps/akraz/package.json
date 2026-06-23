@@ -1,6 +1,6 @@
 {
   "name": "akraz",
-  "version": "0.22.4",
+  "version": "0.22.5",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,10 @@
     "dev": "vite --host 127.0.0.1",
     "prepare:sidecar": "bun scripts/prepare-sidecar.mjs",
     "prepare:sidecar:release": "bun scripts/prepare-sidecar.mjs --release",
+    "qa:linux-x11-plan": "bun scripts/linux-x11-qa-plan.mjs",
+    "qa:linux-x11-report": "bun scripts/linux-x11-qa-report.mjs",
+    "qa:linux-x11-report-template": "bun scripts/linux-x11-qa-report.mjs --template",
+    "qa:linux-x11-report-update": "bun scripts/linux-x11-qa-report.mjs --update-result",
     "qa:windows-mvp-plan": "bun scripts/windows-mvp-qa-plan.mjs",
     "qa:windows-mvp-report": "bun scripts/windows-mvp-qa-report.mjs",
     "qa:windows-mvp-report-template": "bun scripts/windows-mvp-qa-report.mjs --template",

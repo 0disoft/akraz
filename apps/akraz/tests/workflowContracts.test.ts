@@ -59,6 +59,18 @@ describe("GitHub Actions workflow contracts", () => {
       expectedCommand: "bun run --cwd apps/akraz smoke:tcp-transport",
     });
     expect(
+      report.checks.find((check) => check.id === "workspaceAppScript:qa:linux-x11-report"),
+    ).toMatchObject({
+      status: "pass",
+      expectedCommand: "bun run --cwd apps/akraz qa:linux-x11-report",
+    });
+    expect(
+      report.checks.find((check) => check.id === "appPackageScript:qa:linux-x11-report-update"),
+    ).toMatchObject({
+      status: "pass",
+      expectedCommand: "bun scripts/linux-x11-qa-report.mjs --update-result",
+    });
+    expect(
       report.checks.find((check) => check.id === "appPackageScript:smoke:settings-start"),
     ).toMatchObject({
       status: "pass",

@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.22.4",
+  "version": "0.22.5",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -14,6 +14,10 @@
     "format:check": "oxfmt --check .",
     "lint": "oxlint . --no-error-on-unmatched-pattern",
     "lint:fix": "oxlint --fix . --no-error-on-unmatched-pattern",
+    "qa:linux-x11-plan": "bun run --cwd apps/akraz qa:linux-x11-plan",
+    "qa:linux-x11-report": "bun run --cwd apps/akraz qa:linux-x11-report",
+    "qa:linux-x11-report-template": "bun run --cwd apps/akraz qa:linux-x11-report-template",
+    "qa:linux-x11-report-update": "bun run --cwd apps/akraz qa:linux-x11-report-update",
     "qa:windows-mvp-plan": "bun run --cwd apps/akraz qa:windows-mvp-plan",
     "qa:windows-mvp-report": "bun run --cwd apps/akraz qa:windows-mvp-report",
     "qa:windows-mvp-report-template": "bun run --cwd apps/akraz qa:windows-mvp-report-template",
