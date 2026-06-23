@@ -1,6 +1,6 @@
 {
   "name": "akraz-workspace",
-  "version": "0.22.3",
+  "version": "0.22.4",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -9,7 +9,7 @@
   "type": "module",
   "scripts": {
     "build": "bun run --cwd apps/akraz build",
-    "check": "bun run verify:release-metadata && bun run verify:workflow-contracts && bun run format:check && bun run lint && bun run --cwd apps/akraz check && bun run build",
+    "check": "bun run verify:release-metadata && bun run release:linux-deb-preflight && bun run verify:workflow-contracts && bun run format:check && bun run lint && bun run --cwd apps/akraz check && bun run build",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint . --no-error-on-unmatched-pattern",
@@ -19,6 +19,7 @@
     "qa:windows-mvp-report-template": "bun run --cwd apps/akraz qa:windows-mvp-report-template",
     "qa:windows-mvp-report-update": "bun run --cwd apps/akraz qa:windows-mvp-report-update",
     "qa:windows-mvp-workflow-payload": "bun run --cwd apps/akraz qa:windows-mvp-workflow-payload",
+    "release:linux-deb-preflight": "bun run --cwd apps/akraz release:linux-deb-preflight",
     "release:signing-preflight": "bun run --cwd apps/akraz release:signing-preflight",
     "release:updater-config-preflight": "bun run --cwd apps/akraz release:updater-config-preflight",
     "release:windows-mvp-bundle": "bun run --cwd apps/akraz release:windows-mvp-bundle",
