@@ -48,8 +48,15 @@ export function latencySummary(snapshot: DiagnosticsSnapshot): string {
 }
 
 export function runtimeEnvironmentSummary(environment: DiagnosticsRuntimeEnvironment): string {
-  const session = environment.sessionType ? ` · ${environment.sessionType}` : "";
-  return `${environment.os}/${environment.arch}${session}`;
+  const facts = [`${environment.os}/${environment.arch}`];
+  if (environment.sessionType) {
+    facts.push(environment.sessionType);
+  }
+  if (environment.desktopEnvironment) {
+    facts.push(environment.desktopEnvironment);
+  }
+
+  return facts.join(" · ");
 }
 
 export function includedSectionsSummary(bundle: DiagnosticsSupportBundle): string {

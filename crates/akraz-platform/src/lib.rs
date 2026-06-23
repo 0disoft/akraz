@@ -2022,10 +2022,19 @@ impl PlatformAdapter for UnsupportedPlatformAdapter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnsupportedDesktopSession {
     LinuxX11,
-    LinuxWayland,
+    LinuxWayland(LinuxWaylandDesktop),
     LinuxUnknown,
     Macos,
     Other,
+}
+
+#[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxWaylandDesktop {
+    Gnome,
+    Kde,
+    Other,
+    Unknown,
 }
 
 #[cfg(any(not(windows), test))]
@@ -2033,7 +2042,7 @@ impl UnsupportedDesktopSession {
     fn adapter_name(self) -> &'static str {
         match self {
             Self::LinuxX11 => "linux-x11",
-            Self::LinuxWayland => "linux-wayland",
+            Self::LinuxWayland(_) => "linux-wayland",
             Self::LinuxUnknown => "linux-unknown",
             Self::Macos => "macos-unsupported",
             Self::Other => "unsupported",
@@ -2043,10 +2052,66 @@ impl UnsupportedDesktopSession {
     fn diagnostic_permission_issues(self) -> Vec<PlatformDiagnosticIssue> {
         match self {
             Self::LinuxX11 => linux_x11_diagnostic_permission_issues(),
-            Self::LinuxWayland => LINUX_WAYLAND_DIAGNOSTIC_ISSUES.to_vec(),
+            Self::LinuxWayland(desktop) => linux_wayland_diagnostic_permission_issues(desktop),
             Self::LinuxUnknown => LINUX_UNKNOWN_DIAGNOSTIC_ISSUES.to_vec(),
             Self::Macos => MACOS_DIAGNOSTIC_ISSUES.to_vec(),
             Self::Other => UNSUPPORTED_PLATFORM_DIAGNOSTIC_ISSUES.to_vec(),
+        }
+    }
+}
+
+#[cfg(any(not(windows), test))]
+impl LinuxWaylandDesktop {
+    fn from_env_value(value: Option<&str>) -> Self {
+        let Some(value) = normalized_env_value(value) else {
+            return Self::Unknown;
+        };
+        let parts = value
+            .split(':')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+
+        if parts.iter().any(|part| matches!(*part, "gnome" | "ubuntu")) {
+            return Self::Gnome;
+        }
+        if parts.iter().any(|part| matches!(*part, "kde" | "plasma")) {
+            return Self::Kde;
+        }
+
+        Self::Other
+    }
+
+    fn diagnostic_issue(self) -> PlatformDiagnosticIssue {
+        match self {
+            Self::Gnome => PlatformDiagnosticIssue {
+                code: "linux_wayland_compositor_gnome_detected",
+                message: concat!(
+                    "GNOME Wayland was detected; RemoteDesktop, InputCapture, and libei probes ",
+                    "must pass before Akraz can enable Wayland input sharing.",
+                ),
+            },
+            Self::Kde => PlatformDiagnosticIssue {
+                code: "linux_wayland_compositor_kde_detected",
+                message: concat!(
+                    "KDE Wayland was detected; RemoteDesktop, InputCapture, and libei probes ",
+                    "must pass before Akraz can enable Wayland input sharing.",
+                ),
+            },
+            Self::Other => PlatformDiagnosticIssue {
+                code: "linux_wayland_compositor_unsupported",
+                message: concat!(
+                    "This Wayland compositor is outside the verified GNOME/KDE support set; ",
+                    "keep remote input disabled until portal and libei probes prove support.",
+                ),
+            },
+            Self::Unknown => PlatformDiagnosticIssue {
+                code: "linux_wayland_compositor_unknown",
+                message: concat!(
+                    "Wayland compositor could not be identified; set XDG_CURRENT_DESKTOP ",
+                    "before deciding whether GNOME or KDE portal support applies.",
+                ),
+            },
         }
     }
 }
@@ -4359,16 +4424,45 @@ impl Drop for LinuxX11MonitorInfoList {
 }
 
 #[cfg(any(not(windows), test))]
-const LINUX_WAYLAND_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
+const LINUX_WAYLAND_REMOTE_DESKTOP_PORTAL_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
     PlatformDiagnosticIssue {
-        code: "linux_wayland_capture_unimplemented",
-        message: "Linux Wayland input capture is not implemented yet; portal and compositor support must be verified before capture can be enabled.",
-    },
+        code: "linux_wayland_injection_remote_desktop_portal_probe_required",
+        message: concat!(
+            "Linux Wayland input injection needs an xdg-desktop-portal RemoteDesktop probe ",
+            "before capabilities can be enabled.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_INPUT_CAPTURE_PORTAL_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
     PlatformDiagnosticIssue {
-        code: "linux_wayland_injection_unimplemented",
-        message: "Linux Wayland input injection is not implemented yet; portal and compositor support must be verified before injection can be enabled.",
-    },
-];
+        code: "linux_wayland_capture_input_capture_portal_probe_required",
+        message: concat!(
+            "Linux Wayland input capture needs an xdg-desktop-portal InputCapture probe ",
+            "before capture can be enabled.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
+const LINUX_WAYLAND_LIBEI_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue = PlatformDiagnosticIssue {
+    code: "linux_wayland_libei_transport_probe_required",
+    message: concat!(
+        "Linux Wayland remote input needs a libei transport probe before pointer, button, ",
+        "scroll, or keyboard events can be routed.",
+    ),
+};
+
+#[cfg(any(not(windows), test))]
+fn linux_wayland_diagnostic_permission_issues(
+    desktop: LinuxWaylandDesktop,
+) -> Vec<PlatformDiagnosticIssue> {
+    vec![
+        LINUX_WAYLAND_INPUT_CAPTURE_PORTAL_DIAGNOSTIC_ISSUE,
+        LINUX_WAYLAND_REMOTE_DESKTOP_PORTAL_DIAGNOSTIC_ISSUE,
+        LINUX_WAYLAND_LIBEI_DIAGNOSTIC_ISSUE,
+        desktop.diagnostic_issue(),
+    ]
+}
 
 #[cfg(any(not(windows), test))]
 const LINUX_UNKNOWN_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
@@ -4409,12 +4503,14 @@ const UNSUPPORTED_PLATFORM_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
 #[cfg(any(not(windows), test))]
 fn detect_unsupported_desktop_session() -> UnsupportedDesktopSession {
     let xdg_session_type = std::env::var("XDG_SESSION_TYPE").ok();
+    let current_desktop = std::env::var("XDG_CURRENT_DESKTOP").ok();
     let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
     let display = std::env::var("DISPLAY").ok();
 
     detect_unsupported_desktop_session_from_env(
         std::env::consts::OS,
         xdg_session_type.as_deref(),
+        current_desktop.as_deref(),
         wayland_display.as_deref(),
         display.as_deref(),
     )
@@ -4424,11 +4520,17 @@ fn detect_unsupported_desktop_session() -> UnsupportedDesktopSession {
 fn detect_unsupported_desktop_session_from_env(
     target_os: &str,
     xdg_session_type: Option<&str>,
+    current_desktop: Option<&str>,
     wayland_display: Option<&str>,
     display: Option<&str>,
 ) -> UnsupportedDesktopSession {
     match target_os {
-        "linux" => detect_linux_desktop_session(xdg_session_type, wayland_display, display),
+        "linux" => detect_linux_desktop_session(
+            xdg_session_type,
+            current_desktop,
+            wayland_display,
+            display,
+        ),
         "macos" => UnsupportedDesktopSession::Macos,
         _ => UnsupportedDesktopSession::Other,
     }
@@ -4437,17 +4539,24 @@ fn detect_unsupported_desktop_session_from_env(
 #[cfg(any(not(windows), test))]
 fn detect_linux_desktop_session(
     xdg_session_type: Option<&str>,
+    current_desktop: Option<&str>,
     wayland_display: Option<&str>,
     display: Option<&str>,
 ) -> UnsupportedDesktopSession {
     match normalized_env_value(xdg_session_type).as_deref() {
-        Some("wayland") => return UnsupportedDesktopSession::LinuxWayland,
+        Some("wayland") => {
+            return UnsupportedDesktopSession::LinuxWayland(LinuxWaylandDesktop::from_env_value(
+                current_desktop,
+            ));
+        }
         Some("x11" | "xorg") => return UnsupportedDesktopSession::LinuxX11,
         _ => {}
     }
 
     if env_value_is_present(wayland_display) {
-        return UnsupportedDesktopSession::LinuxWayland;
+        return UnsupportedDesktopSession::LinuxWayland(LinuxWaylandDesktop::from_env_value(
+            current_desktop,
+        ));
     }
     if env_value_is_present(display) {
         return UnsupportedDesktopSession::LinuxX11;
@@ -4683,7 +4792,7 @@ mod tests {
 
     use super::{
         DesktopGeometry, DesktopMonitor, FakePlatformAdapter, InputCaptureConfig,
-        InputCapturePolicy, KeyboardLayoutSnapshot, LinuxX11ButtonEvent,
+        InputCapturePolicy, KeyboardLayoutSnapshot, LinuxWaylandDesktop, LinuxX11ButtonEvent,
         LinuxX11DesktopGeometryProbeResult, LinuxX11InjectedInputState,
         LinuxX11InputInjectionResult, LinuxX11Key, LinuxX11KeyEvent, LinuxX11MonitorSnapshot,
         LinuxX11PressedInput, LinuxX11RawInputEvent, LinuxX11Xinput2ProbeResult,
@@ -4765,15 +4874,17 @@ mod tests {
             detect_unsupported_desktop_session_from_env(
                 "linux",
                 Some("wayland"),
+                Some("GNOME"),
                 Some("wayland-0"),
                 Some(":0"),
             ),
-            UnsupportedDesktopSession::LinuxWayland
+            UnsupportedDesktopSession::LinuxWayland(LinuxWaylandDesktop::Gnome)
         );
         assert_eq!(
             detect_unsupported_desktop_session_from_env(
                 "linux",
                 Some("x11"),
+                Some("GNOME"),
                 Some("wayland-0"),
                 Some(":0"),
             ),
@@ -4784,16 +4895,48 @@ mod tests {
     #[test]
     fn linux_desktop_session_detection_uses_display_fallbacks() {
         assert_eq!(
-            detect_unsupported_desktop_session_from_env("linux", None, Some("wayland-0"), None),
-            UnsupportedDesktopSession::LinuxWayland
+            detect_unsupported_desktop_session_from_env(
+                "linux",
+                None,
+                Some("KDE"),
+                Some("wayland-0"),
+                None
+            ),
+            UnsupportedDesktopSession::LinuxWayland(LinuxWaylandDesktop::Kde)
         );
         assert_eq!(
-            detect_unsupported_desktop_session_from_env("linux", Some(""), None, Some(":0")),
+            detect_unsupported_desktop_session_from_env(
+                "linux",
+                Some(""),
+                Some("KDE"),
+                None,
+                Some(":0")
+            ),
             UnsupportedDesktopSession::LinuxX11
         );
         assert_eq!(
-            detect_unsupported_desktop_session_from_env("linux", Some("tty"), None, None),
+            detect_unsupported_desktop_session_from_env("linux", Some("tty"), None, None, None),
             UnsupportedDesktopSession::LinuxUnknown
+        );
+    }
+
+    #[test]
+    fn linux_wayland_desktop_detection_classifies_support_tiers() {
+        assert_eq!(
+            LinuxWaylandDesktop::from_env_value(Some("GNOME:ubuntu")),
+            LinuxWaylandDesktop::Gnome
+        );
+        assert_eq!(
+            LinuxWaylandDesktop::from_env_value(Some("KDE")),
+            LinuxWaylandDesktop::Kde
+        );
+        assert_eq!(
+            LinuxWaylandDesktop::from_env_value(Some("sway")),
+            LinuxWaylandDesktop::Other
+        );
+        assert_eq!(
+            LinuxWaylandDesktop::from_env_value(Some("")),
+            LinuxWaylandDesktop::Unknown
         );
     }
 
@@ -4804,7 +4947,7 @@ mod tests {
             "linux-x11"
         );
         assert_eq!(
-            UnsupportedDesktopSession::LinuxWayland.adapter_name(),
+            UnsupportedDesktopSession::LinuxWayland(LinuxWaylandDesktop::Gnome).adapter_name(),
             "linux-wayland"
         );
         assert_eq!(
@@ -4823,8 +4966,9 @@ mod tests {
 
     #[test]
     fn unsupported_adapter_reports_session_without_opening_capabilities() {
-        let adapter =
-            UnsupportedPlatformAdapter::from_session(UnsupportedDesktopSession::LinuxWayland);
+        let adapter = UnsupportedPlatformAdapter::from_session(
+            UnsupportedDesktopSession::LinuxWayland(LinuxWaylandDesktop::Gnome),
+        );
 
         assert_eq!(adapter.name(), "linux-wayland");
         assert_eq!(
@@ -4845,9 +4989,17 @@ mod tests {
     fn unsupported_adapter_reports_session_permission_diagnostics() {
         let linux_x11 =
             UnsupportedPlatformAdapter::from_session(UnsupportedDesktopSession::LinuxX11);
+        let linux_wayland_gnome = UnsupportedPlatformAdapter::from_session(
+            UnsupportedDesktopSession::LinuxWayland(LinuxWaylandDesktop::Gnome),
+        );
+        let linux_wayland_other = UnsupportedPlatformAdapter::from_session(
+            UnsupportedDesktopSession::LinuxWayland(LinuxWaylandDesktop::Other),
+        );
         let linux_unknown =
             UnsupportedPlatformAdapter::from_session(UnsupportedDesktopSession::LinuxUnknown);
         let linux_x11_issues = linux_x11.diagnostic_permission_issues();
+        let linux_wayland_gnome_issues = linux_wayland_gnome.diagnostic_permission_issues();
+        let linux_wayland_other_issues = linux_wayland_other.diagnostic_permission_issues();
 
         assert_eq!(
             linux_x11_issues
@@ -4868,6 +5020,34 @@ mod tests {
         assert!(!linux_x11_issues[0].message.contains("Xrandr layout probes"));
         assert!(linux_x11_issues[1].message.contains("XTEST runtime probe"));
         assert!(linux_x11_issues[2].message.contains("Xrandr runtime probe"));
+        assert_eq!(
+            linux_wayland_gnome_issues
+                .iter()
+                .map(|issue| issue.code)
+                .collect::<Vec<_>>(),
+            vec![
+                "linux_wayland_capture_input_capture_portal_probe_required",
+                "linux_wayland_injection_remote_desktop_portal_probe_required",
+                "linux_wayland_libei_transport_probe_required",
+                "linux_wayland_compositor_gnome_detected",
+            ]
+        );
+        assert!(
+            linux_wayland_gnome_issues[0]
+                .message
+                .contains("InputCapture probe")
+        );
+        assert!(
+            linux_wayland_gnome_issues[1]
+                .message
+                .contains("RemoteDesktop probe")
+        );
+        assert!(linux_wayland_gnome_issues[2].message.contains("libei"));
+        assert!(
+            linux_wayland_other_issues[3]
+                .message
+                .contains("outside the verified GNOME/KDE support set")
+        );
         assert_eq!(
             linux_unknown
                 .diagnostic_permission_issues()
@@ -5217,8 +5397,7 @@ mod tests {
 
     #[test]
     fn linux_x11_xinput2_mask_helpers_cover_selected_raw_events() {
-        let mut mask = Vec::new();
-        mask.resize(linux_x11_event_mask_len(17), 0_u8);
+        let mut mask = std::iter::repeat_n(0_u8, linux_x11_event_mask_len(17)).collect::<Vec<_>>();
 
         set_linux_x11_event_mask(&mut mask, 13);
         set_linux_x11_event_mask(&mut mask, 14);
@@ -5423,8 +5602,9 @@ mod tests {
     fn linux_x11_adapter_routes_desktop_geometry_to_runtime_probe() {
         let linux_x11 =
             UnsupportedPlatformAdapter::from_session(UnsupportedDesktopSession::LinuxX11);
-        let linux_wayland =
-            UnsupportedPlatformAdapter::from_session(UnsupportedDesktopSession::LinuxWayland);
+        let linux_wayland = UnsupportedPlatformAdapter::from_session(
+            UnsupportedDesktopSession::LinuxWayland(LinuxWaylandDesktop::Gnome),
+        );
 
         let linux_x11_error = linux_x11
             .read_desktop_geometry()

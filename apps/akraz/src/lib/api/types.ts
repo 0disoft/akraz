@@ -83,6 +83,7 @@ export interface DiagnosticsRuntimeEnvironment {
   family: string;
   arch: string;
   sessionType?: string;
+  desktopEnvironment?: string;
 }
 
 export interface DiagnosticsDaemonSnapshot {

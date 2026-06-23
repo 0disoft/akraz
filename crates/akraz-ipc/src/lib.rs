@@ -1366,6 +1366,8 @@ pub struct DiagnosticsRuntimeEnvironment {
     pub arch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_environment: Option<String>,
 }
 
 /// Privacy flags describing which sensitive classes are included in a diagnostics snapshot.
@@ -1570,6 +1572,10 @@ pub fn build_diagnostics_runtime_environment() -> DiagnosticsRuntimeEnvironment 
             env::var("WAYLAND_DISPLAY").ok().as_deref(),
             env::var("DISPLAY").ok().as_deref(),
         ),
+        desktop_environment: diagnostics_desktop_environment_from_values(
+            env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
+            env::var("DESKTOP_SESSION").ok().as_deref(),
+        ),
     }
 }
 
@@ -1598,6 +1604,14 @@ fn diagnostics_session_type_from_values(
     None
 }
 
+fn diagnostics_desktop_environment_from_values(
+    xdg_current_desktop: Option<&str>,
+    desktop_session: Option<&str>,
+) -> Option<String> {
+    sanitize_desktop_environment(xdg_current_desktop)
+        .or_else(|| sanitize_desktop_environment(desktop_session))
+}
+
 fn sanitize_session_type(value: Option<&str>) -> Option<String> {
     let value = non_empty_value(value)?.to_ascii_lowercase();
     if value.len() > 32 {
@@ -1606,6 +1620,21 @@ fn sanitize_session_type(value: Option<&str>) -> Option<String> {
     if value
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn sanitize_desktop_environment(value: Option<&str>) -> Option<String> {
+    let value = non_empty_value(value)?.to_ascii_lowercase();
+    if value.len() > 64 {
+        return None;
+    }
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
     {
         Some(value)
     } else {
@@ -1916,8 +1945,8 @@ mod tests {
         SessionProbeManualCandidateResult, SessionStatus, build_diagnostics_latency_histogram,
         build_diagnostics_snapshot, build_diagnostics_support_bundle,
         build_diagnostics_support_bundle_with_previous_crash, call_json_rpc,
-        diagnostics_session_type_from_values, parse_request_line, resolve_default_endpoint,
-        serve_os_local_ipc_once, to_json_line,
+        diagnostics_desktop_environment_from_values, diagnostics_session_type_from_values,
+        parse_request_line, resolve_default_endpoint, serve_os_local_ipc_once, to_json_line,
     };
     use akraz_protocol::CapabilityFlags;
     use serde_json::json;
@@ -1989,6 +2018,18 @@ mod tests {
         );
         assert_eq!(
             diagnostics_session_type_from_values("linux", None, None, None),
+            None
+        );
+        assert_eq!(
+            diagnostics_desktop_environment_from_values(Some("GNOME:ubuntu"), None),
+            Some("gnome:ubuntu".to_string())
+        );
+        assert_eq!(
+            diagnostics_desktop_environment_from_values(Some("bad value"), Some("plasma")),
+            Some("plasma".to_string())
+        );
+        assert_eq!(
+            diagnostics_desktop_environment_from_values(Some("../secret"), None),
             None
         );
     }

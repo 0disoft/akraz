@@ -33,6 +33,7 @@ function snapshotFixture(): DiagnosticsSnapshot {
       family: "windows",
       arch: "x86_64",
       sessionType: "windows-desktop",
+      desktopEnvironment: "explorer",
     },
     daemon: {
       daemonVersion: appPackage.version,
@@ -150,6 +151,7 @@ function lifecycleOnlyBundleFixture(): DiagnosticsSupportBundle {
       family: "windows",
       arch: "x86_64",
       sessionType: "windows-desktop",
+      desktopEnvironment: "explorer",
     },
     daemonLifecycle: {
       phase: "not_running",
@@ -188,7 +190,7 @@ describe("diagnostics snapshot helpers", () => {
     expect(keyboardLayoutSummary(snapshotFixture())).toBe("0x0412 · 00000412 · 0x0000000004120412");
     expect(latencySummary(snapshotFixture())).toBe("평균 0.45ms · p95 0.90ms · p99 0.90ms");
     expect(runtimeEnvironmentSummary(snapshotFixture().runtimeEnvironment)).toBe(
-      "windows/x86_64 · windows-desktop",
+      "windows/x86_64 · windows-desktop · explorer",
     );
     expect(unavailableSectionsSummary(snapshotFixture())).toBe("recentLogs");
     expect(recentLogsSummary(bundleFixture())).toBe("1개");

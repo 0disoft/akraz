@@ -42,6 +42,12 @@ const linuxX11XtestUnavailableMessage =
   "Linux X11 input injection cannot start because the XTEST extension is not available; " +
   "enable XTEST in the X server before enabling injection.";
 
+const linuxWaylandInputCapturePortalMessage =
+  "Linux Wayland input capture needs an xdg-desktop-portal InputCapture probe before capture can be enabled.";
+
+const linuxWaylandRemoteDesktopPortalMessage =
+  "Linux Wayland input injection needs an xdg-desktop-portal RemoteDesktop probe before capabilities can be enabled.";
+
 describe("diagnostics capability cards", () => {
   test("keeps the user-facing card order stable", () => {
     const cards = diagnosticsCards({
@@ -243,6 +249,56 @@ describe("diagnostics capability cards", () => {
     expect(cards.find((card) => card.id === "inputInjection")).toMatchObject({
       status: "NeedsAction",
       detail: linuxX11XtestUnavailableMessage,
+    });
+  });
+
+  test("shows Linux Wayland portal diagnostics before generic missing capability text", () => {
+    const cards = diagnosticsCards({
+      snapshot: null,
+      permissions: permissionsFixture({
+        adapterName: "linux-wayland",
+        capabilities: {
+          canCapturePointer: false,
+          canCaptureKeyboard: false,
+          canInjectPointer: false,
+          canInjectKeyboard: false,
+        },
+        issues: [
+          {
+            code: "linux_wayland_capture_input_capture_portal_probe_required",
+            message: linuxWaylandInputCapturePortalMessage,
+          },
+          {
+            code: "linux_wayland_injection_remote_desktop_portal_probe_required",
+            message: linuxWaylandRemoteDesktopPortalMessage,
+          },
+          {
+            code: "linux_wayland_libei_transport_probe_required",
+            message: "Linux Wayland remote input needs a libei transport probe.",
+          },
+          {
+            code: "capture_pointer_unavailable",
+            message: "Pointer capture is not available.",
+          },
+          {
+            code: "inject_pointer_unavailable",
+            message: "Pointer injection is not available.",
+          },
+        ],
+      }),
+      hasLocalIdentity: true,
+      trustedPeerCount: 1,
+      layoutBindingCount: 1,
+      hasScreenTopology: true,
+    });
+
+    expect(cards.find((card) => card.id === "inputCapture")).toMatchObject({
+      status: "NeedsAction",
+      detail: linuxWaylandInputCapturePortalMessage,
+    });
+    expect(cards.find((card) => card.id === "inputInjection")).toMatchObject({
+      status: "NeedsAction",
+      detail: linuxWaylandRemoteDesktopPortalMessage,
     });
   });
 
