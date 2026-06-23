@@ -2035,13 +2035,24 @@ impl UnsupportedDesktopSession {
 }
 
 #[cfg(any(not(windows), test))]
-const LINUX_X11_CAPTURE_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue = PlatformDiagnosticIssue {
-    code: "linux_x11_capture_unimplemented",
-    message: concat!(
-        "Linux X11 input capture is disabled for this build; ",
-        "XInput2 capture is required before capture can be enabled.",
-    ),
-};
+const LINUX_X11_XINPUT2_CAPTURE_PROBE_REQUIRED_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_x11_capture_xinput2_probe_required",
+        message: concat!(
+            "Linux X11 input capture needs an XInput2 runtime probe before capabilities can be enabled; ",
+            "run Akraz inside an X11 session with DISPLAY set.",
+        ),
+    };
+
+#[cfg(any(not(windows), test))]
+const LINUX_X11_XINPUT2_CAPTURE_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_x11_capture_xinput2_available",
+        message: concat!(
+            "Linux X11 XInput2 runtime probing is available; ",
+            "input capture still needs the XInput2 event loop implementation before capabilities are enabled.",
+        ),
+    };
 
 #[cfg(any(not(windows), test))]
 const LINUX_X11_XTEST_INJECTION_PROBE_REQUIRED_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
@@ -2077,7 +2088,10 @@ const LINUX_X11_XTEST_INJECTION_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
 fn linux_x11_platform_capabilities() -> PlatformCapabilities {
     #[cfg(all(target_os = "linux", not(test)))]
     {
-        linux_x11_capabilities_from_xtest_probe(probe_linux_x11_xtest_availability())
+        linux_x11_capabilities_from_probes(
+            probe_linux_x11_xinput2_availability(),
+            probe_linux_x11_xtest_availability(),
+        )
     }
 
     #[cfg(not(all(target_os = "linux", not(test))))]
@@ -2091,6 +2105,7 @@ fn linux_x11_diagnostic_permission_issues() -> Vec<PlatformDiagnosticIssue> {
     #[cfg(all(target_os = "linux", not(test)))]
     {
         linux_x11_diagnostic_issues_from_probes(
+            probe_linux_x11_xinput2_availability(),
             probe_linux_x11_xtest_availability(),
             probe_linux_x11_desktop_geometry(),
         )
@@ -2099,10 +2114,24 @@ fn linux_x11_diagnostic_permission_issues() -> Vec<PlatformDiagnosticIssue> {
     #[cfg(not(all(target_os = "linux", not(test))))]
     {
         linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::RuntimeUnavailable,
             LinuxX11XtestProbeResult::DisplayUnavailable,
             LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
         )
     }
+}
+
+#[cfg(any(not(windows), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxX11Xinput2ProbeResult {
+    Available,
+    DisplayUnavailable,
+    X11LibraryUnavailable,
+    XiLibraryUnavailable,
+    ProbeSymbolUnavailable,
+    ExtensionUnavailable,
+    VersionUnsupported,
+    RuntimeUnavailable,
 }
 
 #[cfg(any(not(windows), test))]
@@ -2142,14 +2171,15 @@ struct LinuxX11MonitorSnapshot {
 }
 
 #[cfg(any(not(windows), test))]
-fn linux_x11_capabilities_from_xtest_probe(
-    result: LinuxX11XtestProbeResult,
+fn linux_x11_capabilities_from_probes(
+    _xinput2_result: LinuxX11Xinput2ProbeResult,
+    xtest_result: LinuxX11XtestProbeResult,
 ) -> PlatformCapabilities {
     PlatformCapabilities {
         can_capture_pointer: false,
         can_capture_keyboard: false,
-        can_inject_pointer: matches!(result, LinuxX11XtestProbeResult::Available),
-        can_inject_keyboard: matches!(result, LinuxX11XtestProbeResult::Available),
+        can_inject_pointer: matches!(xtest_result, LinuxX11XtestProbeResult::Available),
+        can_inject_keyboard: matches!(xtest_result, LinuxX11XtestProbeResult::Available),
     }
 }
 
@@ -2158,21 +2188,70 @@ fn linux_x11_diagnostic_issues_from_xtest_probe(
     result: LinuxX11XtestProbeResult,
 ) -> [PlatformDiagnosticIssue; 2] {
     [
-        LINUX_X11_CAPTURE_DIAGNOSTIC_ISSUE,
+        LINUX_X11_XINPUT2_CAPTURE_PROBE_REQUIRED_DIAGNOSTIC_ISSUE,
         linux_x11_injection_diagnostic_issue_from_xtest_probe(result),
     ]
 }
 
 #[cfg(any(not(windows), test))]
 fn linux_x11_diagnostic_issues_from_probes(
+    xinput2_result: LinuxX11Xinput2ProbeResult,
     xtest_result: LinuxX11XtestProbeResult,
     geometry_result: LinuxX11DesktopGeometryProbeResult,
 ) -> Vec<PlatformDiagnosticIssue> {
     vec![
-        LINUX_X11_CAPTURE_DIAGNOSTIC_ISSUE,
+        linux_x11_capture_diagnostic_issue_from_xinput2_probe(xinput2_result),
         linux_x11_injection_diagnostic_issue_from_xtest_probe(xtest_result),
         linux_x11_geometry_diagnostic_issue_from_probe(geometry_result),
     ]
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_x11_capture_diagnostic_issue_from_xinput2_probe(
+    result: LinuxX11Xinput2ProbeResult,
+) -> PlatformDiagnosticIssue {
+    match result {
+        LinuxX11Xinput2ProbeResult::Available => LINUX_X11_XINPUT2_CAPTURE_DIAGNOSTIC_ISSUE,
+        LinuxX11Xinput2ProbeResult::DisplayUnavailable
+        | LinuxX11Xinput2ProbeResult::RuntimeUnavailable => {
+            LINUX_X11_XINPUT2_CAPTURE_PROBE_REQUIRED_DIAGNOSTIC_ISSUE
+        }
+        LinuxX11Xinput2ProbeResult::X11LibraryUnavailable => PlatformDiagnosticIssue {
+            code: "linux_x11_capture_x11_library_unavailable",
+            message: concat!(
+                "Linux X11 input capture cannot verify XInput2 because libX11 could not be loaded; ",
+                "install the X11 runtime library before enabling capture.",
+            ),
+        },
+        LinuxX11Xinput2ProbeResult::XiLibraryUnavailable => PlatformDiagnosticIssue {
+            code: "linux_x11_capture_xinput2_library_unavailable",
+            message: concat!(
+                "Linux X11 input capture cannot verify XInput2 because libXi could not be loaded; ",
+                "install the XInput2 runtime library before enabling capture.",
+            ),
+        },
+        LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable => PlatformDiagnosticIssue {
+            code: "linux_x11_capture_xinput2_probe_unavailable",
+            message: concat!(
+                "Linux X11 input capture cannot verify XInput2 because required X11/XInput2 symbols are missing; ",
+                "install matching libX11 and libXi runtime libraries before enabling capture.",
+            ),
+        },
+        LinuxX11Xinput2ProbeResult::ExtensionUnavailable => PlatformDiagnosticIssue {
+            code: "linux_x11_capture_xinput2_unavailable",
+            message: concat!(
+                "Linux X11 input capture cannot start because the XInput2 extension is not available; ",
+                "enable XInput2 in the X server before enabling capture.",
+            ),
+        },
+        LinuxX11Xinput2ProbeResult::VersionUnsupported => PlatformDiagnosticIssue {
+            code: "linux_x11_capture_xinput2_version_unsupported",
+            message: concat!(
+                "Linux X11 input capture needs XInput2 version 2.0 or newer; ",
+                "upgrade the X server or use a supported X11 session.",
+            ),
+        },
+    }
 }
 
 #[cfg(any(not(windows), test))]
@@ -2836,6 +2915,11 @@ type XOpenDisplayFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 #[cfg(all(target_os = "linux", not(test)))]
 type XCloseDisplayFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 #[cfg(all(target_os = "linux", not(test)))]
+type XQueryExtensionFn =
+    unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_int, *mut c_int, *mut c_int) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
+type XIQueryVersionFn = unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
 type XTestQueryExtensionFn =
     unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int, *mut c_int, *mut c_int) -> c_int;
 #[cfg(all(target_os = "linux", not(test)))]
@@ -2928,6 +3012,66 @@ impl Drop for LinuxDynamicLibrary {
         unsafe {
             dlclose(self.handle);
         }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+struct LinuxX11Xinput2ProbeSymbols {
+    _x11: LinuxDynamicLibrary,
+    _xi: LinuxDynamicLibrary,
+    open_display: XOpenDisplayFn,
+    close_display: XCloseDisplayFn,
+    query_extension: XQueryExtensionFn,
+    query_version: XIQueryVersionFn,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl LinuxX11Xinput2ProbeSymbols {
+    fn load() -> Result<Self, LinuxX11Xinput2ProbeResult> {
+        let Some(x11) =
+            LinuxDynamicLibrary::open_any(&[&b"libX11.so.6\0"[..], &b"libX11.so\0"[..]])
+        else {
+            return Err(LinuxX11Xinput2ProbeResult::X11LibraryUnavailable);
+        };
+        let Some(xi) = LinuxDynamicLibrary::open_any(&[&b"libXi.so.6\0"[..], &b"libXi.so\0"[..]])
+        else {
+            return Err(LinuxX11Xinput2ProbeResult::XiLibraryUnavailable);
+        };
+
+        let Some(open_display_ptr) = x11.symbol_ptr(b"XOpenDisplay\0") else {
+            return Err(LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable);
+        };
+        let Some(close_display_ptr) = x11.symbol_ptr(b"XCloseDisplay\0") else {
+            return Err(LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable);
+        };
+        let Some(query_extension_ptr) = x11.symbol_ptr(b"XQueryExtension\0") else {
+            return Err(LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable);
+        };
+        let Some(query_version_ptr) = xi.symbol_ptr(b"XIQueryVersion\0") else {
+            return Err(LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable);
+        };
+
+        // SAFETY: symbols are loaded from libX11/libXi and matched to their documented C ABIs.
+        let open_display =
+            unsafe { std::mem::transmute::<*mut c_void, XOpenDisplayFn>(open_display_ptr) };
+        // SAFETY: symbols are loaded from libX11/libXi and matched to their documented C ABIs.
+        let close_display =
+            unsafe { std::mem::transmute::<*mut c_void, XCloseDisplayFn>(close_display_ptr) };
+        // SAFETY: symbols are loaded from libX11 and matched to the documented C ABI.
+        let query_extension =
+            unsafe { std::mem::transmute::<*mut c_void, XQueryExtensionFn>(query_extension_ptr) };
+        // SAFETY: symbols are loaded from libXi and matched to the documented C ABI.
+        let query_version =
+            unsafe { std::mem::transmute::<*mut c_void, XIQueryVersionFn>(query_version_ptr) };
+
+        Ok(Self {
+            _x11: x11,
+            _xi: xi,
+            open_display,
+            close_display,
+            query_extension,
+            query_version,
+        })
     }
 }
 
@@ -3229,6 +3373,63 @@ fn linux_x11_xtest_extension_available(
             &mut minor_version,
         ) != 0
     }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn linux_x11_xinput2_extension_available(
+    display: *mut c_void,
+    query_extension: XQueryExtensionFn,
+    query_version: XIQueryVersionFn,
+) -> LinuxX11Xinput2ProbeResult {
+    const XINPUT2_EXTENSION_NAME: &[u8] = b"XInputExtension\0";
+    const XINPUT2_MAJOR_VERSION: c_int = 2;
+    const XINPUT2_MINOR_VERSION: c_int = 0;
+    const X11_SUCCESS: c_int = 0;
+
+    let mut opcode = 0;
+    let mut event_base = 0;
+    let mut error_base = 0;
+    // SAFETY: display is live, the extension name is NUL-terminated, and outputs are stack integers.
+    let extension_available = unsafe {
+        query_extension(
+            display,
+            XINPUT2_EXTENSION_NAME.as_ptr().cast(),
+            &mut opcode,
+            &mut event_base,
+            &mut error_base,
+        ) != 0
+    };
+    if !extension_available {
+        return LinuxX11Xinput2ProbeResult::ExtensionUnavailable;
+    }
+
+    let mut major_version = XINPUT2_MAJOR_VERSION;
+    let mut minor_version = XINPUT2_MINOR_VERSION;
+    // SAFETY: display is live and XIQueryVersion writes the requested/negotiated version integers.
+    let status = unsafe { query_version(display, &mut major_version, &mut minor_version) };
+    if status == X11_SUCCESS && major_version >= XINPUT2_MAJOR_VERSION {
+        LinuxX11Xinput2ProbeResult::Available
+    } else {
+        LinuxX11Xinput2ProbeResult::VersionUnsupported
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn probe_linux_x11_xinput2_availability() -> LinuxX11Xinput2ProbeResult {
+    let symbols = match LinuxX11Xinput2ProbeSymbols::load() {
+        Ok(symbols) => symbols,
+        Err(result) => return result,
+    };
+
+    let Some(display) = LinuxX11Display::open(symbols.open_display, symbols.close_display) else {
+        return LinuxX11Xinput2ProbeResult::DisplayUnavailable;
+    };
+
+    linux_x11_xinput2_extension_available(
+        display.as_ptr(),
+        symbols.query_extension,
+        symbols.query_version,
+    )
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
@@ -3708,10 +3909,11 @@ mod tests {
         InputCapturePolicy, KeyboardLayoutSnapshot, LinuxX11ButtonEvent,
         LinuxX11DesktopGeometryProbeResult, LinuxX11InjectedInputState,
         LinuxX11InputInjectionResult, LinuxX11Key, LinuxX11KeyEvent, LinuxX11MonitorSnapshot,
-        LinuxX11PressedInput, LinuxX11XtestProbeResult, PlatformAdapter, PlatformCapabilities,
-        PlatformError, UnsupportedDesktopSession, UnsupportedPlatformAdapter,
-        detect_unsupported_desktop_session_from_env, inject_linux_x11_input,
-        linux_x11_capabilities_from_xtest_probe, linux_x11_desktop_geometry_from_snapshots,
+        LinuxX11PressedInput, LinuxX11Xinput2ProbeResult, LinuxX11XtestProbeResult,
+        PlatformAdapter, PlatformCapabilities, PlatformError, UnsupportedDesktopSession,
+        UnsupportedPlatformAdapter, detect_unsupported_desktop_session_from_env,
+        inject_linux_x11_input, linux_x11_capabilities_from_probes,
+        linux_x11_desktop_geometry_from_snapshots,
         linux_x11_desktop_geometry_result_to_platform_result,
         linux_x11_diagnostic_issues_from_probes, linux_x11_diagnostic_issues_from_xtest_probe,
         linux_x11_input_injection_result_to_platform_result, linux_x11_key_event,
@@ -3873,12 +4075,16 @@ mod tests {
                 .map(|issue| issue.code)
                 .collect::<Vec<_>>(),
             vec![
-                "linux_x11_capture_unimplemented",
+                "linux_x11_capture_xinput2_probe_required",
                 "linux_x11_injection_xtest_probe_required",
                 "linux_x11_geometry_xrandr_probe_required",
             ]
         );
-        assert!(linux_x11_issues[0].message.contains("XInput2 capture"));
+        assert!(
+            linux_x11_issues[0]
+                .message
+                .contains("XInput2 runtime probe")
+        );
         assert!(!linux_x11_issues[0].message.contains("Xrandr layout probes"));
         assert!(linux_x11_issues[1].message.contains("XTEST runtime probe"));
         assert!(linux_x11_issues[2].message.contains("Xrandr runtime probe"));
@@ -3893,6 +4099,100 @@ mod tests {
                 "linux_session_injection_unknown",
             ]
         );
+    }
+
+    #[test]
+    fn linux_x11_diagnostics_report_xinput2_probe_state() {
+        let available = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::Available,
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
+        );
+
+        assert_eq!(available[0].code, "linux_x11_capture_xinput2_available");
+        assert!(available[0].message.contains("XInput2 runtime probing"));
+        assert!(available[0].message.contains("event loop implementation"));
+
+        let runtime_unavailable = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::RuntimeUnavailable,
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
+        );
+        assert_eq!(
+            runtime_unavailable[0].code,
+            "linux_x11_capture_xinput2_probe_required"
+        );
+        assert!(runtime_unavailable[0].message.contains("DISPLAY"));
+
+        let missing_display = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::DisplayUnavailable,
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
+        );
+        assert_eq!(
+            missing_display[0].code,
+            "linux_x11_capture_xinput2_probe_required"
+        );
+        assert!(missing_display[0].message.contains("DISPLAY"));
+
+        let missing_x11_library = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::X11LibraryUnavailable,
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
+        );
+        assert_eq!(
+            missing_x11_library[0].code,
+            "linux_x11_capture_x11_library_unavailable"
+        );
+        assert!(missing_x11_library[0].message.contains("libX11"));
+
+        let missing_xi_library = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::XiLibraryUnavailable,
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
+        );
+        assert_eq!(
+            missing_xi_library[0].code,
+            "linux_x11_capture_xinput2_library_unavailable"
+        );
+        assert!(missing_xi_library[0].message.contains("libXi"));
+
+        let missing_probe_symbol = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
+        );
+        assert_eq!(
+            missing_probe_symbol[0].code,
+            "linux_x11_capture_xinput2_probe_unavailable"
+        );
+        assert!(
+            missing_probe_symbol[0]
+                .message
+                .contains("required X11/XInput2 symbols")
+        );
+
+        let missing_extension = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::ExtensionUnavailable,
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
+        );
+        assert_eq!(
+            missing_extension[0].code,
+            "linux_x11_capture_xinput2_unavailable"
+        );
+        assert!(missing_extension[0].message.contains("XInput2 extension"));
+
+        let unsupported_version = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::VersionUnsupported,
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
+        );
+        assert_eq!(
+            unsupported_version[0].code,
+            "linux_x11_capture_xinput2_version_unsupported"
+        );
+        assert!(unsupported_version[0].message.contains("2.0 or newer"));
     }
 
     #[test]
@@ -3977,6 +4277,7 @@ mod tests {
         };
 
         let available = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::Available,
             LinuxX11XtestProbeResult::Available,
             LinuxX11DesktopGeometryProbeResult::Geometry(geometry),
         );
@@ -3984,6 +4285,7 @@ mod tests {
         assert!(available[2].message.contains("Xrandr"));
 
         let runtime_unavailable = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::Available,
             LinuxX11XtestProbeResult::Available,
             LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
         );
@@ -3993,6 +4295,7 @@ mod tests {
         );
 
         let missing_xrandr_library = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::Available,
             LinuxX11XtestProbeResult::Available,
             LinuxX11DesktopGeometryProbeResult::XrandrLibraryUnavailable,
         );
@@ -4003,6 +4306,7 @@ mod tests {
         assert!(missing_xrandr_library[2].message.contains("libXrandr"));
 
         let pointer_outside_layout = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11Xinput2ProbeResult::Available,
             LinuxX11XtestProbeResult::Available,
             LinuxX11DesktopGeometryProbeResult::PointerOutsideMonitorLayout,
         );
@@ -4014,9 +4318,12 @@ mod tests {
     }
 
     #[test]
-    fn linux_x11_capabilities_enable_input_injection_when_xtest_is_available() {
+    fn linux_x11_capabilities_expose_xtest_injection_but_keep_capture_closed() {
         assert_eq!(
-            linux_x11_capabilities_from_xtest_probe(LinuxX11XtestProbeResult::Available),
+            linux_x11_capabilities_from_probes(
+                LinuxX11Xinput2ProbeResult::Available,
+                LinuxX11XtestProbeResult::Available,
+            ),
             PlatformCapabilities {
                 can_capture_pointer: false,
                 can_capture_keyboard: false,
@@ -4025,8 +4332,23 @@ mod tests {
             }
         );
         assert_eq!(
-            linux_x11_capabilities_from_xtest_probe(LinuxX11XtestProbeResult::ExtensionUnavailable),
+            linux_x11_capabilities_from_probes(
+                LinuxX11Xinput2ProbeResult::Available,
+                LinuxX11XtestProbeResult::ExtensionUnavailable,
+            ),
             PlatformCapabilities::default()
+        );
+        assert_eq!(
+            linux_x11_capabilities_from_probes(
+                LinuxX11Xinput2ProbeResult::ExtensionUnavailable,
+                LinuxX11XtestProbeResult::Available,
+            ),
+            PlatformCapabilities {
+                can_capture_pointer: false,
+                can_capture_keyboard: false,
+                can_inject_pointer: true,
+                can_inject_keyboard: true,
+            }
         );
     }
 
