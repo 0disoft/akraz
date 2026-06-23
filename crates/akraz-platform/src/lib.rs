@@ -13,7 +13,7 @@ use akraz_core::{
 };
 
 #[cfg(all(target_os = "linux", not(test)))]
-use std::ffi::{c_char, c_int, c_uchar, c_uint, c_ulong, c_void};
+use std::ffi::{c_char, c_double, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
 
 #[cfg(windows)]
 use akraz_core::DEFAULT_PANIC_HOTKEY_KEY;
@@ -28,11 +28,11 @@ use std::ptr::{null, null_mut};
 
 #[cfg(windows)]
 use std::cell::RefCell;
-#[cfg(windows)]
+#[cfg(any(windows, all(target_os = "linux", not(test))))]
 use std::sync::mpsc::TrySendError;
-#[cfg(windows)]
+#[cfg(any(windows, all(target_os = "linux", not(test))))]
 use std::thread;
-#[cfg(windows)]
+#[cfg(any(windows, all(target_os = "linux", not(test))))]
 use std::thread::JoinHandle;
 
 #[cfg(windows)]
@@ -299,6 +299,8 @@ enum InputCaptureShutdown {
     Noop,
     #[cfg(windows)]
     Windows(WindowsCaptureShutdown),
+    #[cfg(all(target_os = "linux", not(test)))]
+    LinuxX11(LinuxX11CaptureShutdown),
 }
 
 impl InputCaptureShutdown {
@@ -307,6 +309,8 @@ impl InputCaptureShutdown {
             Self::Noop => Ok(()),
             #[cfg(windows)]
             Self::Windows(shutdown) => shutdown.stop(),
+            #[cfg(all(target_os = "linux", not(test)))]
+            Self::LinuxX11(shutdown) => shutdown.stop(),
         }
     }
 }
@@ -1159,7 +1163,7 @@ fn forward_captured_windows_event(wparam: WPARAM, lparam: LPARAM) -> bool {
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, all(target_os = "linux", not(test))))]
 fn try_send_captured_input_event(
     sender: &SyncSender<CapturedInputEvent>,
     event: CapturedInputEvent,
@@ -1979,6 +1983,19 @@ impl PlatformAdapter for UnsupportedPlatformAdapter {
         }
     }
 
+    fn start_input_capture(
+        &self,
+        config: InputCaptureConfig,
+    ) -> Result<InputCaptureSession, PlatformError> {
+        match self.session {
+            UnsupportedDesktopSession::LinuxX11 => start_linux_x11_input_capture(config),
+            _ => Err(PlatformError::new(format!(
+                "{} input capture is not available",
+                self.name()
+            ))),
+        }
+    }
+
     fn inject_input(&self, event: &InjectedInputEvent) -> Result<(), PlatformError> {
         match self.session {
             UnsupportedDesktopSession::LinuxX11 => {
@@ -2049,8 +2066,8 @@ const LINUX_X11_XINPUT2_CAPTURE_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
     PlatformDiagnosticIssue {
         code: "linux_x11_capture_xinput2_available",
         message: concat!(
-            "Linux X11 XInput2 runtime probing is available; ",
-            "input capture still needs the XInput2 event loop implementation before capabilities are enabled.",
+            "Linux X11 pointer and keyboard input capture are available through XInput2 raw events; ",
+            "capture observes local input without consuming it.",
         ),
     };
 
@@ -2172,12 +2189,13 @@ struct LinuxX11MonitorSnapshot {
 
 #[cfg(any(not(windows), test))]
 fn linux_x11_capabilities_from_probes(
-    _xinput2_result: LinuxX11Xinput2ProbeResult,
+    xinput2_result: LinuxX11Xinput2ProbeResult,
     xtest_result: LinuxX11XtestProbeResult,
 ) -> PlatformCapabilities {
+    let can_capture = matches!(xinput2_result, LinuxX11Xinput2ProbeResult::Available);
     PlatformCapabilities {
-        can_capture_pointer: false,
-        can_capture_keyboard: false,
+        can_capture_pointer: can_capture,
+        can_capture_keyboard: can_capture,
         can_inject_pointer: matches!(xtest_result, LinuxX11XtestProbeResult::Available),
         can_inject_keyboard: matches!(xtest_result, LinuxX11XtestProbeResult::Available),
     }
@@ -2454,6 +2472,333 @@ impl LinuxX11InjectedInputState {
 
     fn release_sequence(&self) -> Vec<LinuxX11PressedInput> {
         self.press_order.iter().rev().copied().collect()
+    }
+}
+
+#[cfg(any(not(windows), test))]
+const XORG_EVDEV_KEYCODE_OFFSET: u16 = 8;
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+const XI_RAW_KEY_PRESS: i32 = 13;
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+const XI_RAW_KEY_RELEASE: i32 = 14;
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+const XI_RAW_BUTTON_PRESS: i32 = 15;
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+const XI_RAW_BUTTON_RELEASE: i32 = 16;
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+const XI_RAW_MOTION: i32 = 17;
+#[cfg(any(not(windows), test))]
+const LINUX_X11_SCROLL_DELTA_PER_CLICK: i32 = 120;
+
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+#[derive(Debug, Clone, PartialEq)]
+struct LinuxX11RawInputEvent {
+    evtype: i32,
+    detail: i32,
+    valuators: Vec<(i32, f64)>,
+}
+
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+fn captured_events_from_linux_x11_raw_input(
+    event: LinuxX11RawInputEvent,
+) -> Vec<CapturedInputEvent> {
+    match event.evtype {
+        XI_RAW_KEY_PRESS | XI_RAW_KEY_RELEASE => {
+            captured_key_from_linux_x11_raw_key(event.evtype, event.detail)
+                .into_iter()
+                .collect()
+        }
+        XI_RAW_BUTTON_PRESS | XI_RAW_BUTTON_RELEASE => {
+            captured_event_from_linux_x11_raw_button(event.evtype, event.detail)
+                .into_iter()
+                .collect()
+        }
+        XI_RAW_MOTION => captured_event_from_linux_x11_raw_motion(&event.valuators)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+fn captured_key_from_linux_x11_raw_key(evtype: i32, detail: i32) -> Option<CapturedInputEvent> {
+    let state = match evtype {
+        XI_RAW_KEY_PRESS => PressState::Pressed,
+        XI_RAW_KEY_RELEASE => PressState::Released,
+        _ => return None,
+    };
+    let key = physical_key_from_linux_x11_keycode(detail)?;
+
+    Some(CapturedInputEvent::Key { key, state })
+}
+
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+fn physical_key_from_linux_x11_keycode(keycode: i32) -> Option<PhysicalKey> {
+    if keycode <= i32::from(XORG_EVDEV_KEYCODE_OFFSET) || keycode > i32::from(u8::MAX) {
+        return None;
+    }
+
+    let physical_code = (keycode as u16).saturating_sub(XORG_EVDEV_KEYCODE_OFFSET);
+    Some(match physical_code {
+        42 => PhysicalKey::LeftShift,
+        54 => PhysicalKey::RightShift,
+        29 => PhysicalKey::LeftControl,
+        97 => PhysicalKey::RightControl,
+        56 => PhysicalKey::LeftAlt,
+        100 => PhysicalKey::RightAlt,
+        125 => PhysicalKey::LeftMeta,
+        126 => PhysicalKey::RightMeta,
+        code => PhysicalKey::Code(code),
+    })
+}
+
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+fn captured_event_from_linux_x11_raw_button(
+    evtype: i32,
+    detail: i32,
+) -> Option<CapturedInputEvent> {
+    let state = match evtype {
+        XI_RAW_BUTTON_PRESS => PressState::Pressed,
+        XI_RAW_BUTTON_RELEASE => PressState::Released,
+        _ => return None,
+    };
+
+    if state == PressState::Released && matches!(detail, 4..=7) {
+        return None;
+    }
+
+    match detail {
+        1 => Some(CapturedInputEvent::MouseButton {
+            button: MouseButton::Left,
+            state,
+        }),
+        2 => Some(CapturedInputEvent::MouseButton {
+            button: MouseButton::Middle,
+            state,
+        }),
+        3 => Some(CapturedInputEvent::MouseButton {
+            button: MouseButton::Right,
+            state,
+        }),
+        4 => Some(CapturedInputEvent::Scroll {
+            delta_x: 0,
+            delta_y: LINUX_X11_SCROLL_DELTA_PER_CLICK,
+        }),
+        5 => Some(CapturedInputEvent::Scroll {
+            delta_x: 0,
+            delta_y: -LINUX_X11_SCROLL_DELTA_PER_CLICK,
+        }),
+        6 => Some(CapturedInputEvent::Scroll {
+            delta_x: -LINUX_X11_SCROLL_DELTA_PER_CLICK,
+            delta_y: 0,
+        }),
+        7 => Some(CapturedInputEvent::Scroll {
+            delta_x: LINUX_X11_SCROLL_DELTA_PER_CLICK,
+            delta_y: 0,
+        }),
+        8 => Some(CapturedInputEvent::MouseButton {
+            button: MouseButton::Back,
+            state,
+        }),
+        9 => Some(CapturedInputEvent::MouseButton {
+            button: MouseButton::Forward,
+            state,
+        }),
+        other if (1..=i32::from(u16::MAX)).contains(&other) => {
+            Some(CapturedInputEvent::MouseButton {
+                button: MouseButton::Other(other as u16),
+                state,
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+fn captured_event_from_linux_x11_raw_motion(
+    valuators: &[(i32, f64)],
+) -> Option<CapturedInputEvent> {
+    let mut delta_x = 0;
+    let mut delta_y = 0;
+
+    for (axis, value) in valuators {
+        match *axis {
+            0 => delta_x = linux_x11_capture_delta_from_raw_value(*value),
+            1 => delta_y = linux_x11_capture_delta_from_raw_value(*value),
+            _ => {}
+        }
+    }
+
+    if delta_x == 0 && delta_y == 0 {
+        None
+    } else {
+        Some(CapturedInputEvent::PointerMoved { delta_x, delta_y })
+    }
+}
+
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+fn linux_x11_capture_delta_from_raw_value(value: f64) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let rounded = value.round();
+    if rounded > f64::from(i32::MAX) {
+        i32::MAX
+    } else if rounded < f64::from(i32::MIN) {
+        i32::MIN
+    } else {
+        rounded as i32
+    }
+}
+
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+fn linux_x11_event_mask_len(max_event: i32) -> usize {
+    ((max_event as usize) >> 3) + 1
+}
+
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+fn set_linux_x11_event_mask(mask: &mut [u8], event: i32) {
+    let event = event as usize;
+    let Some(byte) = mask.get_mut(event >> 3) else {
+        return;
+    };
+    *byte |= 1_u8 << (event & 7);
+}
+
+#[cfg(any(test, all(target_os = "linux", not(test))))]
+fn linux_x11_event_mask_is_set(mask: &[u8], event: usize) -> bool {
+    mask.get(event >> 3)
+        .map(|byte| (byte & (1_u8 << (event & 7))) != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn start_linux_x11_input_capture(
+    config: InputCaptureConfig,
+) -> Result<InputCaptureSession, PlatformError> {
+    let (event_sender, event_receiver) = sync_channel(config.bounded_capacity());
+    let (ready_sender, ready_receiver) = sync_channel(1);
+    let should_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_should_stop = Arc::clone(&should_stop);
+    let policy = SharedInputCapturePolicy::default();
+    let thread = thread::Builder::new()
+        .name("akraz-linux-x11-input-capture".to_string())
+        .spawn(move || {
+            run_linux_x11_input_capture_thread(event_sender, ready_sender, thread_should_stop)
+        })
+        .map_err(|error| {
+            PlatformError::new(format!("failed to start Linux X11 input capture: {error}"))
+        })?;
+
+    match ready_receiver.recv() {
+        Ok(Ok(())) => Ok(InputCaptureSession::new(
+            event_receiver,
+            InputCaptureShutdown::LinuxX11(LinuxX11CaptureShutdown {
+                should_stop,
+                thread: Some(thread),
+            }),
+            policy,
+        )),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(error)
+        }
+        Err(error) => {
+            let _ = thread.join();
+            Err(PlatformError::new(format!(
+                "Linux X11 input capture failed before startup: {error}"
+            )))
+        }
+    }
+}
+
+#[cfg(all(any(not(windows), test), not(all(target_os = "linux", not(test)))))]
+fn start_linux_x11_input_capture(
+    _config: InputCaptureConfig,
+) -> Result<InputCaptureSession, PlatformError> {
+    Err(PlatformError::new(
+        "Linux X11 input capture can only run in a Linux X11 runtime with XInput2 available.",
+    ))
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn run_linux_x11_input_capture_thread(
+    sender: SyncSender<CapturedInputEvent>,
+    ready: SyncSender<Result<(), PlatformError>>,
+    should_stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let result = run_linux_x11_input_capture_loop(sender, &should_stop, &ready);
+    if let Err(error) = result {
+        let _ = ready.try_send(Err(error));
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn run_linux_x11_input_capture_loop(
+    sender: SyncSender<CapturedInputEvent>,
+    should_stop: &std::sync::atomic::AtomicBool,
+    ready: &SyncSender<Result<(), PlatformError>>,
+) -> Result<(), PlatformError> {
+    let symbols = LinuxX11Xinput2CaptureSymbols::load()?;
+    let Some(display) = LinuxX11Display::open(symbols.open_display, symbols.close_display) else {
+        return Err(linux_x11_capture_probe_result_to_platform_error(
+            LinuxX11Xinput2ProbeResult::DisplayUnavailable,
+        ));
+    };
+
+    let opcode = linux_x11_xinput2_extension_opcode(
+        display.as_ptr(),
+        symbols.query_extension,
+        symbols.query_version,
+    )?;
+    select_linux_x11_xinput2_raw_events(display.as_ptr(), &symbols)?;
+    let _ = ready.try_send(Ok(()));
+
+    while !should_stop.load(Ordering::Acquire) {
+        // SAFETY: display is live and the function pointer came from libX11.
+        let pending = unsafe { (symbols.pending)(display.as_ptr()) };
+        if pending <= 0 {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+
+        for _ in 0..pending {
+            // SAFETY: XEvent is a C union that XNextEvent fully initializes before it is read.
+            let mut event = unsafe { std::mem::zeroed::<XEvent>() };
+            // SAFETY: event points to initialized storage and display is live.
+            unsafe {
+                (symbols.next_event)(display.as_ptr(), &mut event);
+            }
+            forward_linux_x11_xinput2_event(
+                display.as_ptr(),
+                &symbols,
+                opcode,
+                &mut event,
+                &sender,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+struct LinuxX11CaptureShutdown {
+    should_stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl LinuxX11CaptureShutdown {
+    fn stop(mut self) -> Result<(), PlatformError> {
+        self.should_stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| PlatformError::new("Linux X11 input capture thread panicked"))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -2849,7 +3194,6 @@ fn linux_x11_key_from_physical_key(key: PhysicalKey) -> Result<LinuxX11Key, Plat
 
 #[cfg(any(not(windows), test))]
 fn linux_x11_keycode_from_physical_code(code: u16) -> Result<LinuxX11Key, PlatformError> {
-    const XORG_EVDEV_KEYCODE_OFFSET: u16 = 8;
     const X11_MAX_KEYCODE: u16 = u8::MAX as u16;
 
     if code == 0 || code.saturating_add(XORG_EVDEV_KEYCODE_OFFSET) > X11_MAX_KEYCODE {
@@ -2902,12 +3246,10 @@ fn append_linux_x11_scroll_button_events(
 
 #[cfg(any(not(windows), test))]
 fn linux_x11_scroll_click_count(delta: i32) -> u32 {
-    const SCROLL_DELTA_PER_CLICK: u32 = 120;
-
     delta
         .unsigned_abs()
-        .saturating_add(SCROLL_DELTA_PER_CLICK - 1)
-        / SCROLL_DELTA_PER_CLICK
+        .saturating_add(LINUX_X11_SCROLL_DELTA_PER_CLICK as u32 - 1)
+        / LINUX_X11_SCROLL_DELTA_PER_CLICK as u32
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
@@ -2948,10 +3290,77 @@ type XQueryPointerFn = unsafe extern "C" fn(
     *mut c_uint,
 ) -> c_int;
 #[cfg(all(target_os = "linux", not(test)))]
+type XPendingFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
+type XNextEventFn = unsafe extern "C" fn(*mut c_void, *mut XEvent) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
+type XGetEventDataFn = unsafe extern "C" fn(*mut c_void, *mut XGenericEventCookie) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
+type XFreeEventDataFn = unsafe extern "C" fn(*mut c_void, *mut XGenericEventCookie);
+#[cfg(all(target_os = "linux", not(test)))]
+type XISelectEventsFn =
+    unsafe extern "C" fn(*mut c_void, c_ulong, *mut XIEventMask, c_int) -> c_int;
+#[cfg(all(target_os = "linux", not(test)))]
 type XRRGetMonitorsFn =
     unsafe extern "C" fn(*mut c_void, c_ulong, c_int, *mut c_int) -> *mut XRRMonitorInfo;
 #[cfg(all(target_os = "linux", not(test)))]
 type XRRFreeMonitorsFn = unsafe extern "C" fn(*mut XRRMonitorInfo);
+
+#[cfg(all(target_os = "linux", not(test)))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct XGenericEventCookie {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut c_void,
+    extension: c_int,
+    evtype: c_int,
+    cookie: c_uint,
+    data: *mut c_void,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+#[repr(C)]
+union XEvent {
+    type_: c_int,
+    xcookie: XGenericEventCookie,
+    pad: [c_long; 24],
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+#[repr(C)]
+struct XIEventMask {
+    deviceid: c_int,
+    mask_len: c_int,
+    mask: *mut c_uchar,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+#[repr(C)]
+struct XIValuatorState {
+    mask_len: c_int,
+    mask: *mut c_uchar,
+    values: *mut c_double,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+#[repr(C)]
+struct XIRawEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut c_void,
+    extension: c_int,
+    evtype: c_int,
+    time: c_ulong,
+    deviceid: c_int,
+    sourceid: c_int,
+    detail: c_int,
+    flags: c_int,
+    valuators: XIValuatorState,
+    raw_values: *mut c_double,
+}
 
 #[cfg(all(target_os = "linux", not(test)))]
 #[repr(C)]
@@ -3071,6 +3480,147 @@ impl LinuxX11Xinput2ProbeSymbols {
             close_display,
             query_extension,
             query_version,
+        })
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+struct LinuxX11Xinput2CaptureSymbols {
+    _x11: LinuxDynamicLibrary,
+    _xi: LinuxDynamicLibrary,
+    open_display: XOpenDisplayFn,
+    close_display: XCloseDisplayFn,
+    query_extension: XQueryExtensionFn,
+    query_version: XIQueryVersionFn,
+    default_root_window: XDefaultRootWindowFn,
+    pending: XPendingFn,
+    next_event: XNextEventFn,
+    get_event_data: XGetEventDataFn,
+    free_event_data: XFreeEventDataFn,
+    flush: XFlushFn,
+    select_events: XISelectEventsFn,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl LinuxX11Xinput2CaptureSymbols {
+    fn load() -> Result<Self, PlatformError> {
+        let Some(x11) =
+            LinuxDynamicLibrary::open_any(&[&b"libX11.so.6\0"[..], &b"libX11.so\0"[..]])
+        else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::X11LibraryUnavailable,
+            ));
+        };
+        let Some(xi) = LinuxDynamicLibrary::open_any(&[&b"libXi.so.6\0"[..], &b"libXi.so\0"[..]])
+        else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::XiLibraryUnavailable,
+            ));
+        };
+
+        let Some(open_display_ptr) = x11.symbol_ptr(b"XOpenDisplay\0") else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            ));
+        };
+        let Some(close_display_ptr) = x11.symbol_ptr(b"XCloseDisplay\0") else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            ));
+        };
+        let Some(query_extension_ptr) = x11.symbol_ptr(b"XQueryExtension\0") else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            ));
+        };
+        let Some(query_version_ptr) = xi.symbol_ptr(b"XIQueryVersion\0") else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            ));
+        };
+        let Some(default_root_window_ptr) = x11.symbol_ptr(b"XDefaultRootWindow\0") else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            ));
+        };
+        let Some(pending_ptr) = x11.symbol_ptr(b"XPending\0") else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            ));
+        };
+        let Some(next_event_ptr) = x11.symbol_ptr(b"XNextEvent\0") else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            ));
+        };
+        let Some(get_event_data_ptr) = x11.symbol_ptr(b"XGetEventData\0") else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            ));
+        };
+        let Some(free_event_data_ptr) = x11.symbol_ptr(b"XFreeEventData\0") else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            ));
+        };
+        let Some(flush_ptr) = x11.symbol_ptr(b"XFlush\0") else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            ));
+        };
+        let Some(select_events_ptr) = xi.symbol_ptr(b"XISelectEvents\0") else {
+            return Err(linux_x11_capture_probe_result_to_platform_error(
+                LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable,
+            ));
+        };
+
+        // SAFETY: symbols are loaded from libX11/libXi and matched to their documented C ABIs.
+        let open_display =
+            unsafe { std::mem::transmute::<*mut c_void, XOpenDisplayFn>(open_display_ptr) };
+        // SAFETY: symbols are loaded from libX11/libXi and matched to their documented C ABIs.
+        let close_display =
+            unsafe { std::mem::transmute::<*mut c_void, XCloseDisplayFn>(close_display_ptr) };
+        // SAFETY: symbols are loaded from libX11 and matched to the documented C ABI.
+        let query_extension =
+            unsafe { std::mem::transmute::<*mut c_void, XQueryExtensionFn>(query_extension_ptr) };
+        // SAFETY: symbols are loaded from libXi and matched to the documented C ABI.
+        let query_version =
+            unsafe { std::mem::transmute::<*mut c_void, XIQueryVersionFn>(query_version_ptr) };
+        // SAFETY: symbols are loaded from libX11 and matched to the documented C ABI.
+        let default_root_window = unsafe {
+            std::mem::transmute::<*mut c_void, XDefaultRootWindowFn>(default_root_window_ptr)
+        };
+        // SAFETY: symbols are loaded from libX11 and matched to the documented C ABI.
+        let pending = unsafe { std::mem::transmute::<*mut c_void, XPendingFn>(pending_ptr) };
+        // SAFETY: symbols are loaded from libX11 and matched to the documented C ABI.
+        let next_event =
+            unsafe { std::mem::transmute::<*mut c_void, XNextEventFn>(next_event_ptr) };
+        // SAFETY: symbols are loaded from libX11 and matched to the documented C ABI.
+        let get_event_data =
+            unsafe { std::mem::transmute::<*mut c_void, XGetEventDataFn>(get_event_data_ptr) };
+        // SAFETY: symbols are loaded from libX11 and matched to the documented C ABI.
+        let free_event_data =
+            unsafe { std::mem::transmute::<*mut c_void, XFreeEventDataFn>(free_event_data_ptr) };
+        // SAFETY: symbols are loaded from libX11 and matched to the documented C ABI.
+        let flush = unsafe { std::mem::transmute::<*mut c_void, XFlushFn>(flush_ptr) };
+        // SAFETY: symbols are loaded from libXi and matched to the documented C ABI.
+        let select_events =
+            unsafe { std::mem::transmute::<*mut c_void, XISelectEventsFn>(select_events_ptr) };
+
+        Ok(Self {
+            _x11: x11,
+            _xi: xi,
+            open_display,
+            close_display,
+            query_extension,
+            query_version,
+            default_root_window,
+            pending,
+            next_event,
+            get_event_data,
+            free_event_data,
+            flush,
+            select_events,
         })
     }
 }
@@ -3412,6 +3962,233 @@ fn linux_x11_xinput2_extension_available(
     } else {
         LinuxX11Xinput2ProbeResult::VersionUnsupported
     }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn linux_x11_xinput2_extension_opcode(
+    display: *mut c_void,
+    query_extension: XQueryExtensionFn,
+    query_version: XIQueryVersionFn,
+) -> Result<c_int, PlatformError> {
+    const XINPUT2_EXTENSION_NAME: &[u8] = b"XInputExtension\0";
+    const XINPUT2_MAJOR_VERSION: c_int = 2;
+    const XINPUT2_MINOR_VERSION: c_int = 0;
+    const X11_SUCCESS: c_int = 0;
+
+    let mut opcode = 0;
+    let mut event_base = 0;
+    let mut error_base = 0;
+    // SAFETY: display is live, the extension name is NUL-terminated, and outputs are stack integers.
+    let extension_available = unsafe {
+        query_extension(
+            display,
+            XINPUT2_EXTENSION_NAME.as_ptr().cast(),
+            &mut opcode,
+            &mut event_base,
+            &mut error_base,
+        ) != 0
+    };
+    if !extension_available {
+        return Err(linux_x11_capture_probe_result_to_platform_error(
+            LinuxX11Xinput2ProbeResult::ExtensionUnavailable,
+        ));
+    }
+
+    let mut major_version = XINPUT2_MAJOR_VERSION;
+    let mut minor_version = XINPUT2_MINOR_VERSION;
+    // SAFETY: display is live and XIQueryVersion writes the requested/negotiated version integers.
+    let status = unsafe { query_version(display, &mut major_version, &mut minor_version) };
+    if status == X11_SUCCESS && major_version >= XINPUT2_MAJOR_VERSION {
+        Ok(opcode)
+    } else {
+        Err(linux_x11_capture_probe_result_to_platform_error(
+            LinuxX11Xinput2ProbeResult::VersionUnsupported,
+        ))
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn linux_x11_capture_probe_result_to_platform_error(
+    result: LinuxX11Xinput2ProbeResult,
+) -> PlatformError {
+    match result {
+        LinuxX11Xinput2ProbeResult::Available => PlatformError::new(
+            "Linux X11 input capture is already available; this startup path should not fail.",
+        ),
+        LinuxX11Xinput2ProbeResult::DisplayUnavailable => PlatformError::new(
+            "Linux X11 input capture cannot open an X display connection; check DISPLAY and X server access.",
+        ),
+        LinuxX11Xinput2ProbeResult::X11LibraryUnavailable => PlatformError::new(
+            "Linux X11 input capture cannot load libX11; install the X11 runtime library.",
+        ),
+        LinuxX11Xinput2ProbeResult::XiLibraryUnavailable => PlatformError::new(
+            "Linux X11 input capture cannot load libXi; install the XInput2 runtime library.",
+        ),
+        LinuxX11Xinput2ProbeResult::ProbeSymbolUnavailable => PlatformError::new(
+            "Linux X11 input capture cannot load required X11/XInput2 symbols; install matching libX11 and libXi runtime libraries.",
+        ),
+        LinuxX11Xinput2ProbeResult::ExtensionUnavailable => PlatformError::new(
+            "Linux X11 input capture cannot start because the XInput2 extension is not available; enable XInput2 in the X server.",
+        ),
+        LinuxX11Xinput2ProbeResult::VersionUnsupported => PlatformError::new(
+            "Linux X11 input capture needs XInput2 version 2.0 or newer; upgrade the X server or use a supported X11 session.",
+        ),
+        LinuxX11Xinput2ProbeResult::RuntimeUnavailable => PlatformError::new(
+            "Linux X11 input capture can only run in a Linux X11 runtime with XInput2 available.",
+        ),
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn select_linux_x11_xinput2_raw_events(
+    display: *mut c_void,
+    symbols: &LinuxX11Xinput2CaptureSymbols,
+) -> Result<(), PlatformError> {
+    const XI_ALL_MASTER_DEVICES: c_int = 1;
+
+    // SAFETY: display is live and the function pointer came from libX11.
+    let root_window = unsafe { (symbols.default_root_window)(display) };
+    let mut mask = Vec::new();
+    mask.resize(linux_x11_event_mask_len(XI_RAW_MOTION), 0_u8);
+    set_linux_x11_event_mask(&mut mask, XI_RAW_KEY_PRESS);
+    set_linux_x11_event_mask(&mut mask, XI_RAW_KEY_RELEASE);
+    set_linux_x11_event_mask(&mut mask, XI_RAW_BUTTON_PRESS);
+    set_linux_x11_event_mask(&mut mask, XI_RAW_BUTTON_RELEASE);
+    set_linux_x11_event_mask(&mut mask, XI_RAW_MOTION);
+
+    let mut event_mask = XIEventMask {
+        deviceid: XI_ALL_MASTER_DEVICES,
+        mask_len: mask.len() as c_int,
+        mask: mask.as_mut_ptr(),
+    };
+
+    // SAFETY: display and root_window are live, event_mask points to a mask buffer kept alive for
+    // this call, and the function pointer came from libXi.
+    unsafe {
+        (symbols.select_events)(display, root_window, &mut event_mask, 1);
+    }
+
+    // SAFETY: display is live and the function pointer came from libX11.
+    unsafe {
+        (symbols.flush)(display);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn forward_linux_x11_xinput2_event(
+    display: *mut c_void,
+    symbols: &LinuxX11Xinput2CaptureSymbols,
+    opcode: c_int,
+    event: &mut XEvent,
+    sender: &SyncSender<CapturedInputEvent>,
+) {
+    const X11_GENERIC_EVENT: c_int = 35;
+
+    // SAFETY: reading the common type tag is valid for every XEvent variant.
+    let event_type = unsafe { event.type_ };
+    if event_type != X11_GENERIC_EVENT {
+        return;
+    }
+
+    // SAFETY: GenericEvent events expose the xcookie variant according to Xlib.
+    let cookie = unsafe { &mut event.xcookie };
+    if cookie.extension != opcode {
+        return;
+    }
+
+    // SAFETY: display is live and cookie came from XNextEvent on the same display.
+    let has_data = unsafe { (symbols.get_event_data)(display, cookie) != 0 };
+    if !has_data {
+        return;
+    }
+
+    let _guard = LinuxX11EventDataGuard {
+        display,
+        cookie: cookie as *mut XGenericEventCookie,
+        free_event_data: symbols.free_event_data,
+    };
+    let Some(raw_input) = linux_x11_raw_input_event_from_cookie(cookie) else {
+        return;
+    };
+    for event in captured_events_from_linux_x11_raw_input(raw_input) {
+        try_send_captured_input_event(sender, event);
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+struct LinuxX11EventDataGuard {
+    display: *mut c_void,
+    cookie: *mut XGenericEventCookie,
+    free_event_data: XFreeEventDataFn,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+impl Drop for LinuxX11EventDataGuard {
+    fn drop(&mut self) {
+        // SAFETY: cookie data was acquired from XGetEventData on display and is released once here.
+        unsafe {
+            (self.free_event_data)(self.display, self.cookie);
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn linux_x11_raw_input_event_from_cookie(
+    cookie: &XGenericEventCookie,
+) -> Option<LinuxX11RawInputEvent> {
+    if !matches!(
+        cookie.evtype,
+        XI_RAW_KEY_PRESS
+            | XI_RAW_KEY_RELEASE
+            | XI_RAW_BUTTON_PRESS
+            | XI_RAW_BUTTON_RELEASE
+            | XI_RAW_MOTION
+    ) || cookie.data.is_null()
+    {
+        return None;
+    }
+
+    // SAFETY: XGetEventData populated cookie.data for an XInput2 raw event matching cookie.evtype.
+    let raw_event = unsafe { &*(cookie.data.cast::<XIRawEvent>()) };
+    Some(LinuxX11RawInputEvent {
+        evtype: raw_event.evtype,
+        detail: raw_event.detail,
+        valuators: linux_x11_raw_event_valuator_values(raw_event),
+    })
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn linux_x11_raw_event_valuator_values(raw_event: &XIRawEvent) -> Vec<(i32, f64)> {
+    let values_ptr = if raw_event.raw_values.is_null() {
+        raw_event.valuators.values
+    } else {
+        raw_event.raw_values
+    };
+    if raw_event.valuators.mask.is_null()
+        || values_ptr.is_null()
+        || raw_event.valuators.mask_len <= 0
+    {
+        return Vec::new();
+    }
+
+    let mask_len = raw_event.valuators.mask_len as usize;
+    // SAFETY: XInput2 supplies mask_len bytes at valuators.mask while the event data is alive.
+    let mask = unsafe { std::slice::from_raw_parts(raw_event.valuators.mask, mask_len) };
+    let mut raw_values = values_ptr;
+    let mut values = Vec::new();
+
+    for axis in 0..mask_len.saturating_mul(8) {
+        if linux_x11_event_mask_is_set(mask, axis) {
+            // SAFETY: XInput2 raw_values has one entry for each set bit in valuators.mask.
+            let value = unsafe { *raw_values };
+            values.push((axis as i32, value));
+            // SAFETY: advancing by one stays within the set-bit value sequence managed by Xlib.
+            raw_values = unsafe { raw_values.add(1) };
+        }
+    }
+
+    values
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
@@ -3909,15 +4686,18 @@ mod tests {
         InputCapturePolicy, KeyboardLayoutSnapshot, LinuxX11ButtonEvent,
         LinuxX11DesktopGeometryProbeResult, LinuxX11InjectedInputState,
         LinuxX11InputInjectionResult, LinuxX11Key, LinuxX11KeyEvent, LinuxX11MonitorSnapshot,
-        LinuxX11PressedInput, LinuxX11Xinput2ProbeResult, LinuxX11XtestProbeResult,
-        PlatformAdapter, PlatformCapabilities, PlatformError, UnsupportedDesktopSession,
-        UnsupportedPlatformAdapter, detect_unsupported_desktop_session_from_env,
+        LinuxX11PressedInput, LinuxX11RawInputEvent, LinuxX11Xinput2ProbeResult,
+        LinuxX11XtestProbeResult, PlatformAdapter, PlatformCapabilities, PlatformError,
+        UnsupportedDesktopSession, UnsupportedPlatformAdapter,
+        captured_events_from_linux_x11_raw_input, detect_unsupported_desktop_session_from_env,
         inject_linux_x11_input, linux_x11_capabilities_from_probes,
         linux_x11_desktop_geometry_from_snapshots,
         linux_x11_desktop_geometry_result_to_platform_result,
         linux_x11_diagnostic_issues_from_probes, linux_x11_diagnostic_issues_from_xtest_probe,
+        linux_x11_event_mask_is_set, linux_x11_event_mask_len,
         linux_x11_input_injection_result_to_platform_result, linux_x11_key_event,
         linux_x11_mouse_button_number, linux_x11_scroll_button_events, runtime_platform_adapter,
+        set_linux_x11_event_mask,
     };
 
     #[cfg(windows)]
@@ -4110,8 +4890,8 @@ mod tests {
         );
 
         assert_eq!(available[0].code, "linux_x11_capture_xinput2_available");
-        assert!(available[0].message.contains("XInput2 runtime probing"));
-        assert!(available[0].message.contains("event loop implementation"));
+        assert!(available[0].message.contains("XInput2 raw events"));
+        assert!(available[0].message.contains("without consuming it"));
 
         let runtime_unavailable = linux_x11_diagnostic_issues_from_probes(
             LinuxX11Xinput2ProbeResult::RuntimeUnavailable,
@@ -4318,15 +5098,15 @@ mod tests {
     }
 
     #[test]
-    fn linux_x11_capabilities_expose_xtest_injection_but_keep_capture_closed() {
+    fn linux_x11_capabilities_expose_xinput2_capture_and_xtest_injection() {
         assert_eq!(
             linux_x11_capabilities_from_probes(
                 LinuxX11Xinput2ProbeResult::Available,
                 LinuxX11XtestProbeResult::Available,
             ),
             PlatformCapabilities {
-                can_capture_pointer: false,
-                can_capture_keyboard: false,
+                can_capture_pointer: true,
+                can_capture_keyboard: true,
                 can_inject_pointer: true,
                 can_inject_keyboard: true,
             }
@@ -4336,7 +5116,12 @@ mod tests {
                 LinuxX11Xinput2ProbeResult::Available,
                 LinuxX11XtestProbeResult::ExtensionUnavailable,
             ),
-            PlatformCapabilities::default()
+            PlatformCapabilities {
+                can_capture_pointer: true,
+                can_capture_keyboard: true,
+                can_inject_pointer: false,
+                can_inject_keyboard: false,
+            }
         );
         assert_eq!(
             linux_x11_capabilities_from_probes(
@@ -4350,6 +5135,102 @@ mod tests {
                 can_inject_keyboard: true,
             }
         );
+    }
+
+    #[test]
+    fn linux_x11_raw_capture_maps_keyboard_buttons_scroll_and_motion() {
+        assert_eq!(
+            captured_events_from_linux_x11_raw_input(LinuxX11RawInputEvent {
+                evtype: 13,
+                detail: 50,
+                valuators: Vec::new(),
+            }),
+            vec![CapturedInputEvent::Key {
+                key: PhysicalKey::LeftShift,
+                state: PressState::Pressed,
+            }]
+        );
+        assert_eq!(
+            captured_events_from_linux_x11_raw_input(LinuxX11RawInputEvent {
+                evtype: 14,
+                detail: 22,
+                valuators: Vec::new(),
+            }),
+            vec![CapturedInputEvent::Key {
+                key: PhysicalKey::Code(14),
+                state: PressState::Released,
+            }]
+        );
+        assert_eq!(
+            captured_events_from_linux_x11_raw_input(LinuxX11RawInputEvent {
+                evtype: 15,
+                detail: 1,
+                valuators: Vec::new(),
+            }),
+            vec![CapturedInputEvent::MouseButton {
+                button: MouseButton::Left,
+                state: PressState::Pressed,
+            }]
+        );
+        assert_eq!(
+            captured_events_from_linux_x11_raw_input(LinuxX11RawInputEvent {
+                evtype: 16,
+                detail: 8,
+                valuators: Vec::new(),
+            }),
+            vec![CapturedInputEvent::MouseButton {
+                button: MouseButton::Back,
+                state: PressState::Released,
+            }]
+        );
+        assert_eq!(
+            captured_events_from_linux_x11_raw_input(LinuxX11RawInputEvent {
+                evtype: 15,
+                detail: 5,
+                valuators: Vec::new(),
+            }),
+            vec![CapturedInputEvent::Scroll {
+                delta_x: 0,
+                delta_y: -120,
+            }]
+        );
+        assert!(
+            captured_events_from_linux_x11_raw_input(LinuxX11RawInputEvent {
+                evtype: 16,
+                detail: 5,
+                valuators: Vec::new(),
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            captured_events_from_linux_x11_raw_input(LinuxX11RawInputEvent {
+                evtype: 17,
+                detail: 0,
+                valuators: vec![(1, -2.4), (0, 3.6), (2, 9.0)],
+            }),
+            vec![CapturedInputEvent::PointerMoved {
+                delta_x: 4,
+                delta_y: -2,
+            }]
+        );
+    }
+
+    #[test]
+    fn linux_x11_xinput2_mask_helpers_cover_selected_raw_events() {
+        let mut mask = Vec::new();
+        mask.resize(linux_x11_event_mask_len(17), 0_u8);
+
+        set_linux_x11_event_mask(&mut mask, 13);
+        set_linux_x11_event_mask(&mut mask, 14);
+        set_linux_x11_event_mask(&mut mask, 15);
+        set_linux_x11_event_mask(&mut mask, 16);
+        set_linux_x11_event_mask(&mut mask, 17);
+
+        for event in 13..=17 {
+            assert!(linux_x11_event_mask_is_set(&mask, event));
+        }
+        assert!(!linux_x11_event_mask_is_set(&mask, 12));
+        assert_eq!(mask.len(), 3);
     }
 
     #[test]
