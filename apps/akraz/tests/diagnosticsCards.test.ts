@@ -34,6 +34,10 @@ const linuxX11InjectionAvailableMessage =
   "Linux X11 pointer, button, scroll, and keyboard injection are available through XTEST; " +
   "physical key codes use the Xorg evdev keycode offset.";
 
+const linuxX11GeometryProbeRequiredMessage =
+  "Linux X11 screen layout diagnostics need an Xrandr runtime probe before topology can be reported; " +
+  "run Akraz inside an X11 session with DISPLAY set.";
+
 const linuxX11XtestUnavailableMessage =
   "Linux X11 input injection cannot start because the XTEST extension is not available; " +
   "enable XTEST in the X server before enabling injection.";
@@ -176,6 +180,31 @@ describe("diagnostics capability cards", () => {
     expect(cards.find((card) => card.id === "inputInjection")).toMatchObject({
       status: "OK",
       detail: "상대 기기에 마우스와 키보드 입력을 전달할 준비가 됐어.",
+    });
+  });
+
+  test("shows Linux X11 geometry diagnostics when screen topology is missing", () => {
+    const cards = diagnosticsCards({
+      snapshot: null,
+      permissions: permissionsFixture({
+        adapterName: "linux-x11",
+        issues: [
+          {
+            code: "linux_x11_geometry_xrandr_probe_required",
+            message: linuxX11GeometryProbeRequiredMessage,
+          },
+        ],
+      }),
+      hasLocalIdentity: true,
+      trustedPeerCount: 1,
+      layoutBindingCount: 2,
+      hasScreenTopology: false,
+    });
+
+    expect(cards.find((card) => card.id === "screenLayout")).toMatchObject({
+      status: "Limited",
+      summary: "2개 경계",
+      detail: linuxX11GeometryProbeRequiredMessage,
     });
   });
 

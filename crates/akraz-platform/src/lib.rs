@@ -2035,22 +2035,33 @@ impl UnsupportedDesktopSession {
 }
 
 #[cfg(any(not(windows), test))]
-const LINUX_X11_DIAGNOSTIC_ISSUES: [PlatformDiagnosticIssue; 2] = [
-    PlatformDiagnosticIssue {
-        code: "linux_x11_capture_unimplemented",
-        message: concat!(
-            "Linux X11 input capture is disabled for this build; ",
-            "XInput2 capture is required before capture can be enabled.",
-        ),
-    },
+const LINUX_X11_CAPTURE_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue = PlatformDiagnosticIssue {
+    code: "linux_x11_capture_unimplemented",
+    message: concat!(
+        "Linux X11 input capture is disabled for this build; ",
+        "XInput2 capture is required before capture can be enabled.",
+    ),
+};
+
+#[cfg(any(not(windows), test))]
+const LINUX_X11_XTEST_INJECTION_PROBE_REQUIRED_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
     PlatformDiagnosticIssue {
         code: "linux_x11_injection_xtest_probe_required",
         message: concat!(
             "Linux X11 input injection needs an XTEST runtime probe before capabilities can be enabled; ",
             "run Akraz inside an X11 session with DISPLAY set.",
         ),
-    },
-];
+    };
+
+#[cfg(any(not(windows), test))]
+const LINUX_X11_XRANDR_GEOMETRY_PROBE_REQUIRED_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
+    PlatformDiagnosticIssue {
+        code: "linux_x11_geometry_xrandr_probe_required",
+        message: concat!(
+            "Linux X11 screen layout diagnostics need an Xrandr runtime probe before topology can be reported; ",
+            "run Akraz inside an X11 session with DISPLAY set.",
+        ),
+    };
 
 #[cfg(any(not(windows), test))]
 const LINUX_X11_XTEST_INJECTION_DIAGNOSTIC_ISSUE: PlatformDiagnosticIssue =
@@ -2079,12 +2090,18 @@ fn linux_x11_platform_capabilities() -> PlatformCapabilities {
 fn linux_x11_diagnostic_permission_issues() -> Vec<PlatformDiagnosticIssue> {
     #[cfg(all(target_os = "linux", not(test)))]
     {
-        linux_x11_diagnostic_issues_from_xtest_probe(probe_linux_x11_xtest_availability()).to_vec()
+        linux_x11_diagnostic_issues_from_probes(
+            probe_linux_x11_xtest_availability(),
+            probe_linux_x11_desktop_geometry(),
+        )
     }
 
     #[cfg(not(all(target_os = "linux", not(test))))]
     {
-        LINUX_X11_DIAGNOSTIC_ISSUES.to_vec()
+        linux_x11_diagnostic_issues_from_probes(
+            LinuxX11XtestProbeResult::DisplayUnavailable,
+            LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
+        )
     }
 }
 
@@ -2141,8 +2158,20 @@ fn linux_x11_diagnostic_issues_from_xtest_probe(
     result: LinuxX11XtestProbeResult,
 ) -> [PlatformDiagnosticIssue; 2] {
     [
-        LINUX_X11_DIAGNOSTIC_ISSUES[0],
+        LINUX_X11_CAPTURE_DIAGNOSTIC_ISSUE,
         linux_x11_injection_diagnostic_issue_from_xtest_probe(result),
+    ]
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_x11_diagnostic_issues_from_probes(
+    xtest_result: LinuxX11XtestProbeResult,
+    geometry_result: LinuxX11DesktopGeometryProbeResult,
+) -> Vec<PlatformDiagnosticIssue> {
+    vec![
+        LINUX_X11_CAPTURE_DIAGNOSTIC_ISSUE,
+        linux_x11_injection_diagnostic_issue_from_xtest_probe(xtest_result),
+        linux_x11_geometry_diagnostic_issue_from_probe(geometry_result),
     ]
 }
 
@@ -2152,13 +2181,9 @@ fn linux_x11_injection_diagnostic_issue_from_xtest_probe(
 ) -> PlatformDiagnosticIssue {
     match result {
         LinuxX11XtestProbeResult::Available => LINUX_X11_XTEST_INJECTION_DIAGNOSTIC_ISSUE,
-        LinuxX11XtestProbeResult::DisplayUnavailable => PlatformDiagnosticIssue {
-            code: "linux_x11_injection_display_unavailable",
-            message: concat!(
-                "Linux X11 input injection cannot start because no X display connection could be opened; ",
-                "check DISPLAY and X server access before enabling injection.",
-            ),
-        },
+        LinuxX11XtestProbeResult::DisplayUnavailable => {
+            LINUX_X11_XTEST_INJECTION_PROBE_REQUIRED_DIAGNOSTIC_ISSUE
+        }
         LinuxX11XtestProbeResult::X11LibraryUnavailable => PlatformDiagnosticIssue {
             code: "linux_x11_injection_x11_library_unavailable",
             message: concat!(
@@ -2187,6 +2212,76 @@ fn linux_x11_injection_diagnostic_issue_from_xtest_probe(
                 "enable XTEST in the X server before enabling injection.",
             ),
         },
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn linux_x11_geometry_diagnostic_issue_from_probe(
+    result: LinuxX11DesktopGeometryProbeResult,
+) -> PlatformDiagnosticIssue {
+    match result {
+        LinuxX11DesktopGeometryProbeResult::Geometry(_) => PlatformDiagnosticIssue {
+            code: "linux_x11_geometry_xrandr_available",
+            message: concat!(
+                "Linux X11 screen layout diagnostics are available through Xrandr; ",
+                "monitor bounds and pointer position can be reported.",
+            ),
+        },
+        LinuxX11DesktopGeometryProbeResult::DisplayUnavailable => PlatformDiagnosticIssue {
+            code: "linux_x11_geometry_display_unavailable",
+            message: concat!(
+                "Linux X11 screen layout diagnostics cannot open an X display connection; ",
+                "check DISPLAY and X server access before reading topology.",
+            ),
+        },
+        LinuxX11DesktopGeometryProbeResult::X11LibraryUnavailable => PlatformDiagnosticIssue {
+            code: "linux_x11_geometry_x11_library_unavailable",
+            message: concat!(
+                "Linux X11 screen layout diagnostics cannot load libX11; ",
+                "install the X11 runtime library before reading topology.",
+            ),
+        },
+        LinuxX11DesktopGeometryProbeResult::XrandrLibraryUnavailable => PlatformDiagnosticIssue {
+            code: "linux_x11_geometry_xrandr_library_unavailable",
+            message: concat!(
+                "Linux X11 screen layout diagnostics cannot load libXrandr; ",
+                "install the Xrandr runtime library before reading topology.",
+            ),
+        },
+        LinuxX11DesktopGeometryProbeResult::GeometrySymbolUnavailable => PlatformDiagnosticIssue {
+            code: "linux_x11_geometry_xrandr_probe_unavailable",
+            message: concat!(
+                "Linux X11 screen layout diagnostics cannot load required X11/Xrandr symbols; ",
+                "install matching libX11 and libXrandr runtime libraries before reading topology.",
+            ),
+        },
+        LinuxX11DesktopGeometryProbeResult::PointerUnavailable => PlatformDiagnosticIssue {
+            code: "linux_x11_geometry_pointer_unavailable",
+            message: concat!(
+                "Linux X11 screen layout diagnostics cannot read the pointer position from the X root window; ",
+                "check X server access before reading topology.",
+            ),
+        },
+        LinuxX11DesktopGeometryProbeResult::MonitorQueryFailed => PlatformDiagnosticIssue {
+            code: "linux_x11_geometry_xrandr_query_failed",
+            message: "Linux X11 screen layout diagnostics cannot query active Xrandr monitors.",
+        },
+        LinuxX11DesktopGeometryProbeResult::EmptyMonitorSet => PlatformDiagnosticIssue {
+            code: "linux_x11_geometry_xrandr_empty",
+            message: "Linux X11 screen layout diagnostics found no active Xrandr monitor bounds.",
+        },
+        LinuxX11DesktopGeometryProbeResult::PointerOutsideMonitorLayout => {
+            PlatformDiagnosticIssue {
+                code: "linux_x11_geometry_pointer_outside_layout",
+                message: concat!(
+                    "Linux X11 screen layout diagnostics found the pointer outside the active Xrandr monitor layout; ",
+                    "check the Xrandr monitor configuration.",
+                ),
+            }
+        }
+        LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable => {
+            LINUX_X11_XRANDR_GEOMETRY_PROBE_REQUIRED_DIAGNOSTIC_ISSUE
+        }
     }
 }
 
@@ -3618,7 +3713,7 @@ mod tests {
         detect_unsupported_desktop_session_from_env, inject_linux_x11_input,
         linux_x11_capabilities_from_xtest_probe, linux_x11_desktop_geometry_from_snapshots,
         linux_x11_desktop_geometry_result_to_platform_result,
-        linux_x11_diagnostic_issues_from_xtest_probe,
+        linux_x11_diagnostic_issues_from_probes, linux_x11_diagnostic_issues_from_xtest_probe,
         linux_x11_input_injection_result_to_platform_result, linux_x11_key_event,
         linux_x11_mouse_button_number, linux_x11_scroll_button_events, runtime_platform_adapter,
     };
@@ -3780,11 +3875,13 @@ mod tests {
             vec![
                 "linux_x11_capture_unimplemented",
                 "linux_x11_injection_xtest_probe_required",
+                "linux_x11_geometry_xrandr_probe_required",
             ]
         );
         assert!(linux_x11_issues[0].message.contains("XInput2 capture"));
         assert!(!linux_x11_issues[0].message.contains("Xrandr layout probes"));
         assert!(linux_x11_issues[1].message.contains("XTEST runtime probe"));
+        assert!(linux_x11_issues[2].message.contains("Xrandr runtime probe"));
         assert_eq!(
             linux_unknown
                 .diagnostic_permission_issues()
@@ -3816,7 +3913,7 @@ mod tests {
 
         assert_eq!(
             missing_display[1].code,
-            "linux_x11_injection_display_unavailable",
+            "linux_x11_injection_xtest_probe_required",
         );
         assert!(missing_display[1].message.contains("DISPLAY"));
 
@@ -3863,6 +3960,57 @@ mod tests {
             "linux_x11_injection_xtest_unavailable",
         );
         assert!(missing_extension[1].message.contains("XTEST extension"));
+    }
+
+    #[test]
+    fn linux_x11_diagnostics_report_geometry_probe_state() {
+        let geometry = DesktopGeometry {
+            pointer_position: LogicalPoint { x: 1, y: 2 },
+            virtual_screen_bounds: LogicalRect {
+                origin: LogicalPoint { x: 0, y: 0 },
+                size: LogicalSize {
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            monitors: Vec::new(),
+        };
+
+        let available = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::Geometry(geometry),
+        );
+        assert_eq!(available[2].code, "linux_x11_geometry_xrandr_available");
+        assert!(available[2].message.contains("Xrandr"));
+
+        let runtime_unavailable = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::RuntimeUnavailable,
+        );
+        assert_eq!(
+            runtime_unavailable[2].code,
+            "linux_x11_geometry_xrandr_probe_required"
+        );
+
+        let missing_xrandr_library = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::XrandrLibraryUnavailable,
+        );
+        assert_eq!(
+            missing_xrandr_library[2].code,
+            "linux_x11_geometry_xrandr_library_unavailable"
+        );
+        assert!(missing_xrandr_library[2].message.contains("libXrandr"));
+
+        let pointer_outside_layout = linux_x11_diagnostic_issues_from_probes(
+            LinuxX11XtestProbeResult::Available,
+            LinuxX11DesktopGeometryProbeResult::PointerOutsideMonitorLayout,
+        );
+        assert_eq!(
+            pointer_outside_layout[2].code,
+            "linux_x11_geometry_pointer_outside_layout"
+        );
+        assert!(pointer_outside_layout[2].message.contains("outside"));
     }
 
     #[test]

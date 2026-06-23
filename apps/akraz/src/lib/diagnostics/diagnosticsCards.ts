@@ -64,7 +64,12 @@ export function diagnosticsCards(input: DiagnosticsCardsInput): DiagnosticsCard[
     inputInjectionCard(permissions),
     networkDiscoveryCard(),
     pairingAuthCard(input.hasLocalIdentity, input.trustedPeerCount),
-    screenLayoutCard(input.layoutBindingCount, hasScreenTopology, input.layoutMismatch),
+    screenLayoutCard(
+      input.layoutBindingCount,
+      hasScreenTopology,
+      permissions,
+      input.layoutMismatch,
+    ),
     clipboardCard(),
     updatesCard(),
   ];
@@ -181,6 +186,7 @@ function pairingAuthCard(hasLocalIdentity: boolean, trustedPeerCount: number): D
 function screenLayoutCard(
   layoutBindingCount: number,
   hasScreenTopology: boolean,
+  permissions: PermissionFacts | null,
   layoutMismatch?: LayoutMismatchReport,
 ): DiagnosticsCard {
   if (layoutMismatch) {
@@ -225,12 +231,14 @@ function screenLayoutCard(
   }
 
   if (!hasScreenTopology) {
+    const topologyIssueMessage = matchingScreenTopologyIssueMessage(permissions?.issues ?? []);
+
     return {
       id: "screenLayout",
       title: "화면 배치",
       status: "Limited",
       summary: `${layoutBindingCount}개 경계`,
-      detail: "데몬이 실행 중이면 현재 화면 범위까지 함께 확인할 수 있어.",
+      detail: topologyIssueMessage ?? "데몬이 실행 중이면 현재 화면 범위까지 함께 확인할 수 있어.",
     };
   }
 
@@ -272,4 +280,11 @@ function matchingIssueMessage(issues: PermissionIssue[], keywords: string[]): st
   }
 
   return issues[0]?.message ?? null;
+}
+
+function matchingScreenTopologyIssueMessage(issues: PermissionIssue[]): string | null {
+  return (
+    matchingIssueMessage(issues, ["linux_x11_geometry", "xrandr", "screen layout", "topology"]) ??
+    null
+  );
 }
