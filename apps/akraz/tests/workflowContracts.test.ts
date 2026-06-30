@@ -262,7 +262,7 @@ describe("GitHub Actions workflow contracts", () => {
         report.checks.find((check) => check.id.startsWith("checkoutVersion:check.yml")),
       ).toMatchObject({
         status: "invalid",
-        expectedVersion: "v6",
+        expectedVersion: "v7",
         actualVersion: "v5",
       });
       expect(
@@ -280,7 +280,7 @@ describe("GitHub Actions workflow contracts", () => {
       });
       expect(report.nextActions).toContainEqual({
         id: "upgradeCheckoutAction",
-        action: "use actions/checkout@v6",
+        action: "use actions/checkout@v7",
         workflowFile: "check.yml",
       });
       expect(report.nextActions).toContainEqual({
